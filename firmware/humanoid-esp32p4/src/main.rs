@@ -31,7 +31,7 @@ use esp_println::println;
 use humanoid_fw_core::config::{CONTROL_PERIOD_MS, USB_SERIAL_ESP32P4};
 use humanoid_fw_core::copper::current_led_mode;
 
-#[copper_runtime(config = "copperconfig.ron")]
+#[copper_runtime(config = "../copperconfig.ron")]
 struct RockyEsp32P4App {}
 
 fn make_embassy_robot_clock() -> RobotClock {

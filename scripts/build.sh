@@ -28,12 +28,18 @@ sh scripts/ensure-rust.sh
 
 echo "[rocky-studio] Building Rust egui WASM bundle..."
 rm -rf dist.staging
-CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" trunk build --release --dist dist.staging
+if [ -n "${PUBLIC_URL:-}" ]; then
+  CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" trunk build --release --dist dist.staging --public-url "$PUBLIC_URL"
+else
+  CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" trunk build --release --dist dist.staging
+fi
 
 if [ ! -f dist.staging/index.html ]; then
   echo "[rocky-studio] Build finished without dist.staging/index.html" >&2
   exit 1
 fi
+
+touch dist.staging/.nojekyll
 
 rm -rf dist.prev
 if [ -d dist ]; then

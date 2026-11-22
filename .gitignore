@@ -1,16 +1,21 @@
 # Rust / Cargo build outputs (keep Cargo.lock committed for reproducible pinned builds)
-/target/
+**/target/
 **/*.rs.bk
 *.pdb
 
-# Trunk WASM build output
+# Trunk WASM build outputs
 /dist/
+/dist.staging/
+/dist.prev/
 /public/
 
 # Runtime simulation logs & user exports
 *.copper
 /logs/
 /exports/
+
+# Cloned reference repositories (local analysis only)
+/ref/
 
 # Local verification & OS/editor artifacts
 /.playwright-cli/

@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 pub const MAX_JOINTS: usize = 20;
 pub const WATCHDOG_TIMEOUT_MS: u32 = 100;
 pub const MAX_COBS_FRAME_BYTES: usize = 512;
+pub const MODEL_CHUNK_BYTES: usize = 256;
+pub const MAX_MODEL_NAME_BYTES: usize = 32;
+pub const MAX_MODEL_COBS_FRAME_BYTES: usize = 384;
+pub const MODEL_SCHEMA_VERSION: u8 = 1;
 pub const RATED_CURRENT_MA: u16 = 2000;
 pub const HEAT_TINT_THRESHOLD_MA: u16 = 1400; // 70% of rated current
 
@@ -111,6 +115,239 @@ impl Default for McuToHost {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MCU Onboard Kinematics / URDF Storage Protocol (no_std, zero allocation)
+// ---------------------------------------------------------------------------
+
+/// Standard IEEE 802.3 CRC32 evaluable at compile time (`const fn`) for MCU flash blobs.
+pub const fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFF_u32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        crc ^= bytes[i] as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320_u32 & mask);
+            bit += 1;
+        }
+        i += 1;
+    }
+    !crc
+}
+
+/// Format of the robot kinematics model stored in MCU flash.
+#[repr(u8)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ModelFormat {
+    /// Raw UTF-8 URDF XML embedded directly in MCU flash (zero MCU CPU overhead).
+    #[default]
+    UrdfXml = 1,
+    /// Zlib/deflate-compressed URDF XML (~5x smaller in MCU flash, decompressed by Rocky Studio).
+    UrdfDeflate = 2,
+    /// Compact binary kinematics descriptor for ultra-constrained flash targets.
+    CompactKinematics = 3,
+}
+
+impl ModelFormat {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::UrdfXml => "URDF XML (Raw Flash)",
+            Self::UrdfDeflate => "URDF XML (Deflate)",
+            Self::CompactKinematics => "Compact Binary Kinematics",
+        }
+    }
+}
+
+/// Fixed-size metadata header describing the kinematics model stored in MCU flash.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub format: ModelFormat,
+    pub total_bytes: u32,
+    pub crc32: u32,
+    pub joint_count: u8,
+    pub schema_version: u8,
+    pub name_len: u8,
+    pub name_utf8: [u8; MAX_MODEL_NAME_BYTES],
+}
+
+impl Default for ModelInfo {
+    fn default() -> Self {
+        Self {
+            format: ModelFormat::UrdfXml,
+            total_bytes: 0,
+            crc32: 0,
+            joint_count: 0,
+            schema_version: MODEL_SCHEMA_VERSION,
+            name_len: 0,
+            name_utf8: [0u8; MAX_MODEL_NAME_BYTES],
+        }
+    }
+}
+
+impl ModelInfo {
+    /// Builds a compile-time `ModelInfo` descriptor directly from a flash-resident byte slice.
+    pub const fn from_static(
+        name: &str,
+        format: ModelFormat,
+        blob: &[u8],
+        joint_count: u8,
+    ) -> Self {
+        let name_bytes = name.as_bytes();
+        let copy_len = if name_bytes.len() < MAX_MODEL_NAME_BYTES {
+            name_bytes.len()
+        } else {
+            MAX_MODEL_NAME_BYTES
+        };
+        let mut buf = [0u8; MAX_MODEL_NAME_BYTES];
+        let mut i = 0usize;
+        while i < copy_len {
+            buf[i] = name_bytes[i];
+            i += 1;
+        }
+        Self {
+            format,
+            total_bytes: blob.len() as u32,
+            crc32: crc32(blob),
+            joint_count,
+            schema_version: MODEL_SCHEMA_VERSION,
+            name_len: copy_len as u8,
+            name_utf8: buf,
+        }
+    }
+
+    pub fn name_str(&self) -> &str {
+        let len = (self.name_len as usize).min(MAX_MODEL_NAME_BYTES);
+        core::str::from_utf8(&self.name_utf8[..len]).unwrap_or("unknown")
+    }
+}
+
+/// Host -> MCU model transfer request (served off the real-time servo control path).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelRequest {
+    GetInfo,
+    ReadChunk { offset: u32, max_len: u16 },
+}
+
+/// Zero-allocation fixed-capacity model chunk carrying up to `MODEL_CHUNK_BYTES` bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelChunk {
+    pub offset: u32,
+    pub total_bytes: u32,
+    pub crc32: u32,
+    pub format: ModelFormat,
+    pub len: u16,
+    pub data: [u8; MODEL_CHUNK_BYTES],
+}
+
+impl ModelChunk {
+    pub fn payload(&self) -> &[u8] {
+        let n = (self.len as usize).min(MODEL_CHUNK_BYTES);
+        &self.data[..n]
+    }
+}
+
+impl Serialize for ModelChunk {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeTuple;
+        let len = (self.len as usize).min(MODEL_CHUNK_BYTES);
+        let mut tup = serializer.serialize_tuple(5)?;
+        tup.serialize_element(&self.offset)?;
+        tup.serialize_element(&self.total_bytes)?;
+        tup.serialize_element(&self.crc32)?;
+        tup.serialize_element(&self.format)?;
+        tup.serialize_element(&BytesRef(&self.data[..len]))?;
+        tup.end()
+    }
+}
+
+struct BytesRef<'a>(&'a [u8]);
+
+impl Serialize for BytesRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(self.0)
+    }
+}
+
+struct FixedChunkBytes([u8; MODEL_CHUNK_BYTES], u16);
+
+impl<'de> Deserialize<'de> for FixedChunkBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ChunkVisitor;
+        impl<'de> serde::de::Visitor<'de> for ChunkVisitor {
+            type Value = FixedChunkBytes;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str("byte slice up to MODEL_CHUNK_BYTES")
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if v.len() > MODEL_CHUNK_BYTES {
+                    return Err(E::custom("chunk exceeds MODEL_CHUNK_BYTES"));
+                }
+                let mut arr = [0u8; MODEL_CHUNK_BYTES];
+                arr[..v.len()].copy_from_slice(v);
+                Ok(FixedChunkBytes(arr, v.len() as u16))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut arr = [0u8; MODEL_CHUNK_BYTES];
+                let mut idx = 0usize;
+                while let Some(b) = seq.next_element::<u8>()? {
+                    if idx >= MODEL_CHUNK_BYTES {
+                        return Err(serde::de::Error::custom("chunk exceeds MODEL_CHUNK_BYTES"));
+                    }
+                    arr[idx] = b;
+                    idx += 1;
+                }
+                Ok(FixedChunkBytes(arr, idx as u16))
+            }
+        }
+        deserializer.deserialize_bytes(ChunkVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelChunk {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let (offset, total_bytes, crc32, format, FixedChunkBytes(data, len)) =
+            <(u32, u32, u32, ModelFormat, FixedChunkBytes)>::deserialize(deserializer)?;
+        Ok(Self {
+            offset,
+            total_bytes,
+            crc32,
+            format,
+            len,
+            data,
+        })
+    }
+}
+
+/// MCU -> Host model transfer response.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelResponse {
+    Info(ModelInfo),
+    Chunk(ModelChunk),
+    NotAvailable,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodecError {
     EncodeFailed,
@@ -174,6 +411,34 @@ pub fn decode_mcu_cobs(buf: &mut [u8]) -> Result<McuToHost, CodecError> {
         return Err(CodecError::NonFiniteFloat);
     }
     Ok(pkt)
+}
+
+/// Encodes a `ModelRequest` into a COBS frame.
+pub fn encode_model_req_cobs<'a>(
+    req: &ModelRequest,
+    buf: &'a mut [u8],
+) -> Result<&'a [u8], CodecError> {
+    encode_cobs(req, buf)
+}
+
+/// Decodes a `ModelRequest` from a COBS frame.
+pub fn decode_model_req_cobs(buf: &mut [u8]) -> Result<ModelRequest, CodecError> {
+    let (req, _) = decode_cobs::<ModelRequest>(buf)?;
+    Ok(req)
+}
+
+/// Encodes a `ModelResponse` into a COBS frame.
+pub fn encode_model_resp_cobs<'a>(
+    resp: &ModelResponse,
+    buf: &'a mut [u8],
+) -> Result<&'a [u8], CodecError> {
+    encode_cobs(resp, buf)
+}
+
+/// Decodes a `ModelResponse` from a COBS frame.
+pub fn decode_model_resp_cobs(buf: &mut [u8]) -> Result<ModelResponse, CodecError> {
+    let (resp, _) = decode_cobs::<ModelResponse>(buf)?;
+    Ok(resp)
 }
 
 #[cfg(test)]
@@ -245,5 +510,52 @@ mod tests {
             assert!(decode_host_cobs(&mut buf[..sample.len()]).is_err());
             assert!(decode_mcu_cobs(&mut buf[..sample.len()]).is_err());
         }
+    }
+
+    #[test]
+    fn crc32_matches_ieee_standard_vector() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn model_protocol_info_and_chunk_round_trip() {
+        let sample = b"<robot name=\"mini\"><link name=\"base\"/></robot>";
+        let info = ModelInfo::from_static("mini", ModelFormat::UrdfXml, sample, 4);
+        assert_eq!(info.name_str(), "mini");
+        assert_eq!(info.total_bytes as usize, sample.len());
+
+        let mut wire = [0u8; MAX_MODEL_COBS_FRAME_BYTES];
+        let req = ModelRequest::ReadChunk {
+            offset: 0,
+            max_len: 128,
+        };
+        let n = encode_model_req_cobs(&req, &mut wire).expect("encode req").len();
+        assert_eq!(decode_model_req_cobs(&mut wire[..n]).expect("decode req"), req);
+
+        let resp_info = ModelResponse::Info(info);
+        let n = encode_model_resp_cobs(&resp_info, &mut wire)
+            .expect("encode info")
+            .len();
+        assert_eq!(
+            decode_model_resp_cobs(&mut wire[..n]).expect("decode info"),
+            resp_info
+        );
+
+        let mut data = [0u8; MODEL_CHUNK_BYTES];
+        data[..sample.len()].copy_from_slice(sample);
+        let chunk = ModelChunk {
+            offset: 0,
+            total_bytes: sample.len() as u32,
+            crc32: info.crc32,
+            format: ModelFormat::UrdfXml,
+            len: sample.len() as u16,
+            data,
+        };
+        let resp_chunk = ModelResponse::Chunk(chunk);
+        let n = encode_model_resp_cobs(&resp_chunk, &mut wire)
+            .expect("encode chunk")
+            .len();
+        let decoded = decode_model_resp_cobs(&mut wire[..n]).expect("decode chunk");
+        assert_eq!(decoded, resp_chunk);
     }
 }

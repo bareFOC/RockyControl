@@ -24,12 +24,14 @@ use embassy_usb::class::cdc_ncm::{CdcNcmClass, State as NcmState};
 use embassy_usb::{Builder, Config, UsbDevice};
 use humanoid_fw_core::config::{
     CONTROL_PERIOD_MS, USB_MANUFACTURER, USB_NET_HOST_MAC, USB_NET_MCU_IPV4, USB_NET_MCU_MAC,
-    USB_NET_PREFIX_LEN, USB_NET_UDP_PORT, USB_PID_NCM, USB_PRODUCT_NCM, USB_SERIAL_RP2350, USB_VID,
+    USB_NET_MODEL_UDP_PORT, USB_NET_PREFIX_LEN, USB_NET_UDP_PORT, USB_PID_NCM, USB_PRODUCT_NCM,
+    USB_SERIAL_RP2350, USB_VID,
 };
+use humanoid_fw_core::model_store::FlashModelStore;
 use humanoid_fw_core::transport::{
     HOST_LINK_MAILBOX, decode_udp_host_frame, encode_telemetry_frame,
 };
-use humanoid_proto::MAX_COBS_FRAME_BYTES;
+use humanoid_proto::{MAX_COBS_FRAME_BYTES, MAX_MODEL_COBS_FRAME_BYTES};
 use static_cell::StaticCell;
 
 type RpUsbDriver = Driver<'static, USB>;
@@ -107,7 +109,46 @@ async fn udp_host_link_task(stack: Stack<'static>) -> ! {
     }
 }
 
-/// Initializes RP2350 USB CDC-NCM Ethernet device, static IPv4 stack, and UDP control task.
+#[embassy_executor::task]
+async fn udp_model_service_task(stack: Stack<'static>) -> ! {
+    let mut rx_meta = [PacketMetadata::EMPTY; 4];
+    let mut rx_buf = [0u8; 512];
+    let mut tx_meta = [PacketMetadata::EMPTY; 4];
+    let mut tx_buf = [0u8; 512];
+
+    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
+    socket
+        .bind(USB_NET_MODEL_UDP_PORT)
+        .expect("bind Rocky UDP model port 7778");
+
+    let store = FlashModelStore::bundled_rocky();
+    let info = store.info();
+    info!(
+        "MCU Flash Model Service ready on UDP :{} ({} bytes, CRC32={=u32:#010x})",
+        USB_NET_MODEL_UDP_PORT, info.total_bytes, info.crc32
+    );
+
+    let mut rx_pkt = [0u8; MAX_MODEL_COBS_FRAME_BYTES];
+    let mut tx_wire = [0u8; MAX_MODEL_COBS_FRAME_BYTES];
+
+    loop {
+        match socket.recv_from(&mut rx_pkt).await {
+            Ok((n, peer)) if n > 0 => {
+                if let Some(resp_bytes) = store.handle_cobs_datagram(&rx_pkt[..n], &mut tx_wire) {
+                    if let Err(e) = socket.send_to(resp_bytes, peer).await {
+                        warn!("UDP model send error: {:?}", e);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("UDP model recv error: {:?}", e);
+            }
+        }
+    }
+}
+
+/// Initializes RP2350 USB CDC-NCM Ethernet device, static IPv4 stack, and UDP control + model tasks.
 pub fn spawn_usb_net(spawner: &Spawner, driver: RpUsbDriver) {
     let mut usb_cfg = Config::new(USB_VID, USB_PID_NCM);
     usb_cfg.manufacturer = Some(USB_MANUFACTURER);
@@ -121,7 +162,7 @@ pub fn spawn_usb_net(spawner: &Spawner, driver: RpUsbDriver) {
     static CONTROL_BUF: StaticCell<[u8; 128]> = StaticCell::new();
     static NCM_STATE: StaticCell<NcmState> = StaticCell::new();
     static NET_STATE: StaticCell<NetState<MTU, 4, 4>> = StaticCell::new();
-    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 
     let mut builder = Builder::new(
         driver,
@@ -170,4 +211,5 @@ pub fn spawn_usb_net(spawner: &Spawner, driver: RpUsbDriver) {
 
     spawner.spawn(net_stack_task(net_runner).expect("spawn net_stack_task"));
     spawner.spawn(udp_host_link_task(stack).expect("spawn udp_host_link_task"));
+    spawner.spawn(udp_model_service_task(stack).expect("spawn udp_model_service_task"));
 }

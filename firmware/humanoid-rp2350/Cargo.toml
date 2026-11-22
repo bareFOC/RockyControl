@@ -5,8 +5,6 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Rocky Humanoid RP2350 firmware powered by copper-rs (cu29) + embassy-rp + embassy-usb (CDC-ACM & USB Networking CDC-NCM)"
 
-[workspace]
-
 [features]
 # Default Day-1 wired bring-up: USB CDC-ACM serial + onboard bench loopback servo plant.
 # For wired USB Networking (Ethernet-over-USB UDP 10.42.0.2:7777):
@@ -64,15 +62,3 @@ panic-probe = { version = "1.0", features = ["print-defmt"] }
 
 [build-dependencies]
 cu29-build = "1.3"
-
-[profile.dev]
-opt-level = 1
-debug = 2
-panic = "abort"
-
-[profile.release]
-opt-level = "s"
-debug = 2
-lto = "thin"
-codegen-units = 1
-panic = "abort"

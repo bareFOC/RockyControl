@@ -7,9 +7,15 @@
 use humanoid_control::{JointCalibration, RawServoCommand, RawServoFeedback};
 use humanoid_cu_nodes::{CopperListTick, DirectServoTask, HostLinkBridge, ServoBusDriver};
 use humanoid_proto::{
-    HostToMcu, MAX_COBS_FRAME_BYTES, MAX_JOINTS, McuToHost, decode_mcu_cobs, encode_cobs,
+    HostToMcu, MAX_COBS_FRAME_BYTES, MAX_JOINTS, MAX_MODEL_COBS_FRAME_BYTES, MODEL_CHUNK_BYTES,
+    McuToHost, ModelChunk, ModelFormat, ModelInfo, ModelRequest, ModelResponse, decode_mcu_cobs,
+    decode_model_req_cobs, decode_model_resp_cobs, encode_cobs, encode_model_req_cobs,
+    encode_model_resp_cobs,
 };
 use serde::{Deserialize, Serialize};
+
+const DEFAULT_MCU_FLASH_URDF: &[u8] =
+    include_bytes!("../../../assets/sample_humanoid/rocky_mk1.urdf");
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SimFaultInjection {
@@ -206,7 +212,8 @@ pub struct ReplayVerification {
     pub exact_match: bool,
 }
 
-/// End-to-end simulation runner wiring COBS framing -> `DirectServoTask` -> `SimulatedServoPlant`.
+/// End-to-end simulation runner wiring COBS framing -> `DirectServoTask` -> `SimulatedServoPlant`
+/// plus an onboard simulated MCU flash model store matching `firmware/humanoid-fw-core::model_store`.
 pub struct CopperSimRunner {
     pub task: DirectServoTask,
     pub host_bridge: HostLinkBridge,
@@ -216,6 +223,8 @@ pub struct CopperSimRunner {
     recording: bool,
     recorded_log: Option<CopperReplayLog>,
     max_recorded_ticks: usize,
+    mcu_model_info: ModelInfo,
+    mcu_model_blob: Vec<u8>,
 }
 
 impl CopperSimRunner {
@@ -224,6 +233,9 @@ impl CopperSimRunner {
         initial_cal: &[JointCalibration],
         initial_raw_pose: [f32; MAX_JOINTS],
     ) -> Self {
+        let mcu_model_blob = DEFAULT_MCU_FLASH_URDF.to_vec();
+        let mcu_model_info =
+            ModelInfo::from_static("rocky_mk1", ModelFormat::UrdfXml, &mcu_model_blob, 17);
         Self {
             task: DirectServoTask::new(joint_count, initial_cal),
             host_bridge: HostLinkBridge::default(),
@@ -233,7 +245,67 @@ impl CopperSimRunner {
             recording: false,
             recorded_log: None,
             max_recorded_ticks: 2400,
+            mcu_model_info,
+            mcu_model_blob,
         }
+    }
+
+    /// Replaces the simulated MCU's flash-resident URDF / kinematics blob (for testing custom URDF flashing).
+    pub fn stage_mcu_model(
+        &mut self,
+        name: &str,
+        format: ModelFormat,
+        blob: Vec<u8>,
+        joint_count: u8,
+    ) {
+        self.mcu_model_info = ModelInfo::from_static(name, format, &blob, joint_count);
+        self.mcu_model_blob = blob;
+    }
+
+    /// Executes a full COBS-framed `ModelRequest` -> `ModelResponse` round-trip against the simulated MCU flash store.
+    pub fn exchange_model_request(&mut self, req: ModelRequest) -> Option<ModelResponse> {
+        let mut req_wire = [0u8; MAX_MODEL_COBS_FRAME_BYTES];
+        let req_len = encode_model_req_cobs(&req, &mut req_wire).ok()?.len();
+        let mcu_req = decode_model_req_cobs(&mut req_wire[..req_len]).ok()?;
+
+        let mcu_resp = if self.mcu_model_blob.is_empty() {
+            ModelResponse::NotAvailable
+        } else {
+            match mcu_req {
+                ModelRequest::GetInfo => ModelResponse::Info(self.mcu_model_info),
+                ModelRequest::ReadChunk { offset, max_len } => {
+                    let start = offset as usize;
+                    if start >= self.mcu_model_blob.len() {
+                        ModelResponse::Chunk(ModelChunk {
+                            offset,
+                            total_bytes: self.mcu_model_blob.len() as u32,
+                            crc32: self.mcu_model_info.crc32,
+                            format: self.mcu_model_info.format,
+                            len: 0,
+                            data: [0u8; MODEL_CHUNK_BYTES],
+                        })
+                    } else {
+                        let req_len = (max_len as usize).clamp(1, MODEL_CHUNK_BYTES);
+                        let copy_len = req_len.min(self.mcu_model_blob.len() - start);
+                        let mut data = [0u8; MODEL_CHUNK_BYTES];
+                        data[..copy_len]
+                            .copy_from_slice(&self.mcu_model_blob[start..start + copy_len]);
+                        ModelResponse::Chunk(ModelChunk {
+                            offset,
+                            total_bytes: self.mcu_model_blob.len() as u32,
+                            crc32: self.mcu_model_info.crc32,
+                            format: self.mcu_model_info.format,
+                            len: copy_len as u16,
+                            data,
+                        })
+                    }
+                }
+            }
+        };
+
+        let mut resp_wire = [0u8; MAX_MODEL_COBS_FRAME_BYTES];
+        let resp_len = encode_model_resp_cobs(&mcu_resp, &mut resp_wire).ok()?.len();
+        decode_model_resp_cobs(&mut resp_wire[..resp_len]).ok()
     }
 
     pub fn link_errors(&self) -> u64 {

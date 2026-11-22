@@ -33,6 +33,8 @@ pub const USB_NET_MCU_IPV4: [u8; 4] = [10, 42, 0, 2];
 pub const USB_NET_HOST_IPV4: [u8; 4] = [10, 42, 0, 1];
 pub const USB_NET_PREFIX_LEN: u8 = 24;
 pub const USB_NET_UDP_PORT: u16 = 7777;
+/// Dedicated UDP port serving the flash-resident URDF / kinematics model (`ModelRequest`/`ModelResponse`).
+pub const USB_NET_MODEL_UDP_PORT: u16 = 7778;
 
 /// Locally-administered unicast MAC addresses for USB CDC-NCM.
 pub const USB_NET_MCU_MAC: [u8; 6] = [0x02, 0x52, 0x4F, 0x43, 0x4B, 0x02];

@@ -1233,6 +1233,7 @@ dependencies = [
 name = "humanoid-model"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "humanoid-control",
  "humanoid-proto",
  "k",
@@ -1305,6 +1306,7 @@ dependencies = [
  "eframe",
  "egui",
  "humanoid-ui",
+ "js-sys",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

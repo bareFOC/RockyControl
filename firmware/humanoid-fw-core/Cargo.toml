@@ -5,8 +5,6 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Board-agnostic no_std Copper-rs + Embassy humanoid firmware core (shared across RP2350 and ESP32-P4)"
 
-[workspace]
-
 [features]
 default = ["std"]
 std = [

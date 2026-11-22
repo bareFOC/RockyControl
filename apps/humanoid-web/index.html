@@ -2,7 +2,13 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0b0e14" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
     <title>Rocky Studio — Rust egui Humanoid Workstation</title>
     <link data-trunk rel="rust" data-bin="humanoid-web" data-wasm-opt="0" />
     <style>
@@ -12,6 +18,12 @@
         width: 100%;
         height: 100%;
         overflow: hidden;
+        overscroll-behavior: none;
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+        -webkit-tap-highlight-color: transparent;
         background: #0b0e14;
         color: #cbd5e1;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -19,7 +31,10 @@
       #rocky_canvas {
         display: block;
         width: 100vw;
+        width: 100dvw;
         height: 100vh;
+        height: 100dvh;
+        touch-action: none;
       }
       #rocky_loading {
         position: fixed;

@@ -61,7 +61,7 @@ bind_interrupts!(struct Irqs {
 });
 
 // --- Compile-Time Generated Copper-rs Task Graph ---
-#[copper_runtime(config = "copperconfig.ron")]
+#[copper_runtime(config = "../copperconfig.ron")]
 struct RockyRp2350App {}
 
 #[cfg(all(feature = "usb-cdc", feature = "usb-net"))]

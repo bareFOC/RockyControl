@@ -1,7 +1,7 @@
 [build]
 target = "apps/humanoid-web/index.html"
 dist = "dist"
-public_url = "/"
+public_url = "./"
 
 [watch]
 watch = ["apps/humanoid-web", "crates", "assets"]

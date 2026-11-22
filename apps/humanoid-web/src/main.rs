@@ -2,11 +2,29 @@
 
 #[cfg(target_arch = "wasm32")]
 mod web_app {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use craft_platform::browser::{DownloadOptions, PreparedDownload};
     use humanoid_ui::{PlatformSaver, RockyStudioApp};
     use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
 
-    struct BrowserDownloadSaver;
+    struct BrowserDownloadSaver {
+        opened_queue: Rc<RefCell<Vec<(String, Vec<u8>)>>>,
+        active_input: Option<web_sys::HtmlInputElement>,
+        _active_closure: Option<Closure<dyn FnMut(web_sys::Event)>>,
+    }
+
+    impl BrowserDownloadSaver {
+        fn new() -> Self {
+            Self {
+                opened_queue: Rc::new(RefCell::new(Vec::new())),
+                active_input: None,
+                _active_closure: None,
+            }
+        }
+    }
 
     impl PlatformSaver for BrowserDownloadSaver {
         fn save_file(&mut self, filename: &str, mime: &str, bytes: &[u8]) -> Result<String, String> {
@@ -15,6 +33,52 @@ mod web_app {
             dl.click(DownloadOptions::default())
                 .map_err(|e| format!("Trigger download failed: {e:?}"))?;
             Ok(format!("Downloaded '{filename}' via browser."))
+        }
+
+        fn request_open_urdf_file(&mut self) -> Result<(), String> {
+            let document = web_sys::window()
+                .and_then(|w| w.document())
+                .ok_or_else(|| "Browser document unavailable".to_string())?;
+            let input: web_sys::HtmlInputElement = document
+                .create_element("input")
+                .map_err(|e| format!("Create file input failed: {e:?}"))?
+                .dyn_into()
+                .map_err(|_| "Input element cast failed".to_string())?;
+            input.set_type("file");
+            input.set_accept(".urdf,.xml,.zip");
+            let _ = input.set_attribute("data-testid", "urdf-file-input");
+
+            let queue = Rc::clone(&self.opened_queue);
+            let input_for_cb = input.clone();
+            let closure = Closure::wrap(Box::new(move |_event: web_sys::Event| {
+                if let Some(files) = input_for_cb.files() {
+                    if let Some(file) = files.get(0) {
+                        let name = file.name();
+                        let queue_inner = Rc::clone(&queue);
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if let Ok(ab_val) =
+                                wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await
+                            {
+                                let bytes = js_sys::Uint8Array::new(&ab_val).to_vec();
+                                queue_inner.borrow_mut().push((name, bytes));
+                            }
+                        });
+                    }
+                }
+            }) as Box<dyn FnMut(web_sys::Event)>);
+
+            input
+                .add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())
+                .map_err(|e| format!("Bind change listener failed: {e:?}"))?;
+            input.click();
+
+            self.active_input = Some(input);
+            self._active_closure = Some(closure);
+            Ok(())
+        }
+
+        fn poll_opened_files(&mut self) -> Vec<(String, Vec<u8>)> {
+            std::mem::take(&mut *self.opened_queue.borrow_mut())
         }
     }
 
@@ -51,7 +115,7 @@ mod web_app {
                     web_options,
                     Box::new(|_cc| {
                         Ok(Box::new(WebWrapper {
-                            inner: RockyStudioApp::new(Box::new(BrowserDownloadSaver)),
+                            inner: RockyStudioApp::new(Box::new(BrowserDownloadSaver::new())),
                         }))
                     }),
                 )

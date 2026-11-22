@@ -1,11 +1,22 @@
 //! Layer 6 — Native Desktop Runner (`humanoid-desktop`) for Rocky Studio.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use craft_atomic::{NewFilePermissions, WriteOptions, atomic_write};
 use humanoid_ui::{PlatformSaver, RockyStudioApp};
 
-struct DesktopAtomicSaver;
+struct DesktopAtomicSaver {
+    opened_queue: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+}
+
+impl DesktopAtomicSaver {
+    fn new() -> Self {
+        Self {
+            opened_queue: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
 
 impl PlatformSaver for DesktopAtomicSaver {
     fn save_file(&mut self, filename: &str, _mime: &str, bytes: &[u8]) -> Result<String, String> {
@@ -19,6 +30,43 @@ impl PlatformSaver for DesktopAtomicSaver {
         atomic_write(&dest, bytes, &opts)
             .map_err(|e| format!("Atomic save failed for {}: {e}", dest.display()))?;
         Ok(format!("Saved atomically to {}", dest.display()))
+    }
+
+    fn request_open_urdf_file(&mut self) -> Result<(), String> {
+        let queue = Arc::clone(&self.opened_queue);
+        std::thread::spawn(move || {
+            let output = std::process::Command::new("zenity")
+                .args([
+                    "--file-selection",
+                    "--title=Select URDF or ZIP Robot Bundle",
+                    "--file-filter=URDF / ZIP | *.urdf *.xml *.zip",
+                ])
+                .output()
+                .ok();
+            if let Some(out) = output {
+                if out.status.success() {
+                    let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    let path = PathBuf::from(&path_str);
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "uploaded.urdf".to_string());
+                        if let Ok(mut q) = queue.lock() {
+                            q.push((name, bytes));
+                        }
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn poll_opened_files(&mut self) -> Vec<(String, Vec<u8>)> {
+        self.opened_queue
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
     }
 }
 
@@ -51,7 +99,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(|_cc| {
             Ok(Box::new(DesktopWrapper {
-                inner: RockyStudioApp::new(Box::new(DesktopAtomicSaver)),
+                inner: RockyStudioApp::new(Box::new(DesktopAtomicSaver::new())),
             }))
         }),
     )

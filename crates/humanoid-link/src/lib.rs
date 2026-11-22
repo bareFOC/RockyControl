@@ -1,7 +1,7 @@
 //! Layer 4 — `RobotTransport` trait & Stage 1 Sim / Stage 2 Serial backends (`humanoid-link`).
 
 use humanoid_control::JointCalibration;
-use humanoid_proto::{HostToMcu, MAX_JOINTS, McuToHost};
+use humanoid_proto::{HostToMcu, MAX_JOINTS, McuToHost, ModelFormat, ModelRequest, ModelResponse};
 use humanoid_sim::{CopperReplayLog, CopperSimRunner, SimFaultInjection};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +65,20 @@ pub trait RobotTransport {
             std::io::ErrorKind::Unsupported,
             "not supported by transport",
         ))
+    }
+    /// Sends a single `ModelRequest` (`GetInfo` or `ReadChunk`) to the MCU onboard model store.
+    fn exchange_model(&mut self, _req: ModelRequest) -> Option<ModelResponse> {
+        None
+    }
+    /// Stages a URDF / kinematics blob into the simulated MCU flash store (Sim mode only).
+    fn stage_sim_mcu_model(
+        &mut self,
+        _name: &str,
+        _format: ModelFormat,
+        _blob: Vec<u8>,
+        _joint_count: u8,
+    ) -> bool {
+        false
     }
 }
 
@@ -156,6 +170,21 @@ impl RobotTransport for SimTransport {
     fn save_copper_log(&self, path: &std::path::Path) -> std::io::Result<()> {
         self.runner.save_copper_log_to_path(path)
     }
+
+    fn exchange_model(&mut self, req: ModelRequest) -> Option<ModelResponse> {
+        self.runner.exchange_model_request(req)
+    }
+
+    fn stage_sim_mcu_model(
+        &mut self,
+        name: &str,
+        format: ModelFormat,
+        blob: Vec<u8>,
+        joint_count: u8,
+    ) -> bool {
+        self.runner.stage_mcu_model(name, format, blob, joint_count);
+        true
+    }
 }
 
 /// Native desktop wired USB Networking (CDC-NCM) UDP transport (`10.42.0.2:7777`).
@@ -242,5 +271,21 @@ impl RobotTransport for UdpTransport {
             link_errors: self.link_errors,
             connected: self.last_rx_ok,
         }
+    }
+
+    fn exchange_model(&mut self, req: ModelRequest) -> Option<ModelResponse> {
+        // Query dedicated MCU Flash Model Service on UDP port 7778 (control port + 1)
+        let model_addr = std::net::SocketAddr::new(
+            self.remote_addr.ip(),
+            self.remote_addr.port().saturating_add(1),
+        );
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(80)));
+        let mut tx = [0u8; humanoid_proto::MAX_MODEL_COBS_FRAME_BYTES];
+        let wire = humanoid_proto::encode_model_req_cobs(&req, &mut tx).ok()?;
+        sock.send_to(wire, model_addr).ok()?;
+        let mut rx = [0u8; humanoid_proto::MAX_MODEL_COBS_FRAME_BYTES];
+        let (n, _) = sock.recv_from(&mut rx).ok()?;
+        humanoid_proto::decode_model_resp_cobs(&mut rx[..n]).ok()
     }
 }

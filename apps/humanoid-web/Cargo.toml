@@ -11,5 +11,17 @@ eframe.workspace = true
 craft-platform = { workspace = true, features = ["browser"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement", "Element"] }
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "HtmlCanvasElement",
+    "HtmlInputElement",
+    "HtmlElement",
+    "File",
+    "FileList",
+    "Event",
+    "EventTarget",
+    "Element",
+] }
 console_error_panic_hook = "0.1"
