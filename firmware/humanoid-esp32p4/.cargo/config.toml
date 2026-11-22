@@ -1,0 +1,9 @@
+[build]
+# ESP32-P4 dual-core HP RISC-V with single-precision hardware FPU (RV32IMAFC)
+target = "riscv32imafc-unknown-none-elf"
+
+[target.riscv32imafc-unknown-none-elf]
+runner = "espflash flash --monitor"
+
+[unstable]
+build-std = ["alloc", "core"]

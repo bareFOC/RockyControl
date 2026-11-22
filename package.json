@@ -1,0 +1,10 @@
+{
+  "name": "rocky-studio",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "sh scripts/dev.sh",
+    "build": "sh scripts/build.sh",
+    "lint": "sh scripts/lint.sh"
+  }
+}

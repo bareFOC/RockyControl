@@ -1,0 +1,91 @@
+[workspace]
+resolver = "3"
+members = [
+    "xtask",
+    "crates/humanoid-proto",
+    "crates/humanoid-control",
+    "crates/humanoid-cu-nodes",
+    "crates/humanoid-sim",
+    "crates/humanoid-model",
+    "crates/humanoid-link",
+    "crates/humanoid-viewport",
+    "crates/humanoid-ui",
+    "apps/humanoid-desktop",
+    "apps/humanoid-web",
+]
+exclude = [
+    "firmware/humanoid-fw-core",
+    "firmware/humanoid-rp2350",
+    "firmware/humanoid-esp32p4",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Internal layered crates
+humanoid-proto = { path = "crates/humanoid-proto", default-features = false }
+humanoid-control = { path = "crates/humanoid-control", default-features = false }
+humanoid-cu-nodes = { path = "crates/humanoid-cu-nodes", default-features = false }
+humanoid-sim = { path = "crates/humanoid-sim" }
+humanoid-model = { path = "crates/humanoid-model" }
+humanoid-link = { path = "crates/humanoid-link" }
+humanoid-viewport = { path = "crates/humanoid-viewport" }
+humanoid-ui = { path = "crates/humanoid-ui" }
+
+# Pinned storytold/craft-libs ecosystem (immutable commit SHA)
+craft-ui = { git = "https://github.com/storytold/craft-libs.git", rev = "068e079c7be4b100a8a6b305b31ac881e069727e", features = ["serde"] }
+craft-keymap = { git = "https://github.com/storytold/craft-libs.git", rev = "068e079c7be4b100a8a6b305b31ac881e069727e", features = ["egui", "ui"] }
+craft-atomic = { git = "https://github.com/storytold/craft-libs.git", rev = "068e079c7be4b100a8a6b305b31ac881e069727e" }
+craft-platform = { git = "https://github.com/storytold/craft-libs.git", rev = "068e079c7be4b100a8a6b305b31ac881e069727e" }
+craft-quit = { git = "https://github.com/storytold/craft-libs.git", rev = "068e079c7be4b100a8a6b305b31ac881e069727e", features = ["egui"] }
+craft-xtask = { git = "https://github.com/storytold/craft-libs.git", rev = "068e079c7be4b100a8a6b305b31ac881e069727e" }
+
+# egui / eframe (matched to storytold/craft-libs egui 0.37 via [patch.crates-io])
+egui = { version = "0.37", default-features = false, features = ["default_fonts", "serde"] }
+egui_glow = { version = "0.37", default-features = false }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "persistence"] }
+egui_plot = "0.38"
+glow = "0.17"
+
+# 3D viewport, URDF & kinematics
+three-d = { version = "0.19", default-features = false }
+three-d-asset = { version = "0.10", default-features = false, features = ["stl", "obj"] }
+urdf-rs = "0.10"
+k = "0.32"
+
+# Wire protocol & no_std helpers
+serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1.1", default-features = false }
+bitflags = { version = "2", default-features = false, features = ["serde"] }
+
+# Input, timing & utilities
+gilrs = "0.11"
+web-time = "1.1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[patch.crates-io]
+ecolor = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+emath = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+epaint = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+epaint_default_fonts = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui-winit = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui-wgpu = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+egui_glow = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+eframe = { git = "https://github.com/storytold/egui.git", rev = "6d518fc799681571963842f95b55a6b68431b15a" }
+winit = { git = "https://github.com/storytold/winit.git", rev = "a517b3846ee8457d84ee4975110bfda6797c44dc" }
+
+[profile.release]
+opt-level = 2
+lto = false
+codegen-units = 16
+
+[profile.release.package.js-sys]
+opt-level = 0
+
+[profile.release.package.web-sys]
+opt-level = 0

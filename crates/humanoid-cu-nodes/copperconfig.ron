@@ -1,0 +1,36 @@
+(
+    tasks: [
+        (id: "servo_ctrl", type: "humanoid_cu_nodes::DirectServoTask"),
+    ],
+    bridges: [
+        // Stage 1 Sim: overridden via simulation callbacks (SimulatedServoPlant / HostLink)
+        // Stage 2 RP2350: bound to embassy-usb CDC-ACM
+        (
+            id: "host_link",
+            type: "humanoid_cu_nodes::HostLinkBridge",
+            channels: [
+                Rx(id: "rx_cmd"),
+                Tx(id: "tx_telem"),
+            ],
+        ),
+        // Stage 1 Sim: overridden by SimulatedServoPlant
+        // Stage 2 RP2350: bound to PIO UART / CAN servo driver
+        (
+            id: "servo_bus",
+            type: "humanoid_cu_nodes::ServoBusBridge",
+            channels: [
+                Rx(id: "rx_state"),
+                Tx(id: "tx_cmd"),
+            ],
+        ),
+    ],
+    cnx: [
+        (src: "host_link/rx_cmd", dst: "servo_ctrl", msg: "humanoid_proto::HostToMcu"),
+        (src: "servo_bus/rx_state", dst: "servo_ctrl", msg: "humanoid_control::RawServoFeedback"),
+        (src: "servo_ctrl", dst: "servo_bus/tx_cmd", msg: "humanoid_control::RawServoCommand"),
+        (src: "servo_ctrl", dst: "host_link/tx_telem", msg: "humanoid_proto::McuToHost"),
+    ],
+    // Future Stage 3 Extension Hooks (intentionally stubbed):
+    // - imu_src -> cu_ahrs::CuAhrs -> UpperBodyBalance (missions: ["Combat"])
+    // - swap host_link to cu-crsf (ELRS) without touching DirectServoTask or ServoBusBridge
+)

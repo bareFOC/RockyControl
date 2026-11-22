@@ -1,0 +1,6 @@
+{
+  "name": "Rocky Studio",
+  "description": "Software-first humanoid robotics control workstation with 3D URDF mirroring, real-time f32 safety kernel simulation, calibration, keyframe action studio, and fault injection.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

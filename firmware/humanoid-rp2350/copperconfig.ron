@@ -1,0 +1,43 @@
+(
+    tasks: [
+        (
+            id: "servo_ctrl",
+            type: "humanoid_fw_core::copper::DirectServoCuTask",
+            config: {
+                "joint_count": 17,
+            },
+        ),
+    ],
+    bridges: [
+        // Wired USB link (CDC-ACM serial OR CDC-NCM USB Ethernet UDP) via Embassy mailbox
+        (
+            id: "host_link",
+            type: "humanoid_fw_core::copper::HostLinkBridge",
+            channels: [
+                Rx(id: "rx_cmd"),
+                Tx(id: "tx_telem"),
+            ],
+        ),
+        // Servo actuator bus (BenchLoopbackBus on Day 1, UART/PIO half-duplex in Milestone 2.2)
+        (
+            id: "servo_bus",
+            type: "humanoid_fw_core::copper::ServoBusBridge",
+            channels: [
+                Rx(id: "rx_state"),
+                Tx(id: "tx_cmd"),
+            ],
+        ),
+    ],
+    cnx: [
+        (src: "host_link/rx_cmd", dst: "servo_ctrl", msg: "humanoid_fw_core::copper::HostCmdMsg"),
+        (src: "servo_bus/rx_state", dst: "servo_ctrl", msg: "humanoid_fw_core::copper::ServoFeedbackMsg"),
+        (src: "servo_ctrl", dst: "servo_bus/tx_cmd", msg: "humanoid_fw_core::copper::ControlStepMsg"),
+        (src: "servo_ctrl", dst: "host_link/tx_telem", msg: "humanoid_fw_core::copper::ControlStepMsg"),
+    ],
+    logging: (
+        enable_task_logging: false,
+    ),
+    // Future Stage 3 Extension Points:
+    // - Add IMU source + cu_ahrs -> UpperBodyBalance task (mission: "Combat")
+    // - Swap host_link to cu-crsf (ELRS) without touching DirectServoCuTask or ServoBusBridge
+)
