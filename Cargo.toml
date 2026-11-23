@@ -2,21 +2,21 @@
 resolver = "3"
 members = [
     "xtask",
-    "crates/humanoid-proto",
-    "crates/humanoid-control",
-    "crates/humanoid-cu-nodes",
-    "crates/humanoid-sim",
-    "crates/humanoid-model",
-    "crates/humanoid-link",
-    "crates/humanoid-viewport",
-    "crates/humanoid-ui",
-    "apps/humanoid-desktop",
-    "apps/humanoid-web",
+    "crates/rk-proto",
+    "crates/rk-control",
+    "crates/rk-cu-nodes",
+    "crates/rk-sim",
+    "crates/rk-model",
+    "crates/rk-link",
+    "crates/rk-viewport",
+    "crates/rk-ui",
+    "apps/rk-desktop",
+    "apps/rk-web",
 ]
 exclude = [
-    "firmware/humanoid-fw-core",
-    "firmware/humanoid-rp2350",
-    "firmware/humanoid-esp32p4",
+    "firmware/rk-fw-core",
+    "firmware/rk-rp2350",
+    "firmware/rk-esp32p4",
 ]
 
 [workspace.package]
@@ -26,14 +26,14 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 # Internal layered crates
-humanoid-proto = { path = "crates/humanoid-proto", default-features = false }
-humanoid-control = { path = "crates/humanoid-control", default-features = false }
-humanoid-cu-nodes = { path = "crates/humanoid-cu-nodes", default-features = false }
-humanoid-sim = { path = "crates/humanoid-sim" }
-humanoid-model = { path = "crates/humanoid-model" }
-humanoid-link = { path = "crates/humanoid-link" }
-humanoid-viewport = { path = "crates/humanoid-viewport" }
-humanoid-ui = { path = "crates/humanoid-ui" }
+rk-proto = { path = "crates/rk-proto", default-features = false }
+rk-control = { path = "crates/rk-control", default-features = false }
+rk-cu-nodes = { path = "crates/rk-cu-nodes", default-features = false }
+rk-sim = { path = "crates/rk-sim" }
+rk-model = { path = "crates/rk-model" }
+rk-link = { path = "crates/rk-link" }
+rk-viewport = { path = "crates/rk-viewport" }
+rk-ui = { path = "crates/rk-ui" }
 
 # Pinned storytold/craft-libs ecosystem (immutable commit SHA)
 craft-ui = { git = "https://github.com/storytold/craft-libs.git", rev = "068e079c7be4b100a8a6b305b31ac881e069727e", features = ["serde"] }

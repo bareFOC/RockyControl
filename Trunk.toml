@@ -1,10 +1,10 @@
 [build]
-target = "apps/humanoid-web/index.html"
+target = "apps/rk-web/index.html"
 dist = "dist"
 public_url = "./"
 
 [watch]
-watch = ["apps/humanoid-web", "crates", "assets"]
+watch = ["apps/rk-web", "crates", "assets"]
 
 [serve]
 addresses = ["0.0.0.0"]

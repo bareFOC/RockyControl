@@ -1,0 +1,25 @@
+[package]
+name = "rk-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rk-proto.workspace = true
+rk-control.workspace = true
+rk-sim.workspace = true
+rk-model.workspace = true
+rk-link.workspace = true
+rk-viewport.workspace = true
+
+egui.workspace = true
+egui_plot.workspace = true
+craft-ui.workspace = true
+craft-keymap.workspace = true
+gilrs.workspace = true
+web-time.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"

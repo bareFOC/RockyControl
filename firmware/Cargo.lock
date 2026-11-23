@@ -1344,64 +1344,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9356095b4b41197bba32173600e1582792cda618f65d12f68e2e77d273413c5"
 
 [[package]]
-name = "humanoid-control"
-version = "0.1.0"
-dependencies = [
- "humanoid-proto",
- "serde",
-]
-
-[[package]]
-name = "humanoid-fw-core"
-version = "0.1.0"
-dependencies = [
- "critical-section",
- "cu-bincode",
- "cu29",
- "humanoid-control",
- "humanoid-proto",
- "serde",
-]
-
-[[package]]
-name = "humanoid-proto"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.13.2",
- "postcard",
- "serde",
-]
-
-[[package]]
-name = "humanoid-rp2350"
-version = "0.1.0"
-dependencies = [
- "buddy_system_allocator",
- "cortex-m",
- "cortex-m-rt",
- "critical-section",
- "cu-bincode",
- "cu29",
- "cu29-build",
- "defmt 1.2.0",
- "defmt-rtt",
- "embassy-executor",
- "embassy-futures",
- "embassy-net",
- "embassy-rp",
- "embassy-time",
- "embassy-usb",
- "humanoid-control",
- "humanoid-fw-core",
- "humanoid-proto",
- "panic-probe",
- "portable-atomic",
- "serde",
- "spin 0.12.3",
- "static_cell",
-]
-
-[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2004,6 +1946,64 @@ name = "rgb"
 version = "0.8.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
+
+[[package]]
+name = "rk-control"
+version = "0.1.0"
+dependencies = [
+ "rk-proto",
+ "serde",
+]
+
+[[package]]
+name = "rk-fw-core"
+version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "cu-bincode",
+ "cu29",
+ "rk-control",
+ "rk-proto",
+ "serde",
+]
+
+[[package]]
+name = "rk-proto"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "postcard",
+ "serde",
+]
+
+[[package]]
+name = "rk-rp2350"
+version = "0.1.0"
+dependencies = [
+ "buddy_system_allocator",
+ "cortex-m",
+ "cortex-m-rt",
+ "critical-section",
+ "cu-bincode",
+ "cu29",
+ "cu29-build",
+ "defmt 1.2.0",
+ "defmt-rtt",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-net",
+ "embassy-rp",
+ "embassy-time",
+ "embassy-usb",
+ "panic-probe",
+ "portable-atomic",
+ "rk-control",
+ "rk-fw-core",
+ "rk-proto",
+ "serde",
+ "spin 0.12.3",
+ "static_cell",
+]
 
 [[package]]
 name = "ron"

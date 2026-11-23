@@ -1,13 +1,13 @@
 [workspace]
 resolver = "3"
 members = [
-    "humanoid-fw-core",
-    "humanoid-rp2350",
+    "rk-fw-core",
+    "rk-rp2350",
 ]
 # ESP32-P4 requires the RISC-V esp-hal toolchain (`riscv32imafc-unknown-none-elf`),
-# so it remains standalone while sharing `humanoid-fw-core` and `firmware/copperconfig.ron`.
+# so it remains standalone while sharing `rk-fw-core` and `firmware/copperconfig.ron`.
 exclude = [
-    "humanoid-esp32p4",
+    "rk-esp32p4",
 ]
 
 [profile.dev]

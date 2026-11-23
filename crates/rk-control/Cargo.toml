@@ -1,0 +1,13 @@
+[package]
+name = "rk-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["std"]
+std = ["rk-proto/std", "serde/std"]
+
+[dependencies]
+rk-proto.workspace = true
+serde.workspace = true

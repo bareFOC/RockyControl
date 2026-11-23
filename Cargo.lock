@@ -1193,126 +1193,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
-name = "humanoid-control"
-version = "0.1.0"
-dependencies = [
- "humanoid-proto",
- "serde",
-]
-
-[[package]]
-name = "humanoid-cu-nodes"
-version = "0.1.0"
-dependencies = [
- "humanoid-control",
- "humanoid-proto",
- "serde",
-]
-
-[[package]]
-name = "humanoid-desktop"
-version = "0.1.0"
-dependencies = [
- "craft-atomic",
- "craft-quit",
- "eframe",
- "egui",
- "humanoid-ui",
-]
-
-[[package]]
-name = "humanoid-link"
-version = "0.1.0"
-dependencies = [
- "humanoid-control",
- "humanoid-proto",
- "humanoid-sim",
-]
-
-[[package]]
-name = "humanoid-model"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "humanoid-control",
- "humanoid-proto",
- "k",
- "serde",
- "serde_json",
- "urdf-rs 0.10.0",
- "zip",
-]
-
-[[package]]
-name = "humanoid-proto"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.13.2",
- "postcard",
- "serde",
-]
-
-[[package]]
-name = "humanoid-sim"
-version = "0.1.0"
-dependencies = [
- "humanoid-control",
- "humanoid-cu-nodes",
- "humanoid-proto",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "humanoid-ui"
-version = "0.1.0"
-dependencies = [
- "craft-keymap",
- "craft-ui",
- "egui",
- "egui_plot",
- "gilrs",
- "humanoid-control",
- "humanoid-link",
- "humanoid-model",
- "humanoid-proto",
- "humanoid-sim",
- "humanoid-viewport",
- "serde",
- "serde_json",
- "wasm-bindgen-futures",
- "web-time",
-]
-
-[[package]]
-name = "humanoid-viewport"
-version = "0.1.0"
-dependencies = [
- "egui",
- "egui_glow",
- "glow",
- "humanoid-model",
- "humanoid-proto",
- "three-d",
- "three-d-asset",
-]
-
-[[package]]
-name = "humanoid-web"
-version = "0.1.0"
-dependencies = [
- "console_error_panic_hook",
- "craft-platform",
- "eframe",
- "egui",
- "humanoid-ui",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "icu_collections"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2668,6 +2548,127 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
+
+[[package]]
+name = "rk-control"
+version = "0.1.0"
+dependencies = [
+ "rk-proto",
+ "serde",
+]
+
+[[package]]
+name = "rk-cu-nodes"
+version = "0.1.0"
+dependencies = [
+ "rk-control",
+ "rk-proto",
+ "serde",
+]
+
+[[package]]
+name = "rk-desktop"
+version = "0.1.0"
+dependencies = [
+ "craft-atomic",
+ "craft-quit",
+ "eframe",
+ "egui",
+ "rk-ui",
+]
+
+[[package]]
+name = "rk-link"
+version = "0.1.0"
+dependencies = [
+ "rk-control",
+ "rk-proto",
+ "rk-sim",
+]
+
+[[package]]
+name = "rk-model"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "k",
+ "rk-control",
+ "rk-proto",
+ "serde",
+ "serde_json",
+ "urdf-rs 0.10.0",
+ "zip",
+]
+
+[[package]]
+name = "rk-proto"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "postcard",
+ "serde",
+]
+
+[[package]]
+name = "rk-sim"
+version = "0.1.0"
+dependencies = [
+ "rk-control",
+ "rk-cu-nodes",
+ "rk-proto",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rk-ui"
+version = "0.1.0"
+dependencies = [
+ "craft-keymap",
+ "craft-ui",
+ "egui",
+ "egui_plot",
+ "gilrs",
+ "rk-control",
+ "rk-link",
+ "rk-model",
+ "rk-proto",
+ "rk-sim",
+ "rk-viewport",
+ "serde",
+ "serde_json",
+ "wasm-bindgen-futures",
+ "web-time",
+]
+
+[[package]]
+name = "rk-viewport"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "egui_glow",
+ "glow",
+ "rk-control",
+ "rk-model",
+ "rk-proto",
+ "three-d",
+ "three-d-asset",
+]
+
+[[package]]
+name = "rk-web"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "craft-platform",
+ "eframe",
+ "egui",
+ "js-sys",
+ "rk-ui",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
 
 [[package]]
 name = "ron"

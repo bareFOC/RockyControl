@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0b0f17" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <title>Rocky Studio — Rust egui Humanoid Workstation</title>
+    <link data-trunk rel="rust" data-bin="rk-web" data-wasm-opt="0" />
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        overscroll-behavior: none;
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+        -webkit-tap-highlight-color: transparent;
+        background: #0b0f17;
+        color: #cbd5e1;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      }
+      #rocky_canvas {
+        display: block;
+        width: 100vw;
+        width: 100dvw;
+        height: 100vh;
+        height: 100dvh;
+        touch-action: none;
+      }
+      #rocky_loading {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        background: radial-gradient(circle at 50% 42%, #131c2b 0%, #0b0f17 68%);
+        z-index: 20;
+        opacity: 1;
+        visibility: visible;
+        transition: opacity 240ms ease-out, visibility 0s linear 0s;
+      }
+      #rocky_loading.fade-out {
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+        transition: opacity 240ms ease-out, visibility 0s linear 240ms;
+      }
+      .rocky-emblem {
+        width: 64px;
+        height: 64px;
+        filter: drop-shadow(0 6px 20px rgba(14, 165, 233, 0.22));
+      }
+      .rocky-title-block {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 5px;
+      }
+      .rocky-title {
+        font-size: 18px;
+        font-weight: 700;
+        letter-spacing: 0.16em;
+        color: #eef4fc;
+      }
+      .rocky-subtitle {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        color: #7c93b2;
+        text-transform: uppercase;
+      }
+      .rocky-progress-track {
+        width: 210px;
+        height: 3px;
+        border-radius: 2px;
+        background: rgba(56, 76, 104, 0.45);
+        overflow: hidden;
+        position: relative;
+      }
+      .rocky-progress-bar {
+        position: absolute;
+        inset: 0;
+        width: 42%;
+        border-radius: 2px;
+        background: linear-gradient(90deg, rgba(14, 116, 144, 0.2), #38bdf8, rgba(14, 116, 144, 0.2));
+        animation: rockySweep 1.25s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+      }
+      @keyframes rockySweep {
+        0% { transform: translateX(-110%); }
+        100% { transform: translateX(260%); }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="rocky_loading" aria-live="polite">
+      <svg class="rocky-emblem" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <polygon points="32,4 56,18 56,46 32,60 8,46 8,18" fill="#111927" stroke="#2d4360" stroke-width="2" />
+        <polygon points="32,12 49,22 32,32 15,22" fill="#1b3048" stroke="#38bdf8" stroke-width="1.4" />
+        <polygon points="15,22 32,32 32,52 15,42" fill="#142336" stroke="#2d4c6e" stroke-width="1.2" />
+        <polygon points="49,22 32,32 32,52 49,42" fill="#0f1b2b" stroke="#2d4c6e" stroke-width="1.2" />
+        <circle cx="32" cy="32" r="3.2" fill="#38bdf8" />
+      </svg>
+      <div class="rocky-title-block">
+        <div class="rocky-title">ROCKY STUDIO</div>
+        <div id="rocky_loading_status" class="rocky-subtitle">Initializing WebGL2 CAD Mirror</div>
+      </div>
+      <div class="rocky-progress-track">
+        <div class="rocky-progress-bar"></div>
+      </div>
+    </div>
+    <canvas id="rocky_canvas"></canvas>
+  </body>
+</html>
