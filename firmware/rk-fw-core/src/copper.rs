@@ -208,8 +208,13 @@ pub struct ServoFeedbackMsg {
     pub imu_available: bool,
     pub imu_pitch_rad: f32,
     pub imu_roll_rad: f32,
+    pub imu_yaw_rad: f32,
     pub imu_pitch_rate_rad_s: f32,
     pub imu_roll_rate_rad_s: f32,
+    pub imu_yaw_rate_rad_s: f32,
+    pub imu_gravity_x: f32,
+    pub imu_gravity_y: f32,
+    pub imu_gravity_z: f32,
 }
 
 impl From<RawServoFeedback> for ServoFeedbackMsg {
@@ -223,8 +228,13 @@ impl From<RawServoFeedback> for ServoFeedbackMsg {
             imu_available: fb.imu.available,
             imu_pitch_rad: fb.imu.pitch_rad,
             imu_roll_rad: fb.imu.roll_rad,
+            imu_yaw_rad: fb.imu.yaw_rad,
             imu_pitch_rate_rad_s: fb.imu.pitch_rate_rad_s,
             imu_roll_rate_rad_s: fb.imu.roll_rate_rad_s,
+            imu_yaw_rate_rad_s: fb.imu.yaw_rate_rad_s,
+            imu_gravity_x: fb.imu.gravity[0],
+            imu_gravity_y: fb.imu.gravity[1],
+            imu_gravity_z: fb.imu.gravity[2],
         }
     }
 }
@@ -241,8 +251,11 @@ impl From<&ServoFeedbackMsg> for RawServoFeedback {
                 available: msg.imu_available,
                 pitch_rad: msg.imu_pitch_rad,
                 roll_rad: msg.imu_roll_rad,
+                yaw_rad: msg.imu_yaw_rad,
                 pitch_rate_rad_s: msg.imu_pitch_rate_rad_s,
                 roll_rate_rad_s: msg.imu_roll_rate_rad_s,
+                yaw_rate_rad_s: msg.imu_yaw_rate_rad_s,
+                gravity: [msg.imu_gravity_x, msg.imu_gravity_y, msg.imu_gravity_z],
             },
         }
     }
@@ -269,8 +282,13 @@ pub struct ControlStepMsg {
     pub telem_imu_available: bool,
     pub telem_imu_pitch_rad: f32,
     pub telem_imu_roll_rad: f32,
+    pub telem_imu_yaw_rad: f32,
     pub telem_imu_pitch_rate: f32,
     pub telem_imu_roll_rate: f32,
+    pub telem_imu_yaw_rate: f32,
+    pub telem_imu_gravity_x: f32,
+    pub telem_imu_gravity_y: f32,
+    pub telem_imu_gravity_z: f32,
     pub telem_gait_phase_rad: f32,
     pub telem_pitch_corr_rad: f32,
     pub telem_roll_corr_rad: f32,
@@ -281,6 +299,8 @@ pub struct ControlStepMsg {
     pub telem_foot_dx_m: f32,
     pub telem_foot_dy_m: f32,
     pub telem_hip_height_m: f32,
+    /// `fall_orientation::*` wire code captured with `TILT_FALL_CUTOFF`.
+    pub telem_fall_orientation: u8,
 }
 
 impl ControlStepMsg {
@@ -312,8 +332,15 @@ impl ControlStepMsg {
                 available: self.telem_imu_available,
                 pitch_rad: self.telem_imu_pitch_rad,
                 roll_rad: self.telem_imu_roll_rad,
+                yaw_rad: self.telem_imu_yaw_rad,
                 pitch_rate_rad_s: self.telem_imu_pitch_rate,
                 roll_rate_rad_s: self.telem_imu_roll_rate,
+                yaw_rate_rad_s: self.telem_imu_yaw_rate,
+                gravity: [
+                    self.telem_imu_gravity_x,
+                    self.telem_imu_gravity_y,
+                    self.telem_imu_gravity_z,
+                ],
             },
             balance: rk_proto::BalanceTelemetry {
                 gait_phase_rad: self.telem_gait_phase_rad,
@@ -326,6 +353,7 @@ impl ControlStepMsg {
                 foot_dx_m: self.telem_foot_dx_m,
                 foot_dy_m: self.telem_foot_dy_m,
                 hip_height_m: self.telem_hip_height_m,
+                fall_orientation: self.telem_fall_orientation,
             },
         }
     }
@@ -423,8 +451,13 @@ impl CuTask for DirectServoCuTask {
             telem_imu_available: step.telemetry.imu.available,
             telem_imu_pitch_rad: step.telemetry.imu.pitch_rad,
             telem_imu_roll_rad: step.telemetry.imu.roll_rad,
+            telem_imu_yaw_rad: step.telemetry.imu.yaw_rad,
             telem_imu_pitch_rate: step.telemetry.imu.pitch_rate_rad_s,
             telem_imu_roll_rate: step.telemetry.imu.roll_rate_rad_s,
+            telem_imu_yaw_rate: step.telemetry.imu.yaw_rate_rad_s,
+            telem_imu_gravity_x: step.telemetry.imu.gravity[0],
+            telem_imu_gravity_y: step.telemetry.imu.gravity[1],
+            telem_imu_gravity_z: step.telemetry.imu.gravity[2],
             telem_gait_phase_rad: step.telemetry.balance.gait_phase_rad,
             telem_pitch_corr_rad: step.telemetry.balance.pitch_corr_rad,
             telem_roll_corr_rad: step.telemetry.balance.roll_corr_rad,
@@ -435,6 +468,7 @@ impl CuTask for DirectServoCuTask {
             telem_foot_dx_m: step.telemetry.balance.foot_dx_m,
             telem_foot_dy_m: step.telemetry.balance.foot_dy_m,
             telem_hip_height_m: step.telemetry.balance.hip_height_m,
+            telem_fall_orientation: step.telemetry.balance.fall_orientation,
         });
 
         Ok(())

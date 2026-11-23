@@ -47,6 +47,8 @@ impl RockyStudioApp {
                 imu_available: telem.imu.available,
                 imu_pitch_rad: telem.imu.pitch_rad,
                 imu_roll_rad: telem.imu.roll_rad,
+                fall_event_active: telem.faults.contains(rk_proto::FaultFlags::TILT_FALL_CUTOFF)
+                    && telem.imu.available,
             },
         );
         self.apply_viewport_interaction(&interaction);

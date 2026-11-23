@@ -42,8 +42,11 @@ impl ImuSlot {
                     available: false,
                     pitch_rad: 0.0,
                     roll_rad: 0.0,
+                    yaw_rad: 0.0,
                     pitch_rate_rad_s: 0.0,
                     roll_rate_rad_s: 0.0,
+                    yaw_rate_rad_s: 0.0,
+                    gravity: [0.0, -9.81, 0.0],
                 },
                 health: ImuHealth::Uninitialized,
                 sample_count: 0,
@@ -60,8 +63,11 @@ impl ImuSlot {
             slot.health = health;
             if state.pitch_rad.is_finite()
                 && state.roll_rad.is_finite()
+                && state.yaw_rad.is_finite()
                 && state.pitch_rate_rad_s.is_finite()
                 && state.roll_rate_rad_s.is_finite()
+                && state.yaw_rate_rad_s.is_finite()
+                && state.gravity.iter().all(|v| v.is_finite())
             {
                 slot.state = state;
                 slot.sample_count = slot.sample_count.saturating_add(1);
@@ -122,8 +128,11 @@ mod tests {
             available: true,
             pitch_rad: 0.12,
             roll_rad: -0.08,
+            yaw_rad: 0.25,
             pitch_rate_rad_s: 0.4,
             roll_rate_rad_s: -0.2,
+            yaw_rate_rad_s: 0.1,
+            gravity: [0.1, -9.8, 0.0],
         };
         slot.publish(valid, ImuHealth::Healthy, 150);
         assert_eq!(slot.latest(), Some(valid));
@@ -142,5 +151,37 @@ mod tests {
         assert_eq!(slot.latest(), Some(valid));
         assert_eq!(slot.health(), ImuHealth::Fault);
         assert_eq!(slot.sample_count(), 1);
+    }
+
+    #[test]
+    fn imu_slot_rejects_nan_gravity_and_retains_last_good_state() {
+        let slot = ImuSlot::new();
+        let valid = ImuState {
+            available: true,
+            pitch_rad: 0.12,
+            roll_rad: -0.08,
+            yaw_rad: 0.25,
+            pitch_rate_rad_s: 0.4,
+            roll_rate_rad_s: -0.2,
+            yaw_rate_rad_s: 0.1,
+            gravity: [0.1, -9.8, 0.0],
+        };
+        slot.publish(valid, ImuHealth::Healthy, 100);
+        assert_eq!(slot.latest(), Some(valid));
+
+        // NaN gravity must not overwrite the healthy reading
+        let mut bad_gravity = [0.0_f32; 3];
+        bad_gravity[1] = f32::NAN;
+        slot.publish(
+            ImuState {
+                gravity: bad_gravity,
+                ..valid
+            },
+            ImuHealth::Fault,
+            110,
+        );
+        assert_eq!(slot.latest(), Some(valid));
+        assert_eq!(slot.sample_count(), 1);
+        assert_eq!(slot.last_update_ms(), 100);
     }
 }

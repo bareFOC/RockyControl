@@ -2,6 +2,9 @@
 
 Real-time `#![no_std]` humanoid control firmware built on **`copper-rs` (`cu29 1.3`)** and **`embassy-rs`**, targeting **RP2350** first and architected for **ESP32-P4** expansion with zero control-logic duplication.
 
+> [!WARNING]
+> **BREAKING telemetry wire-format change (fall-recovery):** `rk_proto::ImuState` now carries full orientation (`yaw_rad`, `yaw_rate_rad_s`, `gravity`) in every `McuToHost` frame. The COBS telemetry protocol has no version/CRC handshake, so the firmware image and the host workstation must be **rebuilt and flashed in lockstep**. A host and MCU running different `ImuState` layouts cannot communicate — update (or roll back) all sides together.
+
 ---
 
 ## 1. Layered Crate Architecture

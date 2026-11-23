@@ -44,6 +44,8 @@ impl RockyStudioApp {
                 imu_available: telem.imu.available,
                 imu_pitch_rad: telem.imu.pitch_rad,
                 imu_roll_rad: telem.imu.roll_rad,
+                fall_event_active: telem.faults.contains(FaultFlags::TILT_FALL_CUTOFF)
+                    && telem.imu.available,
             },
         );
         self.apply_viewport_interaction(&interaction);
@@ -550,6 +552,88 @@ impl RockyStudioApp {
                 });
             });
             self.viewport_hud_rects[2] = act_resp.response.rect.expand(3.0);
+        }
+
+        // 4. Top-Right Floating HUD: Fall / Recovery status and consent controls.
+        //    Recovery is strictly opt-in: auto_recovery_enabled is OFF by default and
+        //    the watcher starts a sequence only with explicit operator confirmation.
+        let rec_w = 258.0_f32.min(vp_rect.width() - att_w - pad * 3.0);
+        if rec_w >= 190.0 {
+            let rec_area = Rect::from_min_size(
+                pos2(vp_rect.right() - rec_w - pad, vp_rect.top() + pad),
+                vec2(rec_w, 168.0),
+            );
+            let mut rec_ui = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(rec_area)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            rec_ui.set_clip_rect(vp_rect);
+            let rec_resp = hud_frame().show(&mut rec_ui, |ui| {
+                ui.set_width(rec_w - 20.0);
+                let (status, color) = if self.fall_event_active {
+                    ("FALL DETECTED", Color32::from_rgb(248, 113, 113))
+                } else {
+                    ("STABLE", Color32::from_rgb(74, 222, 128))
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("RECOVERY")
+                            .strong()
+                            .size(11.0)
+                            .color(Color32::from_rgb(138, 162, 192)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(status).strong().size(11.0).color(color));
+                    });
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "Orientation: {}  ·  {}",
+                        self.fall_orientation.label(),
+                        self.recovery_state.label()
+                    ))
+                    .monospace()
+                    .size(10.5)
+                    .color(Color32::from_rgb(172, 194, 218)),
+                );
+                ui.add_space(4.0);
+                ui.checkbox(
+                    &mut self.auto_recovery_enabled,
+                    "Auto recovery (opt-in)",
+                );
+                ui.checkbox(&mut self.operator_confirmed, "Operator confirmed");
+                ui.add_space(4.0);
+                let can_get_up = self.fall_event_active
+                    && self.recovery_state == crate::RecoveryState::FallLatched;
+                let get_up = egui::Button::new(
+                    RichText::new(if can_get_up { "Get Up" } else { "Get Up (no fall)" })
+                        .strong()
+                        .size(12.0),
+                )
+                .fill(if can_get_up {
+                    Color32::from_rgb(14, 116, 144)
+                } else {
+                    Color32::from_rgb(26, 36, 52)
+                })
+                .min_size(Vec2::new(ui.available_width(), 28.0))
+                .corner_radius(CornerRadius::same(5));
+                if ui.add(get_up).clicked() {
+                    // Explicit operator initiation: the watcher picks this up next frame
+                    // and still runs the full ordered ClearFaults -> Drive -> playback flow.
+                    self.operator_confirmed = true;
+                    self.get_up_requested = true;
+                    self.model.status_message =
+                        "Get Up requested — waiting for upright stance before recovery."
+                            .to_string();
+                }
+                ui.label(
+                    RichText::new("Open-loop keyframes · aborts on re-fall")
+                        .size(9.5)
+                        .color(Color32::from_rgb(118, 138, 162)),
+                );
+            });
+            self.viewport_hud_rects[3] = rec_resp.response.rect.expand(3.0);
         }
     }
 }

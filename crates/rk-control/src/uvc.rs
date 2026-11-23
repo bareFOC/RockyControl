@@ -12,7 +12,7 @@
 use core::f32::consts::PI;
 
 use libm::{acosf, asinf, atan2f, cosf, sinf, sqrtf};
-use rk_proto::{BalanceGains, ImuState, WalkCmd, uvc_phase};
+use rk_proto::{BalanceGains, ImuState, WalkCmd, classify_fall, fall_orientation, uvc_phase};
 
 /// Reference tick duration of ai2001 `main.c` (`10 ms` = 100 Hz).
 const REF_TICK_SEC: f32 = 0.010_f32;
@@ -233,6 +233,9 @@ pub struct UvcStepOutput {
     pub in_fall_tuck: bool,
     /// True once protective tuck duration completes -> caller must drop torque & latch `TILT_FALL_CUTOFF`.
     pub fall_cutoff_ready: bool,
+    /// Orientation classified from the IMU when the protective tuck engaged
+    /// (`fall_orientation::*` wire code), forwarded into telemetry on cutoff latch.
+    pub fall_orientation: u8,
     pub walk_active: bool,
 }
 
@@ -387,6 +390,7 @@ impl UvcController {
                 hip_height_m: self.geom.min_height,
                 in_fall_tuck: true,
                 fall_cutoff_ready: self.phase_elapsed_sec >= FALL_TUCK_DURATION_SEC,
+                fall_orientation: classify_fall(&imu).to_wire(),
                 walk_active: false,
             };
         }
@@ -725,6 +729,7 @@ impl UvcController {
             hip_height_m: self.auto_h,
             in_fall_tuck: false,
             fall_cutoff_ready: false,
+            fall_orientation: fall_orientation::UNKNOWN,
             walk_active: wants_walk || walk.walk_enabled,
         }
     }
@@ -870,8 +875,11 @@ mod tests {
             available: true,
             pitch_rad: 0.21,
             roll_rad: 0.09,
+            yaw_rad: 0.0,
             pitch_rate_rad_s: 0.8,
             roll_rate_rad_s: 0.3,
+            yaw_rate_rad_s: 0.0,
+            gravity: [0.0, -9.81, 0.0],
         };
         let mut out = ctrl.step(0.005, imu_lean, walk, gains);
         for _ in 0..20 {
@@ -887,8 +895,11 @@ mod tests {
             available: true,
             pitch_rad: 0.85,
             roll_rad: 0.0,
+            yaw_rad: 0.0,
             pitch_rate_rad_s: 2.0,
             roll_rate_rad_s: 0.0,
+            yaw_rate_rad_s: 0.0,
+            gravity: [0.0, -9.81, 0.0],
         };
         let tuck0 = ctrl.step(0.01, imu_fall, walk, gains);
         assert_eq!(tuck0.phase, UvcPhase::FallTuck);

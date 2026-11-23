@@ -510,7 +510,7 @@ impl KinematicRig {
         &self,
         angles_rad: &[f32; MAX_JOINTS],
     ) -> HashMap<String, Isometry3<f32>> {
-        self.compute_link_transforms_with_tilt(angles_rad, 0.0, 0.0)
+        self.compute_link_transforms_with_tilt(angles_rad, 0.0, 0.0, 0.0)
     }
 
     /// Evaluates full 3D world poses with live IMU torso `(pitch_rad, roll_rad)` tilt
@@ -520,8 +520,9 @@ impl KinematicRig {
         angles_rad: &[f32; MAX_JOINTS],
         pitch_rad: f32,
         roll_rad: f32,
+        yaw_rad: f32,
     ) -> HashMap<String, Isometry3<f32>> {
-        let (map, _) = self.compute_link_transforms_with_root(angles_rad, pitch_rad, roll_rad);
+        let (map, _) = self.compute_link_transforms_with_root(angles_rad, pitch_rad, roll_rad, yaw_rad);
         map
     }
 
@@ -530,6 +531,7 @@ impl KinematicRig {
         angles_rad: &[f32; MAX_JOINTS],
         pitch_rad: f32,
         roll_rad: f32,
+        yaw_rad: f32,
     ) -> (HashMap<String, Isometry3<f32>>, Isometry3<f32>) {
         let dof = self.chain.dof();
         let positions: Vec<f32> = (0..dof)
@@ -542,7 +544,9 @@ impl KinematicRig {
         // Pitch tilts torso forward (+X axis in Y-Up world); roll tilts sideways (+Z axis)
         let tilt_rot = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pitch_rad)
             * UnitQuaternion::from_axis_angle(&Vector3::z_axis(), -roll_rad);
-        let combined_rot = tilt_rot * base_rot;
+        // Heading is a world-Y rotation applied outside the torso tilt.
+        let yaw_rot = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), yaw_rad);
+        let combined_rot = yaw_rot * tilt_rot * base_rot;
 
         let mut raw_map = HashMap::with_capacity(self.visuals.len() + self.links.len() + 2);
         for node in self.chain.iter() {
@@ -625,7 +629,30 @@ impl KinematicRig {
         roll_rad: f32,
         calibration: &[JointCalibration],
     ) -> Option<[f32; MAX_JOINTS]> {
-        let (_, root_iso) = self.compute_link_transforms_with_root(current_angles, pitch_rad, roll_rad);
+        self.solve_limb_ik_with_yaw(
+            target_link,
+            current_angles,
+            world_target,
+            pitch_rad,
+            roll_rad,
+            0.0,
+            calibration,
+        )
+    }
+
+    /// Yaw-aware variant of [`Self::solve_limb_ik`] used by the viewport so IK
+    /// targets are transformed through the same world-Y heading as the rendered robot.
+    pub fn solve_limb_ik_with_yaw(
+        &self,
+        target_link: &str,
+        current_angles: &[f32; MAX_JOINTS],
+        world_target: Point3<f32>,
+        pitch_rad: f32,
+        roll_rad: f32,
+        yaw_rad: f32,
+        calibration: &[JointCalibration],
+    ) -> Option<[f32; MAX_JOINTS]> {
+        let (_, root_iso) = self.compute_link_transforms_with_root(current_angles, pitch_rad, roll_rad, yaw_rad);
         let end_node = self.chain.find(target_link)?;
         let serial = k::SerialChain::from_end(end_node);
         if serial.dof() == 0 {

@@ -18,7 +18,7 @@ use core::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use rk_proto::{
     BalanceGains, BalanceTelemetry, ConfigCmd, ControlMode, FaultFlags, HostToMcu, ImuState,
-    MAX_JOINTS, McuToHost, WATCHDOG_TIMEOUT_MS, WalkCmd, uvc_phase,
+    MAX_JOINTS, McuToHost, WATCHDOG_TIMEOUT_MS, WalkCmd, classify_fall, fall_orientation, uvc_phase,
 };
 use serde::{Deserialize, Serialize};
 pub use uvc::{LegGeometry, LegIkAngles, UvcController, UvcPhase, UvcStepOutput, solve_leg_ik};
@@ -185,6 +185,9 @@ pub struct DirectServoKernel {
     last_walk_cmd: WalkCmd,
     uvc: UvcController,
     uvc_blend: f32,
+    /// Orientation captured at the most recent `TILT_FALL_CUTOFF` latch
+    /// (`fall_orientation::*` wire code). Persists while the fault is latched.
+    fall_orientation: u8,
 }
 
 impl DirectServoKernel {
@@ -212,6 +215,7 @@ impl DirectServoKernel {
             last_walk_cmd: WalkCmd::default(),
             uvc: UvcController::new(LegGeometry::rocky_mk1()),
             uvc_blend: 0.0,
+            fall_orientation: fall_orientation::UNKNOWN,
         }
     }
 
@@ -337,6 +341,7 @@ impl DirectServoKernel {
                     self.last_host_target_rad = measured_rad;
                     self.uvc.reset();
                     self.uvc_blend = 0.0;
+                    self.fall_orientation = fall_orientation::UNKNOWN;
                     cleared_faults_this_tick = true;
                 }
             }
@@ -413,6 +418,14 @@ impl DirectServoKernel {
                     // Protective tuck complete -> drop torque & latch TILT_FALL_CUTOFF
                     self.active_mode = ControlMode::EStop;
                     self.latched_faults.insert(FaultFlags::TILT_FALL_CUTOFF);
+                    // Prefer the orientation latched by the UVC tuck; fall back to
+                    // classifying the current sample directly if unavailable.
+                    self.fall_orientation = if uvc_out.fall_orientation != fall_orientation::UNKNOWN
+                    {
+                        uvc_out.fall_orientation
+                    } else {
+                        classify_fall(&imu).to_wire()
+                    };
                 } else {
                     // Bumpless ramp into UVC leg targets (instant when actively catching a shove or tucking)
                     let target_blend = 1.0_f32;
@@ -473,6 +486,7 @@ impl DirectServoKernel {
                     foot_dx_m: uvc_out.foot_dx_m,
                     foot_dy_m: uvc_out.foot_dy_m,
                     hip_height_m: uvc_out.hip_height_m,
+                    fall_orientation: fall_orientation::UNKNOWN,
                 };
             } else {
                 self.uvc.reset();
@@ -484,6 +498,8 @@ impl DirectServoKernel {
             self.uvc_blend = 0.0;
             balance_telem.uvc_phase = uvc_phase::IDLE;
         }
+
+        balance_telem.fall_orientation = self.fall_orientation;
 
         // 6. Compute torque mask & soft-stopped, slew-clamped servo targets (Safety always downstream)
         let mut torque_state_mask: u32 = 0;
@@ -726,6 +742,57 @@ mod tests {
         assert_eq!(fall.telemetry.active_mode, ControlMode::EStop);
         assert_eq!(fall.servo_cmd.torque_mask, 0);
         assert!(fall.telemetry.faults.contains(FaultFlags::TILT_FALL_CUTOFF));
+    }
+
+    #[test]
+    fn fall_cutoff_captures_classified_orientation_in_telemetry() {
+        let cal = [JointCalibration {
+            min_rad: -2.2,
+            max_rad: 2.2,
+            ..Default::default()
+        }; 21];
+
+        let cases: [(f32, f32, u8); 4] = [
+            (1.0, 0.0, fall_orientation::PRONE),
+            (-1.0, 0.0, fall_orientation::SUPINE),
+            (0.0, 1.0, fall_orientation::SIDE_RIGHT),
+            (0.0, -1.0, fall_orientation::SIDE_LEFT),
+        ];
+
+        for (pitch, roll, expected) in cases {
+            let mut kernel = DirectServoKernel::new(21, &cal);
+            let mut fb = RawServoFeedback::default();
+            fb.imu = ImuState {
+                available: true,
+                pitch_rad: pitch,
+                roll_rad: roll,
+                gravity: [0.0, -9.81, 0.0],
+                ..Default::default()
+            };
+            let mut cmd = HostToMcu {
+                mode: ControlMode::Drive,
+                torque_mask: (1u32 << 21) - 1,
+                walk: WalkCmd {
+                    balance_enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let mut out = kernel.step(10, 0.01, Some(&cmd), &fb);
+            for tick in 2..=20 {
+                cmd.seq = tick;
+                out = kernel.step(tick * 10, 0.01, Some(&cmd), &fb);
+            }
+            assert!(
+                out.telemetry.faults.contains(FaultFlags::TILT_FALL_CUTOFF),
+                "pitch={pitch} roll={roll} must latch a fall"
+            );
+            assert_eq!(
+                out.telemetry.balance.fall_orientation, expected,
+                "pitch={pitch} roll={roll} orientation mismatch"
+            );
+        }
     }
 
     #[test]

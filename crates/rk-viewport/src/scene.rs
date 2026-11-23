@@ -26,6 +26,10 @@ pub struct ViewportFrameData {
     pub selected_joint: usize,
     pub current_ma: [u16; MAX_JOINTS],
     pub estop_active: bool,
+    /// True while a fall event is active; overrides all other per-joint tints.
+    pub fall_event_active: bool,
+    /// Monotonic wall time (seconds) from the egui context, used for the fall pulse.
+    pub time_sec: f64,
     pub orbit: OrbitState,
     pub marker_radius: f32,
 }
@@ -148,7 +152,14 @@ impl SceneResources {
             let mut b = item.base_rgba[2];
             let mut emissive = Srgba::BLACK;
 
-            if let Some(j_idx) = item.joint_index {
+            if frame.fall_event_active {
+                // Highest-priority tint: pulsing red fall alarm overrides heat/selection.
+                let (ar, ag, ab) = fall_albedo_rgb();
+                r = ar;
+                g = ag;
+                b = ab;
+                emissive = fall_emissive(frame.time_sec);
+            } else if let Some(j_idx) = item.joint_index {
                 let ma = frame.current_ma[j_idx];
                 if ma >= HEAT_TINT_THRESHOLD_MA {
                     let t = ((ma - HEAT_TINT_THRESHOLD_MA) as f32
@@ -550,6 +561,23 @@ fn build_floor_grid(ctx: &Context) -> Vec<Gm<Mesh, ColorMaterial>> {
     lines
 }
 
+/// Base albedo (linear 0..1) applied to every solid mesh during a fall alarm.
+fn fall_albedo_rgb() -> (f32, f32, f32) {
+    (0.85, 0.06, 0.06)
+}
+
+/// 0.5 + 0.5*sin(2*pi*2*t): a deterministic 2 Hz pulse in [0, 1].
+fn fall_pulse(time_sec: f64) -> f32 {
+    let phase = time_sec * std::f64::consts::TAU * 2.0;
+    (0.5 + 0.5 * phase.sin()) as f32
+}
+
+/// Emissive red channel pulses; green/blue stay dark so the mesh reads unmistakably red.
+fn fall_emissive(time_sec: f64) -> Srgba {
+    let pulse = fall_pulse(time_sec);
+    Srgba::new((200.0 * pulse) as u8, 0, 0, 255)
+}
+
 fn iso_to_mat4(iso: &Isometry3<f32>) -> Mat4 {
     let m: Matrix4<f32> = iso.to_homogeneous();
     let s = m.as_slice();
@@ -559,4 +587,40 @@ fn iso_to_mat4(iso: &Isometry3<f32>) -> Mat4 {
         s[8], s[9], s[10], s[11],
         s[12], s[13], s[14], s[15],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fall_emissive_red_exceeds_non_fall_and_pulses_with_time() {
+        // Non-fall meshes start from a black emissive (no active tint).
+        let non_fall_red = Srgba::BLACK.r;
+
+        // Across a full 2 Hz cycle the fall emissive red channel is always brighter
+        // than the non-fall value and takes on distinct values as time advances.
+        let mut samples = [0u8; 3];
+        for (i, &t) in [0.0_f64, 0.125, 0.25].iter().enumerate() {
+            let red = fall_emissive(t).r;
+            assert!(
+                red > non_fall_red,
+                "fall emissive red {red} must exceed non-fall {non_fall_red} at t={t}"
+            );
+            samples[i] = red;
+        }
+
+        // Pulse must vary with time_sec (peak at t=0.125s, midpoint at t=0.0s/0.25s for 2 Hz).
+        assert!(
+            samples[1] > samples[0],
+            "emissive red must pulse: peak {} > midpoint {}",
+            samples[1], samples[0]
+        );
+    }
+
+    #[test]
+    fn fall_albedo_is_dominantly_red() {
+        let (r, g, b) = fall_albedo_rgb();
+        assert!(r > 0.8 && g < 0.1 && b < 0.1);
+    }
 }

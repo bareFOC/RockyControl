@@ -64,6 +64,8 @@ pub struct SimulatedServoPlant {
     // Deterministic 2-axis stepping-aware LIPM torso dynamics + virtual IMU state
     torso_pitch_rad: f32,
     torso_roll_rad: f32,
+    /// Synthetic heading accumulated from roll motion (deterministic, zero on reset).
+    torso_yaw_rad: f32,
     pitch_rate_rad_s: f32,
     roll_rate_rad_s: f32,
     act_pitch_corr: f32,
@@ -71,6 +73,23 @@ pub struct SimulatedServoPlant {
     act_foot_dx: f32,
     act_foot_dy: f32,
     last_balance: rk_proto::BalanceTelemetry,
+}
+
+/// Body-frame gravity consistent with the kinematics tilt rotation.
+///
+/// `tilt_rot = R_x(pitch) * R_z(-roll)` (pitch about +X, roll about -Z, matching
+/// `kinematics.rs`), so the sensor reading is `tilt_rot^-1 * (0, -9.81, 0)`
+/// `= R_z(roll) * R_x(-pitch) * (0, -9.81, 0)`. This guarantees the rendered
+/// orientation and the published gravity vector agree.
+fn gravity_from_tilt(pitch_rad: f32, roll_rad: f32) -> [f32; 3] {
+    const G: f32 = 9.81_f32;
+    // R_x(-pitch) applied to (0, -G, 0).
+    let y1 = -G * (-pitch_rad).cos();
+    let z1 = -G * (-pitch_rad).sin();
+    // R_z(roll) applied to the result (x starts at zero).
+    let sr = roll_rad.sin();
+    let cr = roll_rad.cos();
+    [-y1 * sr, y1 * cr, z1]
 }
 
 impl SimulatedServoPlant {
@@ -90,6 +109,7 @@ impl SimulatedServoPlant {
             faults: SimFaultInjection::default(),
             torso_pitch_rad: 0.0,
             torso_roll_rad: 0.0,
+            torso_yaw_rad: 0.0,
             pitch_rate_rad_s: 0.0,
             roll_rate_rad_s: 0.0,
             act_pitch_corr: 0.0,
@@ -136,6 +156,7 @@ impl SimulatedServoPlant {
     pub fn reset_upright(&mut self) {
         self.torso_pitch_rad = 0.0;
         self.torso_roll_rad = 0.0;
+        self.torso_yaw_rad = 0.0;
         self.pitch_rate_rad_s = 0.0;
         self.roll_rate_rad_s = 0.0;
         self.act_pitch_corr = 0.0;
@@ -322,6 +343,11 @@ impl SimulatedServoPlant {
             }
         }
 
+        // Deterministic synthetic heading: accumulated sway from roll motion,
+        // clamped so a violent fall cannot spin the robot arbitrarily far.
+        self.torso_yaw_rad = (self.torso_yaw_rad + self.roll_rate_rad_s * 0.06_f32 * dt)
+            .clamp(-0.6_f32, 0.6_f32);
+
         let mut temp_c = [28u8; MAX_JOINTS];
         for i in 0..self.joint_count {
             temp_c[i] = self.temp_c_f[i].round() as u8;
@@ -348,8 +374,11 @@ impl SimulatedServoPlant {
                     available: true,
                     pitch_rad: self.torso_pitch_rad,
                     roll_rad: self.torso_roll_rad,
+                    yaw_rad: self.torso_yaw_rad,
                     pitch_rate_rad_s: self.pitch_rate_rad_s,
                     roll_rate_rad_s: self.roll_rate_rad_s,
+                    yaw_rate_rad_s: self.roll_rate_rad_s * 0.06_f32,
+                    gravity: gravity_from_tilt(self.torso_pitch_rad, self.torso_roll_rad),
                 }
             },
         }
@@ -744,5 +773,47 @@ mod tests {
         }
         assert_eq!(last.active_mode, ControlMode::EStop);
         assert!(last.faults.contains(FaultFlags::TILT_FALL_CUTOFF));
+    }
+
+    #[test]
+    fn simulated_gravity_matches_forward_tilt() {
+        let mut plant = SimulatedServoPlant::new(6, [0.0; MAX_JOINTS]);
+
+        // Upright: gravity points straight down in body frame, yaw is zero.
+        let upright = plant.step_plant(0.01);
+        assert!(upright.imu.available);
+        assert_eq!(upright.imu.yaw_rad, 0.0);
+        let g0 = upright.imu.gravity;
+        assert!((g0[0]).abs() < 1e-6 && (g0[2]).abs() < 1e-6);
+        assert!((g0[1] + 9.81).abs() < 1e-6);
+
+        // Inject a pure forward pitch impulse and let the plant settle into a lean.
+        plant.apply_push_impulse(1.4, 0.0);
+        let mut tilted = upright;
+        for _ in 0..40 {
+            tilted = plant.step_plant(0.01);
+        }
+        let pitch = tilted.imu.pitch_rad;
+        assert!(pitch > 0.1, "expected forward lean, pitch={pitch}");
+
+        // Rotating world-down by the inverse tilt quaternion yields a body-frame
+        // gravity whose Z component grows with forward lean (classified as prone).
+        let g = tilted.imu.gravity;
+        let expected_z = 9.81_f32 * pitch.sin();
+        assert!(
+            (g[2] - expected_z).abs() < 1e-4,
+            "gravity Z must match forward tilt: got {:.4}, expected {:.4}",
+            g[2],
+            expected_z
+        );
+        assert!(g[2] > 0.0, "forward lean must produce positive body-Z gravity");
+        assert!((g[1] + 9.81_f32 * pitch.cos()).abs() < 1e-4);
+        assert!(g[0].abs() < 1e-4, "pure pitch must not introduce lateral gravity");
+
+        // Reset zeroes yaw and restores upright gravity.
+        plant.reset_upright();
+        let reset = plant.step_plant(0.01);
+        assert_eq!(reset.imu.yaw_rad, 0.0);
+        assert!((reset.imu.gravity[2]).abs() < 1e-6);
     }
 }

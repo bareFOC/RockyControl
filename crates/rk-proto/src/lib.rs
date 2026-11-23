@@ -26,6 +26,180 @@ pub enum ControlMode {
     Drive = 2, // Torque ON:  GUI streams target_rad -> robot mirrors GUI
 }
 
+/// Wire-encoded fall orientation identifiers.
+///
+/// `FallOrientation` is serialized in `BalanceTelemetry.fall_orientation` as the `u8`
+/// value defined here (matching the `#[repr(u8)]` discriminant of [`FallOrientation`]).
+/// A dedicated `u8` field keeps the telemetry layout allocation-free and `no_std`
+/// friendly while allowing the host to reconstruct the enum with
+/// [`FallOrientation::from_wire`].
+pub mod fall_orientation {
+    pub const UNKNOWN: u8 = 0;
+    pub const PRONE: u8 = 1;
+    pub const SUPINE: u8 = 2;
+    pub const SIDE_LEFT: u8 = 3;
+    pub const SIDE_RIGHT: u8 = 4;
+
+    pub const fn label(code: u8) -> &'static str {
+        match code {
+            PRONE => "PRONE",
+            SUPINE => "SUPINE",
+            SIDE_LEFT => "SIDE_LEFT",
+            SIDE_RIGHT => "SIDE_RIGHT",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
+/// Coarse fall orientation derived from the torso gravity vector.
+///
+/// The discriminants match [`fall_orientation`] wire codes. `Unknown` is the
+/// default for unavailable or invalid orientation samples.
+#[repr(u8)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FallOrientation {
+    #[default]
+    Unknown = fall_orientation::UNKNOWN,
+    Prone = fall_orientation::PRONE,
+    Supine = fall_orientation::SUPINE,
+    SideLeft = fall_orientation::SIDE_LEFT,
+    SideRight = fall_orientation::SIDE_RIGHT,
+}
+
+impl FallOrientation {
+    pub const fn to_wire(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_wire(code: u8) -> Self {
+        match code {
+            fall_orientation::PRONE => Self::Prone,
+            fall_orientation::SUPINE => Self::Supine,
+            fall_orientation::SIDE_LEFT => Self::SideLeft,
+            fall_orientation::SIDE_RIGHT => Self::SideRight,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        fall_orientation::label(self.to_wire())
+    }
+}
+
+/// Gravity magnitude below which a sample is considered unusable for classification.
+const CLASSIFY_MIN_GRAVITY_MAG: f32 = 0.5_f32;
+/// Horizontal gravity magnitude below which the torso is effectively upright.
+const CLASSIFY_MIN_HORIZONTAL_MAG: f32 = 0.05_f32;
+
+/// Classifies a fall orientation from an IMU sample.
+///
+/// Pure and `#![no_std]` compatible. The gravity vector is interpreted as the
+/// world-frame down vector when it is nearly vertical (which is what the BNO055
+/// gravity register and the simulator publish); in that case it is rotated into
+/// the body frame using the sample's Euler attitude so that the horizontal
+/// components align with the torso axes. If the gravity vector already carries a
+/// significant horizontal component it is treated as body-frame directly. This
+/// makes the classifier robust to both representations without guessing.
+///
+/// Body-frame convention (matching `KinematicRig::compute_link_transforms_with_root`):
+/// `+X` is the robot's right, `+Z` is forward, `+Y` is up. The dominant horizontal
+/// component selects the fall direction:
+/// - `+Z` gravity component (`pitch > 0`, falling forward) -> [`FallOrientation::Prone`]
+/// - `-Z` gravity component (`pitch < 0`, falling backward) -> [`FallOrientation::Supine`]
+/// - `+X` gravity component (falling toward the right) -> [`FallOrientation::SideRight`]
+/// - `-X` gravity component (falling toward the left) -> [`FallOrientation::SideLeft`]
+///
+/// Returns [`FallOrientation::Unknown`] when the IMU is unavailable, gravity is
+/// non-finite or near zero, or the torso is effectively upright.
+pub fn classify_fall(imu: &ImuState) -> FallOrientation {
+    if !imu.available {
+        return FallOrientation::Unknown;
+    }
+    let g = imu.gravity;
+    if !g[0].is_finite() || !g[1].is_finite() || !g[2].is_finite() {
+        return FallOrientation::Unknown;
+    }
+    let mag_sq = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
+    if !mag_sq.is_finite() || mag_sq < CLASSIFY_MIN_GRAVITY_MAG * CLASSIFY_MIN_GRAVITY_MAG {
+        return FallOrientation::Unknown;
+    }
+
+    // Body-frame horizontal components. If the sample already looks like a
+    // body-frame gravity vector (non-trivial horizontal component) use it as-is;
+    // otherwise rotate the world-frame vector into the body frame.
+    let raw_h = g[0] * g[0] + g[2] * g[2];
+    let (hx, hz) = if raw_h > CLASSIFY_MIN_HORIZONTAL_MAG * CLASSIFY_MIN_HORIZONTAL_MAG {
+        (g[0], g[2])
+    } else {
+        rotate_world_gravity_to_body(g, imu.pitch_rad, imu.roll_rad, imu.yaw_rad)
+    };
+
+    if !hx.is_finite() || !hz.is_finite() {
+        return FallOrientation::Unknown;
+    }
+    if hx.abs() < CLASSIFY_MIN_HORIZONTAL_MAG && hz.abs() < CLASSIFY_MIN_HORIZONTAL_MAG {
+        return FallOrientation::Unknown;
+    }
+
+    if hz.abs() >= hx.abs() {
+        // Forward axis: +Z gravity component means the torso tipped forward.
+        if hz >= 0.0 {
+            FallOrientation::Prone
+        } else {
+            FallOrientation::Supine
+        }
+    } else if hx >= 0.0 {
+        FallOrientation::SideRight
+    } else {
+        FallOrientation::SideLeft
+    }
+}
+
+/// Rotates a world-frame vector into the torso body frame using the same Euler
+/// axis order as `KinematicRig` (`yaw` about world Y, `pitch` about X, `-roll` about Z).
+#[inline]
+fn rotate_world_gravity_to_body(g: [f32; 3], pitch: f32, roll: f32, yaw: f32) -> (f32, f32) {
+    let (sp, cp) = sin_cos_f32(pitch);
+    let (sr, cr) = sin_cos_f32(roll);
+    let (sy, cy) = sin_cos_f32(yaw);
+
+    // R = R_y(yaw) * R_x(pitch) * R_z(-roll); body = R^T * world.
+    // Apply R_z(roll), then R_x(-pitch), then R_y(-yaw).
+    let x1 = g[0] * cr - g[1] * sr;
+    let y1 = g[0] * sr + g[1] * cr;
+    let z1 = g[2];
+
+    let y2 = y1 * cp + z1 * sp;
+    let z2 = -y1 * sp + z1 * cp;
+
+    let x3 = x1 * cy - z2 * sy;
+    let z3 = x1 * sy + z2 * cy;
+
+    let _ = y2; // vertical component is not used by classification
+    (x3, z3)
+}
+
+/// Small deterministic sine/cosine pair for the classifier (no external `libm` in proto).
+#[inline]
+fn sin_cos_f32(x: f32) -> (f32, f32) {
+    if !x.is_finite() {
+        return (0.0, 1.0);
+    }
+    let two_pi = core::f32::consts::TAU;
+    let mut a = x % two_pi;
+    if a > core::f32::consts::PI {
+        a -= two_pi;
+    } else if a < -core::f32::consts::PI {
+        a += two_pi;
+    }
+    let a2 = a * a;
+    let s = a * (1.0
+        + a2 * (-0.166_666_67 + a2 * (0.008_333_334 + a2 * (-0.000_198_412_7 + a2 * 0.000_002_755_732))));
+    let c = 1.0
+        + a2 * (-0.5 + a2 * (0.041_666_664 + a2 * (-0.001_388_888_9 + a2 * 0.000_024_801_588)));
+    (s, c)
+}
+
 bitflags! {
     #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
     #[serde(transparent)]
@@ -108,15 +282,21 @@ impl Default for BalanceGains {
     }
 }
 
-/// Compact 2-axis torso IMU attitude & gyro rate snapshot (`f32`, `#![no_std]`).
+/// Compact full-orientation torso IMU attitude, gyro rate & gravity snapshot (`f32`, `#![no_std]`).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub struct ImuState {
     /// True when a hardware or simulated IMU is present and reporting live orientation.
     pub available: bool,
     pub pitch_rad: f32,
     pub roll_rad: f32,
+    /// Heading / yaw angle in radians.
+    pub yaw_rad: f32,
     pub pitch_rate_rad_s: f32,
     pub roll_rate_rad_s: f32,
+    /// Yaw angular rate in radians per second.
+    pub yaw_rate_rad_s: f32,
+    /// World-frame gravity vector in m/s² (`[x, y, z]`); upright nominal `[0.0, -9.81, 0.0]`.
+    pub gravity: [f32; 3],
 }
 
 /// Wire-encoded UVC state machine phase identifiers (aligned with ai2001 modes 710..770 + FallTuck).
@@ -165,6 +345,9 @@ pub struct BalanceTelemetry {
     pub foot_dy_m: f32,
     /// Active UVC pelvis-to-ankle height (`auto_h`, meters).
     pub hip_height_m: f32,
+    /// Fall orientation captured when `TILT_FALL_CUTOFF` latched
+    /// (`fall_orientation::*` wire code; `UNKNOWN` when no fall has been classified).
+    pub fall_orientation: u8,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
@@ -564,8 +747,11 @@ pub fn decode_mcu_cobs(buf: &mut [u8]) -> Result<McuToHost, CodecError> {
         || pkt.applied_target_rad.iter().any(|v| !v.is_finite())
         || !pkt.imu.pitch_rad.is_finite()
         || !pkt.imu.roll_rad.is_finite()
+        || !pkt.imu.yaw_rad.is_finite()
         || !pkt.imu.pitch_rate_rad_s.is_finite()
         || !pkt.imu.roll_rate_rad_s.is_finite()
+        || !pkt.imu.yaw_rate_rad_s.is_finite()
+        || pkt.imu.gravity.iter().any(|v| !v.is_finite())
         || !pkt.balance.gait_phase_rad.is_finite()
         || !pkt.balance.pitch_corr_rad.is_finite()
         || !pkt.balance.roll_corr_rad.is_finite()
@@ -656,8 +842,11 @@ mod tests {
                 available: true,
                 pitch_rad: 0.08,
                 roll_rad: -0.05,
+                yaw_rad: 0.31,
                 pitch_rate_rad_s: 0.42,
                 roll_rate_rad_s: -0.19,
+                yaw_rate_rad_s: 0.07,
+                gravity: [0.12, -9.78, 0.04],
             },
             balance: BalanceTelemetry {
                 gait_phase_rad: 1.25,
@@ -670,6 +859,7 @@ mod tests {
                 foot_dx_m: 0.045,
                 foot_dy_m: -0.032,
                 hip_height_m: 0.61,
+                fall_orientation: fall_orientation::PRONE,
             },
             ..Default::default()
         };
@@ -702,6 +892,77 @@ mod tests {
             assert!(decode_host_cobs(&mut buf[..sample.len()]).is_err());
             assert!(decode_mcu_cobs(&mut buf[..sample.len()]).is_err());
         }
+    }
+
+    #[test]
+    fn classify_fall_world_gravity_four_directions() {
+        // World-frame gravity is near-constant; the Euler attitude carries the tilt.
+        let sample = |pitch: f32, roll: f32| ImuState {
+            available: true,
+            pitch_rad: pitch,
+            roll_rad: roll,
+            gravity: [0.0, -9.81, 0.0],
+            ..Default::default()
+        };
+
+        // Forward pitch (pitch > 0) -> body +Z gravity -> Prone.
+        assert_eq!(classify_fall(&sample(1.2, 0.0)), FallOrientation::Prone);
+        // Backward pitch (pitch < 0) -> body -Z gravity -> Supine.
+        assert_eq!(classify_fall(&sample(-1.2, 0.0)), FallOrientation::Supine);
+        // Right roll (roll > 0) -> body +X gravity -> SideRight.
+        assert_eq!(classify_fall(&sample(0.0, 1.2)), FallOrientation::SideRight);
+        // Left roll (roll < 0) -> body -X gravity -> SideLeft.
+        assert_eq!(classify_fall(&sample(0.0, -1.2)), FallOrientation::SideLeft);
+    }
+
+    #[test]
+    fn classify_fall_body_frame_gravity_four_directions() {
+        // Already-rotated body-frame gravity vectors must classify directly.
+        let sample = |x: f32, z: f32| ImuState {
+            available: true,
+            gravity: [x, -8.0, z],
+            ..Default::default()
+        };
+        assert_eq!(classify_fall(&sample(0.0, 6.0)), FallOrientation::Prone);
+        assert_eq!(classify_fall(&sample(0.0, -6.0)), FallOrientation::Supine);
+        assert_eq!(classify_fall(&sample(6.0, 0.0)), FallOrientation::SideRight);
+        assert_eq!(classify_fall(&sample(-6.0, 0.0)), FallOrientation::SideLeft);
+    }
+
+    #[test]
+    fn classify_fall_unavailable_and_invalid_are_unknown() {
+        let mut s = ImuState {
+            pitch_rad: 1.2,
+            gravity: [0.0, -9.81, 0.0],
+            ..Default::default()
+        };
+        assert_eq!(classify_fall(&s), FallOrientation::Unknown, "IMU unavailable");
+
+        s.available = true;
+        s.gravity = [0.0, 0.0, 0.0];
+        assert_eq!(classify_fall(&s), FallOrientation::Unknown, "zero gravity");
+
+        s.gravity = [f32::NAN, -9.81, 0.0];
+        assert_eq!(classify_fall(&s), FallOrientation::Unknown, "non-finite gravity");
+
+        s.gravity = [0.0, -9.81, 0.0];
+        s.pitch_rad = 0.0;
+        s.roll_rad = 0.0;
+        assert_eq!(classify_fall(&s), FallOrientation::Unknown, "upright");
+    }
+
+    #[test]
+    fn fall_orientation_wire_round_trip() {
+        for o in [
+            FallOrientation::Unknown,
+            FallOrientation::Prone,
+            FallOrientation::Supine,
+            FallOrientation::SideLeft,
+            FallOrientation::SideRight,
+        ] {
+            assert_eq!(FallOrientation::from_wire(o.to_wire()), o);
+        }
+        assert_eq!(FallOrientation::from_wire(200), FallOrientation::Unknown);
     }
 
     #[test]

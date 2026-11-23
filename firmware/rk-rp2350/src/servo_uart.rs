@@ -35,8 +35,11 @@ static UART_BUS: Mutex<RefCell<UartBusState>> = Mutex::new(RefCell::new(UartBusS
             available: false,
             pitch_rad: 0.0,
             roll_rad: 0.0,
+            yaw_rad: 0.0,
             pitch_rate_rad_s: 0.0,
             roll_rate_rad_s: 0.0,
+            yaw_rate_rad_s: 0.0,
+            gravity: [0.0, -9.81, 0.0],
         },
     },
     last_cmd: RawServoCommand {

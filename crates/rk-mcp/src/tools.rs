@@ -6,7 +6,7 @@ use craft_mcp_server::{Contents, Info, Options, Reference, Server, Tools, text_r
 use rk_link::TransportKind;
 use rk_model::nalgebra::Point3;
 use rk_model::{AssetBundle, samples};
-use rk_proto::{ControlMode, ModelRequest, ModelResponse, uvc_phase};
+use rk_proto::{ControlMode, FallOrientation, ModelRequest, ModelResponse, uvc_phase};
 use rk_sim::verify_deterministic_replay;
 use serde_json::{Value, json};
 
@@ -240,6 +240,8 @@ impl<'a, H: McpHost> RockyMcpTools<'a, H> {
                 "pitch_corr_rad": b.pitch_corr_rad,
                 "roll_corr_rad": b.roll_corr_rad,
                 "gait_phase_rad": b.gait_phase_rad,
+                "fall_orientation": FallOrientation::from_wire(b.fall_orientation).label(),
+                "fall_orientation_code": b.fall_orientation,
             },
             "joints": joints,
         })

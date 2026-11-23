@@ -9,6 +9,24 @@ use serde::{Deserialize, Serialize};
 use crate::bundle::AssetBundle;
 use crate::kinematics::KinematicRig;
 
+/// Studio-side extensions on [`KinematicRig`] shared by the combat and recovery libraries.
+///
+/// Implemented here (rather than in `kinematics.rs`) so authored poses can be built
+/// by joint name while keeping kinematics focused on URDF parsing and FK.
+impl KinematicRig {
+    /// Builds the rig's default pose, applying named joint overrides clamped to each
+    /// joint's URDF limits. Unknown joint names are ignored deterministically.
+    pub fn pose_from_overrides(&self, overrides: &[(&str, f32)]) -> [f32; MAX_JOINTS] {
+        let mut arr = self.default_pose();
+        for (name, val) in overrides {
+            if let Some(j) = self.joints.iter().find(|jm| jm.name == *name) {
+                arr[j.index] = val.clamp(j.default_min_rad, j.default_max_rad);
+            }
+        }
+        arr
+    }
+}
+
 /// Teach & Action Studio keyframe.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Keyframe {
@@ -89,13 +107,7 @@ pub fn sample_action_move(
 
 pub fn default_combat_library(rig: &KinematicRig) -> Vec<ActionMove> {
     let pose = |overrides: &[(&str, f32)]| -> [f32; MAX_JOINTS] {
-        let mut arr = rig.default_pose();
-        for (name, val) in overrides {
-            if let Some(j) = rig.joints.iter().find(|jm| jm.name == *name) {
-                arr[j.index] = val.clamp(j.default_min_rad, j.default_max_rad);
-            }
-        }
-        arr
+        rig.pose_from_overrides(overrides)
     };
 
     let neutral = pose(&[]);
@@ -271,6 +283,278 @@ pub fn default_combat_library(rig: &KinematicRig) -> Vec<ActionMove> {
     ]
 }
 
+/// Pre-computed get-up motions, one per supported fall orientation.
+///
+/// Every move transitions from a tucked/fallen posture through a push-off, kneeling,
+/// and standing stage into the standard Guard stance. Poses are authored by joint name
+/// via [`KinematicRig::pose_from_overrides`], so every angle is clamped to that joint's
+/// URDF limits (which also matches the calibration soft limits for the bundled rig).
+pub fn default_recovery_library(rig: &KinematicRig) -> Vec<ActionMove> {
+    let pose = |overrides: &[(&str, f32)]| -> [f32; MAX_JOINTS] {
+        rig.pose_from_overrides(overrides)
+    };
+
+    // Final standing guard stance, identical to the combat library's Guard.
+    let guard = pose(&[
+        ("waist_yaw", 0.22),
+        ("head_yaw", -0.18),
+        ("l_shoulder_pitch", -1.10),
+        ("l_shoulder_roll", 0.20),
+        ("l_elbow_pitch", -1.72),
+        ("r_shoulder_pitch", -1.18),
+        ("r_shoulder_roll", -0.20),
+        ("r_elbow_pitch", -1.85),
+        ("l_hip_pitch", -0.26),
+        ("l_knee_pitch", 0.50),
+        ("l_ankle_pitch", -0.24),
+        ("r_hip_pitch", -0.16),
+        ("r_knee_pitch", 0.34),
+        ("r_ankle_pitch", -0.18),
+    ]);
+
+    // A balanced standing pose used as the fourth (stand) keyframe before Guard.
+    let stand = pose(&[
+        ("waist_yaw", 0.0),
+        ("head_yaw", 0.0),
+        ("head_pitch", 0.0),
+        ("l_shoulder_pitch", -0.22),
+        ("l_shoulder_roll", 0.14),
+        ("l_elbow_pitch", -0.52),
+        ("r_shoulder_pitch", -0.22),
+        ("r_shoulder_roll", -0.14),
+        ("r_elbow_pitch", -0.52),
+        ("l_hip_pitch", -0.22),
+        ("l_hip_roll", 0.04),
+        ("l_knee_pitch", 0.44),
+        ("l_ankle_pitch", -0.22),
+        ("r_hip_pitch", -0.22),
+        ("r_hip_roll", -0.04),
+        ("r_knee_pitch", 0.44),
+        ("r_ankle_pitch", -0.22),
+    ]);
+
+    let kf = |label: &str, duration_ms: u32, angles_rad: [f32; MAX_JOINTS]| Keyframe {
+        label: label.to_string(),
+        duration_ms,
+        angles_rad,
+    };
+
+    // Tucked/fallen start: hips folded, knees deeply bent, arms drawn in to protect the head.
+    let prone_fallen = pose(&[
+        ("waist_yaw", 0.0),
+        ("head_pitch", 0.30),
+        ("l_shoulder_pitch", -2.10),
+        ("l_shoulder_roll", 0.30),
+        ("l_elbow_pitch", -1.90),
+        ("r_shoulder_pitch", -2.10),
+        ("r_shoulder_roll", -0.30),
+        ("r_elbow_pitch", -1.90),
+        ("l_hip_pitch", -1.50),
+        ("l_knee_pitch", 1.95),
+        ("l_ankle_pitch", 0.40),
+        ("r_hip_pitch", -1.50),
+        ("r_knee_pitch", 1.95),
+        ("r_ankle_pitch", 0.40),
+    ]);
+    let prone_push = pose(&[
+        ("waist_yaw", 0.0),
+        ("head_pitch", 0.10),
+        ("l_shoulder_pitch", -1.55),
+        ("l_shoulder_roll", 0.25),
+        ("l_elbow_pitch", -0.35),
+        ("r_shoulder_pitch", -1.55),
+        ("r_shoulder_roll", -0.25),
+        ("r_elbow_pitch", -0.35),
+        ("l_hip_pitch", -1.10),
+        ("l_knee_pitch", 1.55),
+        ("l_ankle_pitch", 0.20),
+        ("r_hip_pitch", -1.10),
+        ("r_knee_pitch", 1.55),
+        ("r_ankle_pitch", 0.20),
+    ]);
+    let prone_kneel = pose(&[
+        ("waist_yaw", 0.0),
+        ("l_shoulder_pitch", -1.15),
+        ("l_elbow_pitch", -1.20),
+        ("r_shoulder_pitch", -1.15),
+        ("r_elbow_pitch", -1.20),
+        ("l_hip_pitch", -0.95),
+        ("l_knee_pitch", 1.25),
+        ("l_ankle_pitch", -0.30),
+        ("r_hip_pitch", -0.95),
+        ("r_knee_pitch", 1.25),
+        ("r_ankle_pitch", -0.30),
+    ]);
+
+    let supine_fallen = pose(&[
+        ("waist_yaw", -0.10),
+        ("head_pitch", -0.35),
+        ("l_shoulder_pitch", -1.90),
+        ("l_shoulder_roll", 0.55),
+        ("l_elbow_pitch", -1.70),
+        ("r_shoulder_pitch", -1.90),
+        ("r_shoulder_roll", -0.55),
+        ("r_elbow_pitch", -1.70),
+        ("l_hip_pitch", -1.35),
+        ("l_hip_roll", 0.25),
+        ("l_knee_pitch", 1.85),
+        ("l_ankle_pitch", 0.45),
+        ("r_hip_pitch", -1.35),
+        ("r_hip_roll", -0.25),
+        ("r_knee_pitch", 1.85),
+        ("r_ankle_pitch", 0.45),
+    ]);
+    let supine_push = pose(&[
+        ("waist_yaw", -0.10),
+        ("head_pitch", -0.10),
+        ("l_shoulder_pitch", -1.40),
+        ("l_shoulder_roll", 0.45),
+        ("l_elbow_pitch", -0.45),
+        ("r_shoulder_pitch", -1.40),
+        ("r_shoulder_roll", -0.45),
+        ("r_elbow_pitch", -0.45),
+        ("l_hip_pitch", -0.95),
+        ("l_knee_pitch", 1.45),
+        ("l_ankle_pitch", 0.15),
+        ("r_hip_pitch", -0.95),
+        ("r_knee_pitch", 1.45),
+        ("r_ankle_pitch", 0.15),
+    ]);
+    let supine_kneel = pose(&[
+        ("l_shoulder_pitch", -1.05),
+        ("l_elbow_pitch", -1.10),
+        ("r_shoulder_pitch", -1.05),
+        ("r_elbow_pitch", -1.10),
+        ("l_hip_pitch", -0.85),
+        ("l_knee_pitch", 1.20),
+        ("l_ankle_pitch", -0.25),
+        ("r_hip_pitch", -0.85),
+        ("r_knee_pitch", 1.20),
+        ("r_ankle_pitch", -0.25),
+    ]);
+
+    // Left-side fall: roll toward the left, left arm under the body, right arm bracing.
+    let left_fallen = pose(&[
+        ("waist_yaw", 0.12),
+        ("head_pitch", 0.20),
+        ("l_shoulder_pitch", -1.85),
+        ("l_shoulder_roll", 1.10),
+        ("l_elbow_pitch", -1.75),
+        ("r_shoulder_pitch", -1.35),
+        ("r_shoulder_roll", -0.55),
+        ("r_elbow_pitch", -0.90),
+        ("l_hip_pitch", -1.30),
+        ("l_hip_roll", 0.45),
+        ("l_knee_pitch", 1.80),
+        ("l_ankle_pitch", 0.35),
+        ("r_hip_pitch", -1.30),
+        ("r_hip_roll", -0.45),
+        ("r_knee_pitch", 1.55),
+        ("r_ankle_pitch", 0.35),
+    ]);
+    let left_push = pose(&[
+        ("waist_yaw", 0.12),
+        ("l_shoulder_pitch", -1.45),
+        ("l_shoulder_roll", 0.65),
+        ("l_elbow_pitch", -0.55),
+        ("r_shoulder_pitch", -1.25),
+        ("r_shoulder_roll", -0.40),
+        ("r_elbow_pitch", -0.55),
+        ("l_hip_pitch", -1.00),
+        ("l_hip_roll", 0.25),
+        ("l_knee_pitch", 1.40),
+        ("l_ankle_pitch", 0.10),
+        ("r_hip_pitch", -1.00),
+        ("r_knee_pitch", 1.25),
+        ("r_ankle_pitch", 0.10),
+    ]);
+    let left_kneel = pose(&[
+        ("l_shoulder_pitch", -1.10),
+        ("l_shoulder_roll", 0.30),
+        ("l_elbow_pitch", -1.15),
+        ("r_shoulder_pitch", -1.10),
+        ("r_shoulder_roll", -0.30),
+        ("r_elbow_pitch", -1.15),
+        ("l_hip_pitch", -0.90),
+        ("l_hip_roll", 0.12),
+        ("l_knee_pitch", 1.15),
+        ("l_ankle_pitch", -0.25),
+        ("r_hip_pitch", -0.90),
+        ("r_knee_pitch", 1.10),
+        ("r_ankle_pitch", -0.25),
+    ]);
+
+    // Right-side fall: mirror of the left-side sequence.
+    let right_fallen = pose(&[
+        ("waist_yaw", -0.12),
+        ("head_pitch", 0.20),
+        ("l_shoulder_pitch", -1.35),
+        ("l_shoulder_roll", 0.55),
+        ("l_elbow_pitch", -0.90),
+        ("r_shoulder_pitch", -1.85),
+        ("r_shoulder_roll", -1.10),
+        ("r_elbow_pitch", -1.75),
+        ("l_hip_pitch", -1.30),
+        ("l_hip_roll", 0.45),
+        ("l_knee_pitch", 1.55),
+        ("l_ankle_pitch", 0.35),
+        ("r_hip_pitch", -1.30),
+        ("r_hip_roll", -0.45),
+        ("r_knee_pitch", 1.80),
+        ("r_ankle_pitch", 0.35),
+    ]);
+    let right_push = pose(&[
+        ("waist_yaw", -0.12),
+        ("l_shoulder_pitch", -1.25),
+        ("l_shoulder_roll", 0.40),
+        ("l_elbow_pitch", -0.55),
+        ("r_shoulder_pitch", -1.45),
+        ("r_shoulder_roll", -0.65),
+        ("r_elbow_pitch", -0.55),
+        ("l_hip_pitch", -1.00),
+        ("l_knee_pitch", 1.25),
+        ("l_ankle_pitch", 0.10),
+        ("r_hip_pitch", -1.00),
+        ("r_hip_roll", -0.25),
+        ("r_knee_pitch", 1.40),
+        ("r_ankle_pitch", 0.10),
+    ]);
+    let right_kneel = pose(&[
+        ("l_shoulder_pitch", -1.10),
+        ("l_shoulder_roll", 0.30),
+        ("l_elbow_pitch", -1.15),
+        ("r_shoulder_pitch", -1.10),
+        ("r_shoulder_roll", -0.30),
+        ("r_elbow_pitch", -1.15),
+        ("l_hip_pitch", -0.90),
+        ("l_knee_pitch", 1.10),
+        ("l_ankle_pitch", -0.25),
+        ("r_hip_pitch", -0.90),
+        ("r_hip_roll", -0.12),
+        ("r_knee_pitch", 1.15),
+        ("r_ankle_pitch", -0.25),
+    ]);
+
+    let sequence = |name: &str, fallen, push, kneel| ActionMove {
+        name: name.to_string(),
+        category: "Recovery".to_string(),
+        keyframes: vec![
+            kf("Fallen Tuck", 520, fallen),
+            kf("Push Off", 620, push),
+            kf("Kneel", 600, kneel),
+            kf("Stand", 640, stand),
+            kf("Guard", 480, guard),
+        ],
+    };
+
+    vec![
+        sequence("Get Up Prone", prone_fallen, prone_push, prone_kneel),
+        sequence("Get Up Supine", supine_fallen, supine_push, supine_kneel),
+        sequence("Get Up Left Side", left_fallen, left_push, left_kneel),
+        sequence("Get Up Right Side", right_fallen, right_push, right_kneel),
+    ]
+}
+
 /// Calibration persistence file format.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CalibrationFile {
@@ -306,7 +590,8 @@ impl StudioModel {
             .expect("bundled rocky_mk1.urdf must be valid");
         let calibration = rig.default_calibration();
         let default_pose = rig.default_pose();
-        let moves = default_combat_library(&rig);
+        let mut moves = default_combat_library(&rig);
+        moves.extend(default_recovery_library(&rig));
         let all_mask = if rig.joints.len() >= 32 {
             u32::MAX
         } else {
@@ -348,7 +633,9 @@ impl StudioModel {
         self.target_rad = default_pose;
         self.latest_telemetry.measured_rad = default_pose;
         self.latest_telemetry.applied_target_rad = default_pose;
-        self.moves = default_combat_library(&rig);
+        let mut moves = default_combat_library(&rig);
+        moves.extend(default_recovery_library(&rig));
+        self.moves = moves;
         self.selected_joint = 0;
         self.selected_move = 0;
         self.torque_mask = if rig.joints.is_empty() {
@@ -640,5 +927,99 @@ impl StudioModel {
             self.playback = None;
         }
         self.latest_telemetry = telem;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bundle::BUNDLED_URDF_XML;
+
+    fn rig() -> KinematicRig {
+        KinematicRig::from_urdf_xml(BUNDLED_URDF_XML).expect("bundled rocky_mk1.urdf must parse")
+    }
+
+    #[test]
+    fn pose_from_overrides_clamps_each_joint_to_urdf_limits() {
+        let rig = rig();
+        let knee = rig
+            .joints
+            .iter()
+            .find(|j| j.name == "l_knee_pitch")
+            .expect("l_knee_pitch exists");
+        let beyond = knee.default_max_rad + 5.0;
+        let pose = rig.pose_from_overrides(&[("l_knee_pitch", beyond), ("waist_yaw", 0.25)]);
+
+        assert!((pose[knee.index] - knee.default_max_rad).abs() < 1e-6);
+        let waist = rig.joints.iter().find(|j| j.name == "waist_yaw").unwrap();
+        assert!((pose[waist.index] - 0.25).abs() < 1e-6);
+
+        // Unknown joint names are ignored without corrupting the default pose.
+        let unknown = rig.pose_from_overrides(&[("not_a_joint", 9.9)]);
+        assert_eq!(unknown, rig.default_pose());
+    }
+
+    #[test]
+    fn recovery_library_has_four_unique_multiframe_moves_within_limits() {
+        let rig = rig();
+        let moves = default_recovery_library(&rig);
+        assert_eq!(moves.len(), 4);
+        assert!(moves.iter().all(|m| m.category == "Recovery"));
+
+        let mut names = std::collections::HashSet::new();
+        let calibration = rig.default_calibration();
+        for mv in &moves {
+            assert!(names.insert(mv.name.as_str()), "duplicate move name: {}", mv.name);
+            assert!(mv.keyframes.len() >= 4, "{} needs >= 4 keyframes", mv.name);
+            for kf in &mv.keyframes {
+                for (idx, &angle) in kf.angles_rad.iter().enumerate() {
+                    if idx >= rig.joints.len() {
+                        // Unused joint slots must stay at their default (zero) value.
+                        assert!((angle - rig.default_pose()[idx]).abs() < 1e-6);
+                        continue;
+                    }
+                    let j = &rig.joints[idx];
+                    assert!(
+                        angle >= j.default_min_rad - 1e-5 && angle <= j.default_max_rad + 1e-5,
+                        "{} / {}: {angle} outside URDF limits [{}, {}] for {}",
+                        mv.name,
+                        kf.label,
+                        j.default_min_rad,
+                        j.default_max_rad,
+                        j.name,
+                    );
+                    let cal = &calibration[idx];
+                    assert!(
+                        angle >= cal.min_rad - 1e-5 && angle <= cal.max_rad + 1e-5,
+                        "{} / {}: {angle} outside calibration soft limits [{}, {}] for {}",
+                        mv.name,
+                        kf.label,
+                        cal.min_rad,
+                        cal.max_rad,
+                        j.name,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_moves_survive_bundled_urdf_reload() {
+        let mut model = StudioModel::new_default();
+        let expected = default_recovery_library(&model.rig)
+            .into_iter()
+            .map(|m| m.name)
+            .collect::<Vec<_>>();
+        assert_eq!(expected.len(), 4);
+
+        model
+            .load_bundle(AssetBundle::bundled_rocky())
+            .expect("reload bundled URDF");
+        for name in expected {
+            assert!(
+                model.moves.iter().any(|m| m.name == name),
+                "'{name}' must remain selectable after model reload"
+            );
+        }
     }
 }

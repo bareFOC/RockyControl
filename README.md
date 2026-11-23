@@ -4,6 +4,9 @@ Pure Rust humanoid robotics control workstation and `#![no_std]` embedded firmwa
 
 Rocky Studio runs the exact same workstation UI on **Desktop** (`apps/rk-desktop`) and **Browser WASM** (`apps/rk-web`), paired with deterministic real-time firmware for **RP2350** (`firmware/rk-rp2350`) and **ESP32-P4** (`firmware/rk-esp32p4`).
 
+> [!WARNING]
+> **BREAKING telemetry wire-format change (fall-recovery):** `rk_proto::ImuState` now carries additional full-orientation fields (`yaw_rad`, `yaw_rate_rad_s`, `gravity`). Because the `postcard` + COBS telemetry framing has no protocol-version handshake, the host workstation and firmware must be **rebuilt and flashed in lockstep** — a mismatched host/firmware pair will fail to decode telemetry frames. Always update both sides together (and roll back both together).
+
 ## Key Capabilities
 
 - **Full-Bleed 3D Mirror Viewport (`rk-viewport`)**:
@@ -18,6 +21,9 @@ Rocky Studio runs the exact same workstation UI on **Desktop** (`apps/rk-desktop
 - **URDF & MCU Model Pipeline (`rk-model`, `rk-link`)**:
   - Loads `.urdf`, `.xml`, or `.zip` robot bundles (with embedded STL/OBJ meshes) via upload picker, drag-and-drop, XML paste, or chunked CRC32-verified MCU flash pull (`Pull MCU`).
   - Built-in 12-DoF fighting humanoid sample (`assets/sample_humanoid/rocky_mk1.urdf`).
+- **Fall Recovery (`rk-ui`, `rk-model`)**:
+  - A pulsing red highlight and a top-right **Recovery HUD** panel make falls unmistakable, showing `FALL DETECTED / STABLE`, the classified orientation, and the ordered recovery state.
+  - Four pre-computed get-up motions (Prone, Supine, Left Side, Right Side) end in a stable Guard stance.
 - **Desktop & Android Tablet Ergonomics (`rk-ui`)**:
   - Slim CAD workstation shell with floating HUD overlays, in-app Fullscreen toggle, live `egui_plot` telemetry charts, `gilrs` gamepad pilot, and automatic Desktop / Tablet Touch layout switching.
 
@@ -87,3 +93,27 @@ cargo check --manifest-path firmware/Cargo.toml -p rk-rp2350 --target thumbv8m.m
 ## GitHub Pages Deployment
 
 The included workflow (`.github/workflows/deploy-pages.yml`) automatically builds the release WASM bundle with `trunk build --release --public-url "./"` and publishes `dist/` to GitHub Pages on push to `main` or `master`.
+
+## Fall Recovery — Operator Behavior & Safety Limitations
+
+When a `TILT_FALL_CUTOFF` latch arrives with a valid IMU, the **Recovery HUD** (top-right of the Control screen) shows `FALL DETECTED`, the classified orientation (Prone / Supine / Left Side / Right Side / Unknown), and the current recovery state. The robot's mesh also pulses red while the alarm is active. The alarm is only cleared once the robot is verified upright (torso tilt below the configured fall-cutoff threshold for a sustained dwell) **and** the get-up has completed or been aborted.
+
+Recovery is **strictly opt-in and off by default**:
+
+- **Auto recovery** checkbox is unchecked on startup. Autonomous recovery starts only when it is enabled *and* the operator has checked **Operator confirmed**, and only after the robot is stable upright for the dwell period.
+- **Get Up** button is the explicit operator path: it sets `Operator confirmed` and initiates the same recovery sequence even when Auto recovery is off.
+
+Once consent is satisfied, recovery advances one control frame at a time through an ordered sequence that never bypasses the existing safety interlocks:
+
+1. `reset_estop()` queues a single `ClearFaults` command and returns strictly to `Teach` (torque off).
+2. The fault must be observed cleared in telemetry before `Drive` is requested.
+3. After one full frame in `Drive` with no active fault, walking is disabled and the orientation-matched get-up move is played.
+4. On completion the model returns to `Teach` and the alarm clears only after a stable upright stance is confirmed.
+
+**Safety limitations:**
+
+- Get-up motions are **open-loop keyframes** sampled under existing slew-rate and soft-limit clamps. There is no closed-loop IMU balance or ground-contact / friction model during recovery; success on real hardware depends on the surface and initial pose.
+- Any new fall latch or E-Stop during playback **aborts immediately**: playback stops, torque stays cut, consent is cleared, and the state re-latches to `FallLatched` with the newly classified orientation.
+- A `Drive` request while a fault is latched is refused by `set_authority_mode()`, and `play_move()` is Drive-only and E-Stop-gated; the watcher relies on these gates rather than bypassing them.
+- The operator must supervise powered get-up attempts. Keep servo power off (Teach) during initial bench validation and verify the recovery motion in simulation first.
+- Because full-orientation telemetry changed the wire layout, host and firmware must be rebuilt and flashed together (see the breaking-change warning above).

@@ -358,7 +358,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "action_play",
             "Play Combat / Motion Action",
-            "Plays a named keyframe action from the robot's library (e.g. Guard, Left Jab, Right Cross, Front Kick, Neutral Zero). Requires armed Drive mode.",
+            "Plays a named keyframe action from the robot's library. Combat actions: Guard, Left Jab, Right Cross, Front Kick, Neutral Zero. Recovery get-ups: Get Up Prone, Get Up Supine, Get Up Left Side, Get Up Right Side. Requires armed Drive mode.",
             object(
                 json!({
                     "name": string("Action name (case-insensitive)"),

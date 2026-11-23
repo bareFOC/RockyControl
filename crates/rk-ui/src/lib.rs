@@ -27,7 +27,7 @@ use egui::{Color32, CornerRadius, Key, RichText, Stroke, Vec2};
 use mcp_bridge::McpUiState;
 use rk_link::{RobotTransport, SimTransport, TransportKind};
 use rk_model::{AssetBundle, StudioModel};
-use rk_proto::{ControlMode, ModelFormat};
+use rk_proto::{ControlMode, FallOrientation, FaultFlags, ModelFormat};
 use rk_sim::ReplayVerification;
 use rk_viewport::{HumanoidViewport, ViewportInteraction};
 pub use responsive::{FormFactor, UiMetrics};
@@ -37,6 +37,42 @@ use web_time::Instant;
 
 const TELEMETRY_HISTORY_LEN: usize = 180;
 const CMD_ESTOP: &str = "safety.estop";
+/// Sustained upright attitude required before a latched fall may start recovery,
+/// and before the visual alarm may be cleared after a successful get-up.
+const RECOVERY_STABLE_DWELL_SEC: f32 = 0.6;
+
+/// Ordered, multi-frame fall-recovery sequence owned by [`RockyStudioApp`].
+///
+/// Every transition is driven by fresh telemetry in `update_fall_watcher()` so
+/// no safety interlock is bypassed in a single frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecoveryState {
+    #[default]
+    Idle,
+    /// A `TILT_FALL_CUTOFF` (or E-Stop during playback) has been latched.
+    FallLatched,
+    /// `ClearFaults` queued via `reset_estop()`; waiting for the fault to clear in telemetry.
+    ClearingFault,
+    /// Fault clear observed; `Drive` requested, waiting one control frame before playing.
+    ArmingDrive,
+    /// Get-up keyframes are playing with torque enabled.
+    PlayingGetUp,
+    /// Playback finished; returning to `Teach` and waiting for a stable upright stance.
+    Completed,
+}
+
+impl RecoveryState {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "IDLE",
+            Self::FallLatched => "FALL LATCHED",
+            Self::ClearingFault => "CLEARING FAULT",
+            Self::ArmingDrive => "ARMING DRIVE",
+            Self::PlayingGetUp => "GETTING UP",
+            Self::Completed => "COMPLETED",
+        }
+    }
+}
 
 #[cfg(target_arch = "wasm32")]
 thread_local! {
@@ -186,6 +222,20 @@ pub struct RockyStudioApp {
     pub(crate) saver: Box<dyn PlatformSaver>,
     pub(crate) selected_transport_ui: TransportKind,
     pub mcp: McpUiState,
+    /// Visual alarm / latch state for the most recent fall event.
+    pub fall_event_active: bool,
+    /// Classification captured from telemetry when the fall latched.
+    pub fall_orientation: FallOrientation,
+    /// Standing opt-in for autonomous recovery (off by default).
+    pub auto_recovery_enabled: bool,
+    /// Per-event operator confirmation (set by the confirm checkbox or Get Up button).
+    pub operator_confirmed: bool,
+    /// Ordered recovery sequence state.
+    pub recovery_state: RecoveryState,
+    /// Seconds of continuous upright attitude since the last fall latch.
+    pub fall_dwell_sec: f32,
+    /// True when the Get Up button (not the autonomous path) initiated this sequence.
+    get_up_requested: bool,
 }
 
 impl RockyStudioApp {
@@ -246,6 +296,13 @@ impl RockyStudioApp {
             saver,
             selected_transport_ui: TransportKind::SimKernel,
             mcp: McpUiState::default(),
+            fall_event_active: false,
+            fall_orientation: FallOrientation::Unknown,
+            auto_recovery_enabled: false,
+            operator_confirmed: false,
+            recovery_state: RecoveryState::Idle,
+            fall_dwell_sec: 0.0,
+            get_up_requested: false,
         }
     }
 
@@ -509,6 +566,9 @@ impl RockyStudioApp {
                     self.mcp.on_estop_disarm();
                 }
             }
+            // Advance the consent-gated, multi-frame fall recovery sequence only after
+            // fresh telemetry has been ingested so every safety gate is observed.
+            self.update_fall_watcher(dt_sec);
 
             let j = self
                 .model
@@ -663,6 +723,174 @@ impl RockyStudioApp {
         ctx.request_repaint();
     }
 
+    /// Advances the fall-recovery state machine from freshly ingested telemetry.
+    ///
+    /// Safety invariants mirrored here:
+    /// - nothing leaves `Teach` or clears faults unless `ClearFaults` was queued first;
+    /// - `Drive` is entered only after `is_estop_active()` is false in telemetry;
+    /// - a get-up move is played only while `requested_mode == Drive` and no fault is latched;
+    /// - any new fall / E-Stop during playback cuts torque and re-latches immediately.
+    fn update_fall_watcher(&mut self, dt_sec: f32) {
+        let telem = &self.model.latest_telemetry;
+        let fall_fault = telem.faults.contains(FaultFlags::TILT_FALL_CUTOFF) && telem.imu.available;
+        let estop_active = self.model.is_estop_active();
+        let imu_ok = telem.imu.available;
+        let tilt = telem.imu.pitch_rad.abs().max(telem.imu.roll_rad.abs());
+        let upright = imu_ok && tilt < self.model.balance_gains.fall_cutoff_rad;
+        let orientation = FallOrientation::from_wire(telem.balance.fall_orientation);
+
+        // 1. Latch a new fall (or abort an in-progress get-up on a re-fall / E-Stop).
+        match self.recovery_state {
+            RecoveryState::Idle | RecoveryState::Completed => {
+                if fall_fault {
+                    self.fall_event_active = true;
+                    self.fall_orientation = orientation;
+                    self.fall_dwell_sec = 0.0;
+                    self.operator_confirmed = false;
+                    self.get_up_requested = false;
+                    self.recovery_state = RecoveryState::FallLatched;
+                    self.model.status_message = format!(
+                        "FALL DETECTED ({}). Recovery held until upright and consented.",
+                        self.fall_orientation.label()
+                    );
+                }
+            }
+            RecoveryState::PlayingGetUp => {
+                if fall_fault || estop_active {
+                    self.model.stop_playback();
+                    // Explicitly cut torque even if the MCU has not yet mirrored the fault.
+                    self.model.trigger_estop();
+                    self.model.walk_cmd.walk_enabled = false;
+                    self.fall_event_active = true;
+                    if fall_fault {
+                        self.fall_orientation = orientation;
+                    }
+                    self.fall_dwell_sec = 0.0;
+                    self.operator_confirmed = false;
+                    self.get_up_requested = false;
+                    self.recovery_state = RecoveryState::FallLatched;
+                    self.model.status_message = "Get-up ABORTED by new fall / E-Stop — torque OFF."
+                        .to_string();
+                    return;
+                }
+            }
+            RecoveryState::FallLatched
+            | RecoveryState::ClearingFault
+            | RecoveryState::ArmingDrive => {
+                // An operator E-Stop (without a new fall) also aborts an armed sequence.
+                if estop_active && !fall_fault && self.recovery_state != RecoveryState::FallLatched {
+                    self.model.walk_cmd.walk_enabled = false;
+                    self.fall_dwell_sec = 0.0;
+                    self.operator_confirmed = false;
+                    self.get_up_requested = false;
+                    self.recovery_state = RecoveryState::FallLatched;
+                    self.model.status_message =
+                        "Recovery aborted by E-Stop. Torque OFF.".to_string();
+                    return;
+                }
+            }
+        }
+
+        // 2. Track a stable upright dwell. While still tilted the dwell resets; only
+        //    sustained upright time counts. In FallLatched the TILT_FALL_CUTOFF bit stays
+        //    latched until ClearFaults is delivered, so waiting on `!fall_fault` here would
+        //    deadlock the consent path (the ClearFaults is queued by the transition below).
+        //    Requiring `upright` alone is safe: consent is still required, reset_estop()
+        //    returns strictly to Teach with torque off, and ClearingFault still waits for
+        //    the real fault clear before Drive is entered.
+        if self.fall_event_active {
+            let dwell_ok = if self.recovery_state == RecoveryState::FallLatched {
+                upright
+            } else {
+                upright && !fall_fault
+            };
+            if dwell_ok {
+                self.fall_dwell_sec += dt_sec;
+            } else {
+                self.fall_dwell_sec = 0.0;
+            }
+        }
+
+        // 3. Ordered state transitions — at most one per control frame.
+        match self.recovery_state {
+            RecoveryState::FallLatched => {
+                let consent = self.get_up_requested
+                    || (self.auto_recovery_enabled && self.operator_confirmed);
+                if consent && self.fall_dwell_sec >= RECOVERY_STABLE_DWELL_SEC {
+                    self.operator_confirmed = false;
+                    self.get_up_requested = false;
+                    self.model.reset_estop();
+                    self.recovery_state = RecoveryState::ClearingFault;
+                    self.model.status_message =
+                        "Recovery step 1/3: ClearFaults queued; waiting for fault clear."
+                            .to_string();
+                }
+            }
+            RecoveryState::ClearingFault => {
+                if !estop_active {
+                    self.model.set_authority_mode(ControlMode::Drive);
+                    self.recovery_state = RecoveryState::ArmingDrive;
+                    self.model.status_message =
+                        "Recovery step 2/3: fault clear observed; Drive requested.".to_string();
+                }
+            }
+            RecoveryState::ArmingDrive => {
+                if self.model.requested_mode == ControlMode::Drive && !estop_active {
+                    self.model.walk_cmd.walk_enabled = false;
+                    if let Some(idx) = self.recovery_move_index() {
+                        self.model.play_move(idx);
+                        self.recovery_state = RecoveryState::PlayingGetUp;
+                        self.model.status_message = format!(
+                            "Recovery step 3/3: playing '{}'.",
+                            self.model.moves[idx].name
+                        );
+                    } else {
+                        // No matching motion: fail safe instead of playing the wrong move.
+                        self.model.set_authority_mode(ControlMode::Teach);
+                        self.recovery_state = RecoveryState::Completed;
+                        self.model.status_message = format!(
+                            "No get-up motion for {} — staying in Teach.",
+                            self.fall_orientation.label()
+                        );
+                    }
+                }
+            }
+            RecoveryState::PlayingGetUp => {
+                self.model.walk_cmd.walk_enabled = false;
+                if self.model.playback.is_none() {
+                    self.model.set_authority_mode(ControlMode::Teach);
+                    self.recovery_state = RecoveryState::Completed;
+                    self.model.status_message =
+                        "Get-up finished — returning to Teach; verifying upright stance."
+                            .to_string();
+                }
+            }
+            RecoveryState::Completed => {
+                if upright && !fall_fault && !estop_active {
+                    self.fall_event_active = false;
+                    self.fall_orientation = FallOrientation::Unknown;
+                    self.fall_dwell_sec = 0.0;
+                    self.recovery_state = RecoveryState::Idle;
+                    self.model.status_message =
+                        "Recovery complete — stable guard stance, alarm cleared.".to_string();
+                }
+            }
+            RecoveryState::Idle => {}
+        }
+    }
+
+    /// Index of the pre-computed get-up move matching the latched fall orientation.
+    fn recovery_move_index(&self) -> Option<usize> {
+        let name = match self.fall_orientation {
+            FallOrientation::Prone => "Get Up Prone",
+            FallOrientation::Supine => "Get Up Supine",
+            FallOrientation::SideLeft => "Get Up Left Side",
+            FallOrientation::SideRight => "Get Up Right Side",
+            FallOrientation::Unknown => return None,
+        };
+        self.model.moves.iter().position(|mv| mv.name == name)
+    }
+
     fn update_walk_command_from_inputs(&mut self, ctx: &egui::Context, typing: bool) {
         let mut kb_vx = 0.0_f32;
         let mut kb_vy = 0.0_f32;
@@ -805,3 +1033,154 @@ fn apply_rocky_theme(ctx: &egui::Context) {
 
     ctx.set_visuals(visuals);
 }
+
+#[cfg(test)]
+mod fall_recovery_tests {
+    use super::*;
+    use rk_proto::{ConfigCmd, fall_orientation};
+
+    fn new_app() -> RockyStudioApp {
+        RockyStudioApp::new(Box::new(NoopSaver))
+    }
+
+    /// Pushes a synthetic telemetry frame into the model, mirroring what
+    /// `ingest_telemetry()` observes after a `step_exchange()` in the real loop.
+    fn telemetry(app: &mut RockyStudioApp, fall: bool, pitch: f32, roll: f32, code: u8) {
+        let t = &mut app.model.latest_telemetry;
+        t.imu.available = true;
+        t.imu.pitch_rad = pitch;
+        t.imu.roll_rad = roll;
+        t.balance.fall_orientation = code;
+        if fall {
+            t.faults.insert(FaultFlags::TILT_FALL_CUTOFF);
+            t.active_mode = ControlMode::EStop;
+        } else {
+            t.faults.remove(FaultFlags::TILT_FALL_CUTOFF);
+            t.active_mode = ControlMode::Teach;
+        }
+    }
+
+    fn latch(app: &mut RockyStudioApp, code: u8) {
+        telemetry(app, true, 1.2, 0.0, code);
+        app.update_fall_watcher(0.016);
+        assert_eq!(app.recovery_state, RecoveryState::FallLatched);
+        assert!(app.fall_event_active);
+    }
+
+    /// Advances stable-upright frames until the dwell elapses and the first
+    /// transition out of `FallLatched` occurs (one control frame at a time).
+    fn settle_upright(app: &mut RockyStudioApp, code: u8) {
+        for _ in 0..60 {
+            telemetry(app, false, 0.02, 0.0, code);
+            app.update_fall_watcher(0.016);
+            if app.recovery_state != RecoveryState::FallLatched {
+                break;
+            }
+        }
+    }
+
+    /// Drives a consented fall through ClearFaults -> Drive -> get-up playback.
+    fn drive_to_playback(app: &mut RockyStudioApp, code: u8) {
+        latch(app, code);
+        app.auto_recovery_enabled = true;
+        app.operator_confirmed = true;
+        settle_upright(app, code);
+        assert_eq!(app.recovery_state, RecoveryState::ClearingFault);
+        assert_eq!(app.model.requested_mode, ControlMode::Teach);
+        assert!(app
+            .model
+            .pending_config
+            .contains(&ConfigCmd::ClearFaults));
+
+        // Fault still latched in telemetry -> cannot arm Drive yet.
+        telemetry(app, true, 1.2, 0.0, code);
+        app.update_fall_watcher(0.016);
+        assert_eq!(app.recovery_state, RecoveryState::ClearingFault);
+        assert_eq!(app.model.requested_mode, ControlMode::Teach);
+
+        // Fault clear observed in telemetry -> Drive is requested.
+        telemetry(app, false, 0.02, 0.0, code);
+        app.update_fall_watcher(0.016);
+        assert_eq!(app.recovery_state, RecoveryState::ArmingDrive);
+        assert_eq!(app.model.requested_mode, ControlMode::Drive);
+
+        // One full control frame later -> get-up playback starts.
+        telemetry(app, false, 0.02, 0.0, code);
+        app.update_fall_watcher(0.016);
+        assert_eq!(app.recovery_state, RecoveryState::PlayingGetUp);
+        assert!(app.model.playback.is_some());
+        assert!(!app.model.walk_cmd.walk_enabled);
+    }
+
+    #[test]
+    fn auto_disabled_does_not_start_recovery() {
+        let mut app = new_app();
+        latch(&mut app, fall_orientation::PRONE);
+        // No consent flags set: auto recovery is off by default.
+        settle_upright(&mut app, fall_orientation::PRONE);
+        assert_eq!(app.recovery_state, RecoveryState::FallLatched);
+        assert_eq!(app.model.requested_mode, ControlMode::Teach);
+        assert!(app.model.pending_config.is_empty());
+        assert!(app.model.playback.is_none());
+        assert!(app.fall_event_active);
+    }
+
+    #[test]
+    fn ordered_recovery_reaches_completed_and_clears_alarm() {
+        let mut app = new_app();
+        drive_to_playback(&mut app, fall_orientation::PRONE);
+
+        // Playback finished -> return to Teach and wait for stable upright.
+        app.model.playback = None;
+        telemetry(&mut app, false, 0.02, 0.0, fall_orientation::PRONE);
+        app.update_fall_watcher(0.016);
+        assert_eq!(app.recovery_state, RecoveryState::Completed);
+        assert_eq!(app.model.requested_mode, ControlMode::Teach);
+        assert!(app.fall_event_active, "alarm must persist until upright");
+
+        // Dwell already satisfied -> alarm clears and state returns to Idle.
+        telemetry(&mut app, false, 0.02, 0.0, fall_orientation::PRONE);
+        app.update_fall_watcher(0.016);
+        assert_eq!(app.recovery_state, RecoveryState::Idle);
+        assert!(!app.fall_event_active);
+        assert_eq!(app.fall_orientation, FallOrientation::Unknown);
+    }
+
+    #[test]
+    fn re_fall_during_get_up_aborts_and_cuts_torque() {
+        let mut app = new_app();
+        drive_to_playback(&mut app, fall_orientation::PRONE);
+
+        telemetry(&mut app, true, -1.1, 0.0, fall_orientation::SUPINE);
+        app.update_fall_watcher(0.016);
+
+        assert!(app.model.playback.is_none());
+        assert_eq!(app.model.requested_mode, ControlMode::EStop);
+        assert!(!app.model.walk_cmd.walk_enabled);
+        assert_eq!(app.recovery_state, RecoveryState::FallLatched);
+        assert_eq!(app.fall_orientation, FallOrientation::Supine);
+        assert!(!app.operator_confirmed);
+        assert!(app.fall_event_active);
+    }
+
+    #[test]
+    fn get_up_button_works_with_auto_disabled() {
+        let mut app = new_app();
+        latch(&mut app, fall_orientation::SIDE_LEFT);
+        // Explicit Get Up initiation does not require the auto opt-in.
+        app.operator_confirmed = true;
+        app.get_up_requested = true;
+        settle_upright(&mut app, fall_orientation::SIDE_LEFT);
+        assert_eq!(app.recovery_state, RecoveryState::ClearingFault);
+        assert!(app
+            .model
+            .pending_config
+            .contains(&ConfigCmd::ClearFaults));
+    }
+}
+
+/// Headless, real-plant E2E scenario for task 7.3 (separate file to keep the
+/// synthetic-telemetry state-machine tests above focused).
+#[cfg(test)]
+#[path = "e2e_fall_recovery_test.rs"]
+mod e2e_fall_recovery_test;

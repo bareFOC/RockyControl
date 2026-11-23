@@ -96,6 +96,8 @@ pub struct ViewportOptions {
     pub imu_available: bool,
     pub imu_pitch_rad: f32,
     pub imu_roll_rad: f32,
+    /// True while a fall event is active; drives the pulsing red fall highlight.
+    pub fall_event_active: bool,
 }
 
 impl ViewportOptions {
@@ -122,6 +124,7 @@ impl Default for ViewportOptions {
             imu_available: false,
             imu_pitch_rad: 0.0,
             imu_roll_rad: 0.0,
+            fall_event_active: false,
         }
     }
 }
@@ -277,10 +280,12 @@ impl HumanoidViewport {
         );
 
         let (eff_pitch_rad, eff_roll_rad) = opts.effective_imu_tilt();
+        // Heading is not yet threaded into viewport options; pass 0.0 until fall visuals land.
+        let eff_yaw_rad = 0.0_f32;
         let measured_transforms =
-            rig.compute_link_transforms_with_tilt(measured_rad, eff_pitch_rad, eff_roll_rad);
+            rig.compute_link_transforms_with_tilt(measured_rad, eff_pitch_rad, eff_roll_rad, eff_yaw_rad);
         let target_transforms = if opts.show_ghost {
-            rig.compute_link_transforms_with_tilt(target_rad, eff_pitch_rad, eff_roll_rad)
+            rig.compute_link_transforms_with_tilt(target_rad, eff_pitch_rad, eff_roll_rad, eff_yaw_rad)
         } else {
             HashMap::new()
         };
@@ -518,12 +523,13 @@ impl HumanoidViewport {
                                 if let Some(world_target) =
                                     intersect_ray_plane(ray_o, ray_d, *plane_point, *plane_normal)
                                 {
-                                    if let Some(solved) = rig.solve_limb_ik(
+                                    if let Some(solved) = rig.solve_limb_ik_with_yaw(
                                         link_name,
                                         target_rad,
                                         world_target,
                                         eff_pitch_rad,
                                         eff_roll_rad,
+                                        eff_yaw_rad,
                                         calibration,
                                     ) {
                                         interaction.picked_joint = Some(*joint_idx);
@@ -578,6 +584,8 @@ impl HumanoidViewport {
             selected_joint: active_sel,
             current_ma: *current_ma,
             estop_active: opts.estop_active,
+            fall_event_active: opts.fall_event_active,
+            time_sec: ui.ctx().input(|i| i.time),
             orbit: self.orbit.clone(),
             marker_radius,
         };
