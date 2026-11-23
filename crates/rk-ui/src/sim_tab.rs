@@ -48,6 +48,10 @@ impl RockyStudioApp {
                                 "Voltage Sag (<10.5 V Under-Voltage)",
                             );
                             ui.checkbox(&mut faults.servo_bus_error, "Servo Bus Error");
+                            ui.checkbox(
+                                &mut faults.imu_disconnected,
+                                "Disable Virtual IMU (Always Upright / Top-Up)",
+                            );
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 ui.label("Actuator Response:");

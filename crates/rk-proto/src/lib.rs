@@ -111,6 +111,8 @@ impl Default for BalanceGains {
 /// Compact 2-axis torso IMU attitude & gyro rate snapshot (`f32`, `#![no_std]`).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub struct ImuState {
+    /// True when a hardware or simulated IMU is present and reporting live orientation.
+    pub available: bool,
     pub pitch_rad: f32,
     pub roll_rad: f32,
     pub pitch_rate_rad_s: f32,
@@ -651,6 +653,7 @@ mod tests {
             torque_state_mask: 0x0000_00FF,
             bus_voltage_mv: 12_150,
             imu: ImuState {
+                available: true,
                 pitch_rad: 0.08,
                 roll_rad: -0.05,
                 pitch_rate_rad_s: 0.42,

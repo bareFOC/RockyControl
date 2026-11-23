@@ -39,6 +39,7 @@ impl ImuSlot {
             inner: Mutex::new(RefCell::new(ImuSnapshot {
                 registered: false,
                 state: ImuState {
+                    available: false,
                     pitch_rad: 0.0,
                     roll_rad: 0.0,
                     pitch_rate_rad_s: 0.0,
@@ -118,6 +119,7 @@ mod tests {
         assert_eq!(slot.health(), ImuHealth::Uninitialized);
 
         let valid = ImuState {
+            available: true,
             pitch_rad: 0.12,
             roll_rad: -0.08,
             pitch_rate_rad_s: 0.4,

@@ -32,6 +32,7 @@ static UART_BUS: Mutex<RefCell<UartBusState>> = Mutex::new(RefCell::new(UartBusS
         bus_voltage_mv: 12_000,
         bus_error: false,
         imu: rk_proto::ImuState {
+            available: false,
             pitch_rad: 0.0,
             roll_rad: 0.0,
             pitch_rate_rad_s: 0.0,

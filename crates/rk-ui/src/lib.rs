@@ -12,6 +12,8 @@ mod calibration_tab;
 mod config_screen;
 mod control_screen;
 mod dashboard_screen;
+mod mcp_bridge;
+mod mcp_drawer;
 mod responsive;
 mod sim_tab;
 mod top_bar;
@@ -22,6 +24,7 @@ use std::collections::VecDeque;
 use craft_keymap::{Active, Bindable, Binding, Keymap, Scope, Scopes};
 use craft_ui::theme::WidgetPalette;
 use egui::{Color32, CornerRadius, Key, RichText, Stroke, Vec2};
+use mcp_bridge::McpUiState;
 use rk_link::{RobotTransport, SimTransport, TransportKind};
 use rk_model::{AssetBundle, StudioModel};
 use rk_proto::{ControlMode, ModelFormat};
@@ -182,6 +185,7 @@ pub struct RockyStudioApp {
     pub(crate) viewport_hud_rects: [egui::Rect; 5],
     pub(crate) saver: Box<dyn PlatformSaver>,
     pub(crate) selected_transport_ui: TransportKind,
+    pub mcp: McpUiState,
 }
 
 impl RockyStudioApp {
@@ -241,6 +245,7 @@ impl RockyStudioApp {
             viewport_hud_rects: [egui::Rect::NOTHING; 5],
             saver,
             selected_transport_ui: TransportKind::SimKernel,
+            mcp: McpUiState::default(),
         }
     }
 
@@ -434,6 +439,7 @@ impl RockyStudioApp {
             }
         });
         if estop_pressed && self.connected {
+            self.mcp.on_estop_disarm();
             self.model.trigger_estop();
         }
 
@@ -499,6 +505,9 @@ impl RockyStudioApp {
             let host_pkt = self.model.build_next_host_packet(dt_sec);
             if let Some(telem) = self.transport.step_exchange(dt_sec, &host_pkt) {
                 self.model.ingest_telemetry(telem);
+                if self.model.is_estop_active() {
+                    self.mcp.on_estop_disarm();
+                }
             }
 
             let j = self
@@ -519,8 +528,12 @@ impl RockyStudioApp {
                 self.history.pop_front();
             }
         } else {
+            self.sim_time_sec += dt_sec as f64;
             self.active_screen = AppScreen::Dashboard;
         }
+
+        // 3b. Pump live Streamable HTTP MCP bridge requests into RockyStudioApp
+        self.pump_mcp_bridge(&ctx);
 
         // 4. Contextual Top Toolbar
         let top_h = self.ui_metrics.top_bar_height;
@@ -620,6 +633,9 @@ impl RockyStudioApp {
         // Optional Paste URDF XML modal
         self.render_paste_urdf_modal(&ctx);
 
+        // Slide-over MCP Agent Drawer
+        self.render_mcp_drawer(&ctx);
+
         // Visual drag-and-drop overlay when hovering a .urdf/.zip file over the window
         let hovered_files = ctx.input(|i| i.raw.hovered_files.len());
         if hovered_files > 0 {
@@ -682,15 +698,32 @@ impl RockyStudioApp {
             total_vx.abs() > 0.05 || total_vy.abs() > 0.05 || total_yaw.abs() > 0.05;
 
         if has_input && !self.model.is_estop_active() {
+            // Human input always supersedes any prior MCP walk velocity override
+            self.mcp.mcp_walk_override = None;
             self.model.walk_cmd.walk_enabled = true;
             if self.model.requested_mode == ControlMode::Teach {
                 self.model.set_authority_mode(ControlMode::Drive);
             }
+            self.model.walk_cmd.vx = total_vx;
+            self.model.walk_cmd.vy = total_vy;
+            self.model.walk_cmd.yaw_rate = total_yaw;
+        } else if let Some((vx, vy, yaw, enabled)) = self.mcp.mcp_walk_override {
+            if self.model.is_estop_active() || !self.mcp.policy.drive_armed {
+                self.mcp.mcp_walk_override = None;
+                self.model.walk_cmd.vx = 0.0;
+                self.model.walk_cmd.vy = 0.0;
+                self.model.walk_cmd.yaw_rate = 0.0;
+            } else {
+                self.model.walk_cmd.vx = vx;
+                self.model.walk_cmd.vy = vy;
+                self.model.walk_cmd.yaw_rate = yaw;
+                self.model.walk_cmd.walk_enabled = enabled;
+            }
+        } else {
+            self.model.walk_cmd.vx = total_vx;
+            self.model.walk_cmd.vy = total_vy;
+            self.model.walk_cmd.yaw_rate = total_yaw;
         }
-
-        self.model.walk_cmd.vx = total_vx;
-        self.model.walk_cmd.vy = total_vy;
-        self.model.walk_cmd.yaw_rate = total_yaw;
     }
 
     fn poll_gamepad(&mut self) {
@@ -711,6 +744,7 @@ impl RockyStudioApp {
                         gilrs::Button::East => self.model.play_move(2),
                         gilrs::Button::North => self.model.play_move(3),
                         gilrs::Button::Start | gilrs::Button::Select => {
+                            self.mcp.on_estop_disarm();
                             self.model.trigger_estop();
                         }
                         _ => {}

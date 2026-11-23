@@ -1,13 +1,24 @@
-//! Quaternion-based auto-fitted orbit camera with smooth 220 ms transitions and 90-degree roll.
+//! Single-axis gravity-locked upright turntable camera with smooth 220 ms horizontal yaw transitions.
+//!
+//! The camera always keeps world `+Y` (real-world vertical / top) upright with zero roll and a
+//! fixed comfortable elevation angle, allowing smooth 360-degree horizontal rotation around the
+//! robot without ever tilting or flipping the view upside-down.
 //!
 //! Camera distance and target are continuously fitted to the active URDF bounding sphere
 //! and viewport aspect ratio so the entire robot always remains centered and framed in view.
+
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use rk_model::nalgebra::{Matrix3, Unit, UnitQuaternion, Vector3};
 use three_d::{Vec3, vec3};
 
 pub const CAMERA_FOV_DEG: f32 = 42.0;
 const TRANSITION_DURATION_SEC: f32 = 0.22;
+
+/// Fixed upright elevation angle (~19.5 deg above horizon) matching the default Front-Right view.
+pub const FIXED_ELEVATION_RAD: f32 = 0.340;
+/// Default Front-Right isometric azimuth angle (~36.7 deg).
+pub const HOME_YAW_RAD: f32 = 0.641;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CameraPreset {
@@ -23,15 +34,18 @@ pub enum CameraPreset {
 
 #[derive(Clone, Debug)]
 pub struct CameraTransition {
-    pub from: UnitQuaternion<f32>,
-    pub to: UnitQuaternion<f32>,
+    pub from_yaw: f32,
+    pub to_yaw: f32,
     pub elapsed_sec: f32,
     pub duration_sec: f32,
 }
 
 #[derive(Clone, Debug)]
 pub struct OrbitState {
+    /// Current horizontal turntable azimuth around world `+Y` (radians; 0 = Front `+Z`).
+    pub yaw_rad: f32,
     /// Rotation from camera-local basis (`+X` right, `+Y` up, `+Z` toward eye) to world space.
+    /// Always kept strictly synchronized with `turntable_orientation(self.yaw_rad)`.
     pub orientation: UnitQuaternion<f32>,
     pub distance: f32,
     pub target: [f32; 3],
@@ -41,6 +55,7 @@ pub struct OrbitState {
 impl Default for OrbitState {
     fn default() -> Self {
         Self {
+            yaw_rad: HOME_YAW_RAD,
             orientation: home_iso_orientation(),
             distance: 2.35,
             target: [0.0, 0.78, 0.0],
@@ -49,12 +64,27 @@ impl Default for OrbitState {
     }
 }
 
-/// Default Front-Right-Top isometric workstation orientation.
+/// Wraps an angle in radians cleanly into `[-PI, PI]`.
+fn wrap_angle(rad: f32) -> f32 {
+    let mut a = (rad + PI).rem_euclid(TAU) - PI;
+    if a <= -PI {
+        a += TAU;
+    }
+    a
+}
+
+/// Computes the exact upright gravity-locked turntable camera orientation for azimuth `yaw_rad`.
+/// Camera horizon is strictly level (`right.y == 0`), roll is always `0`, and world `+Y` is always up.
+pub fn turntable_orientation(yaw_rad: f32) -> UnitQuaternion<f32> {
+    let cos_e = FIXED_ELEVATION_RAD.cos();
+    let sin_e = FIXED_ELEVATION_RAD.sin();
+    let eye_dir = Vector3::new(yaw_rad.sin() * cos_e, sin_e, yaw_rad.cos() * cos_e);
+    orientation_from_dir_up(eye_dir, Vector3::y())
+}
+
+/// Default Front-Right upright isometric workstation orientation.
 pub fn home_iso_orientation() -> UnitQuaternion<f32> {
-    orientation_from_dir_up(
-        Vector3::new(0.56, 0.34, 0.75).normalize(),
-        Vector3::y(),
-    )
+    turntable_orientation(HOME_YAW_RAD)
 }
 
 /// Constructs a right-handed camera orientation where camera `+Z` points along `eye_dir`
@@ -64,7 +94,7 @@ pub fn orientation_from_dir_up(eye_dir: Vector3<f32>, up_hint: Vector3<f32>) -> 
         .map(|u| u.into_inner())
         .unwrap_or_else(Vector3::z);
 
-    // Pick a stable fallback up if up_hint is parallel to eye_dir (e.g., Top / Bottom views)
+    // Pick a stable fallback up if up_hint is parallel to eye_dir
     let up_ref = if back.dot(&up_hint).abs() > 0.995 {
         if back.y > 0.0 {
             -Vector3::z()
@@ -85,10 +115,21 @@ pub fn orientation_from_dir_up(eye_dir: Vector3<f32>, up_hint: Vector3<f32>) -> 
     UnitQuaternion::from_matrix(&rot_mat)
 }
 
+/// Extracts the horizontal turntable yaw angle for a preset (always gravity-locked upright).
+pub fn preset_yaw(preset: CameraPreset) -> f32 {
+    match preset {
+        CameraPreset::Iso | CameraPreset::Top | CameraPreset::Bottom => HOME_YAW_RAD,
+        CameraPreset::Front => 0.0,
+        CameraPreset::Right | CameraPreset::Side => FRAC_PI_2,
+        CameraPreset::Back => PI,
+        CameraPreset::Left => -FRAC_PI_2,
+    }
+}
+
 impl OrbitState {
     pub fn apply_preset(&mut self, preset: CameraPreset) {
-        let target_q = self.preset_orientation(preset);
-        self.orientation = target_q;
+        self.yaw_rad = wrap_angle(preset_yaw(preset));
+        self.orientation = turntable_orientation(self.yaw_rad);
         self.transition = None;
     }
 
@@ -98,64 +139,60 @@ impl OrbitState {
         center: [f32; 3],
         radius: f32,
     ) {
-        self.animate_to_orientation(self.preset_orientation(preset));
+        self.animate_to_yaw(preset_yaw(preset));
         self.fit_to_bounds(center, radius, 1.33, CAMERA_FOV_DEG);
     }
 
     pub fn preset_orientation(&self, preset: CameraPreset) -> UnitQuaternion<f32> {
-        match preset {
-            CameraPreset::Iso => home_iso_orientation(),
-            CameraPreset::Front => orientation_from_dir_up(Vector3::z(), Vector3::y()),
-            CameraPreset::Back => orientation_from_dir_up(-Vector3::z(), Vector3::y()),
-            CameraPreset::Right | CameraPreset::Side => {
-                orientation_from_dir_up(Vector3::x(), Vector3::y())
-            }
-            CameraPreset::Left => orientation_from_dir_up(-Vector3::x(), Vector3::y()),
-            CameraPreset::Top => orientation_from_dir_up(Vector3::y(), -Vector3::z()),
-            CameraPreset::Bottom => orientation_from_dir_up(-Vector3::y(), Vector3::z()),
-        }
+        turntable_orientation(preset_yaw(preset))
     }
 
-    /// Starts a smooth 220 ms eased quaternion transition to `target_q`.
-    pub fn animate_to_orientation(&mut self, target_q: UnitQuaternion<f32>) {
-        // Ensure shortest-arc slerp by aligning hemisphere sign
-        let aligned = if self.orientation.coords.dot(&target_q.coords) < 0.0 {
-            UnitQuaternion::new_unchecked(-target_q.into_inner())
-        } else {
-            target_q
-        };
+    /// Smoothly rotates camera horizontally around world `+Y` to `target_yaw_rad` along shortest arc.
+    pub fn animate_to_yaw(&mut self, target_yaw_rad: f32) {
+        let from_yaw = self.yaw_rad;
+        let delta = wrap_angle(target_yaw_rad - from_yaw);
         self.transition = Some(CameraTransition {
-            from: self.orientation,
-            to: aligned,
+            from_yaw,
+            to_yaw: from_yaw + delta,
             elapsed_sec: 0.0,
             duration_sec: TRANSITION_DURATION_SEC,
         });
     }
 
-    /// Smoothly rotates camera to look from `eye_dir` toward target using `up_hint`.
-    pub fn animate_to_dir_up(&mut self, eye_dir: Vector3<f32>, up_hint: Vector3<f32>) {
-        let q = orientation_from_dir_up(eye_dir, up_hint);
-        self.animate_to_orientation(q);
+    /// Projects any requested orientation onto the gravity-locked horizontal turntable yaw and animates smoothly.
+    pub fn animate_to_orientation(&mut self, target_q: UnitQuaternion<f32>) {
+        let back = target_q * Vector3::z();
+        let horiz = back.x.hypot(back.z);
+        let target_yaw = if horiz > 1e-4 {
+            back.x.atan2(back.z)
+        } else {
+            HOME_YAW_RAD
+        };
+        self.animate_to_yaw(target_yaw);
     }
 
-    /// Smoothly animates back to the default Front-Right-Top Home isometric view.
+    /// Smoothly rotates camera horizontally to face `eye_dir` while preserving upright world `+Y`.
+    pub fn animate_to_dir_up(&mut self, eye_dir: Vector3<f32>, _up_hint: Vector3<f32>) {
+        let horiz = eye_dir.x.hypot(eye_dir.z);
+        let target_yaw = if horiz > 1e-4 {
+            eye_dir.x.atan2(eye_dir.z)
+        } else {
+            HOME_YAW_RAD
+        };
+        self.animate_to_yaw(target_yaw);
+    }
+
+    /// Smoothly animates back to the default Front-Right upright isometric view.
     pub fn animate_home(&mut self) {
-        self.animate_to_orientation(home_iso_orientation());
+        self.animate_to_yaw(HOME_YAW_RAD);
     }
 
-    /// Rolls the camera around its current viewing axis by `delta_rad` (e.g., ±90 degrees).
-    /// Chains from any in-flight transition destination so rapid clicks add full 90-degree turns.
-    pub fn animate_roll(&mut self, delta_rad: f32) {
-        let base = self
-            .transition
-            .as_ref()
-            .map(|t| t.to)
-            .unwrap_or(self.orientation);
-        let roll_q = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), delta_rad);
-        self.animate_to_orientation(base * roll_q);
+    /// Camera roll is disabled in single-axis upright turntable mode so gravity/top always stays level.
+    pub fn animate_roll(&mut self, _delta_rad: f32) {
+        self.orientation = turntable_orientation(self.yaw_rad);
     }
 
-    /// Advances any active smooth ViewCube transition; returns `true` while animating.
+    /// Advances any active smooth ViewCube horizontal transition; returns `true` while animating.
     pub fn advance(&mut self, dt_sec: f32) -> bool {
         let Some(mut tr) = self.transition.take() else {
             return false;
@@ -164,36 +201,26 @@ impl OrbitState {
         let t = (tr.elapsed_sec / tr.duration_sec.max(1e-4)).clamp(0.0, 1.0);
         // Smooth cubic ease-out: 1 - (1 - t)^3
         let eased = 1.0 - (1.0 - t).powi(3);
-        self.orientation = tr.from.slerp(&tr.to, eased);
+        let yaw = tr.from_yaw + (tr.to_yaw - tr.from_yaw) * eased;
+        self.yaw_rad = wrap_angle(yaw);
+        self.orientation = turntable_orientation(self.yaw_rad);
         if t < 1.0 {
             self.transition = Some(tr);
             true
         } else {
-            self.orientation = tr.to;
+            self.yaw_rad = wrap_angle(tr.to_yaw);
+            self.orientation = turntable_orientation(self.yaw_rad);
             false
         }
     }
 
-    /// Interactive turntable / trackball orbit from a screen pointer drag delta.
-    /// Immediately cancels any in-flight transition so user drag always has instant authority.
-    pub fn drag_orbit(&mut self, dx: f32, dy: f32) {
+    /// Single-axis horizontal turntable orbit around world `+Y`.
+    /// Vertical drag (`_dy`) is ignored so the robot always stays in its true upright/IMU orientation.
+    pub fn drag_orbit(&mut self, dx: f32, _dy: f32) {
         self.transition = None;
         let yaw_delta = -dx * 0.0085;
-        let pitch_delta = -dy * 0.0080;
-
-        let cur_up = self.orientation * Vector3::y();
-        // Use world Y turntable when upright so the horizon stays crisp; fall back to local up near poles.
-        let yaw_axis = if cur_up.y.abs() > 0.2 {
-            let sign = if cur_up.y >= 0.0 { 1.0 } else { -1.0 };
-            Unit::new_normalize(Vector3::new(0.0, sign, 0.0))
-        } else {
-            Unit::new_normalize(cur_up)
-        };
-        let yaw_q = UnitQuaternion::from_axis_angle(&yaw_axis, yaw_delta);
-        let pitch_q = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pitch_delta);
-
-        self.orientation = yaw_q * self.orientation * pitch_q;
-        self.orientation.renormalize();
+        self.yaw_rad = wrap_angle(self.yaw_rad + yaw_delta);
+        self.orientation = turntable_orientation(self.yaw_rad);
     }
 
     /// Computes exact perspective distance so a sphere of `radius` at `center` fits inside
@@ -259,24 +286,41 @@ mod tests {
     }
 
     #[test]
-    fn roll_rotates_camera_up_by_90_degrees_and_chains_rapid_clicks() {
+    fn turntable_camera_locks_single_axis_upright_rotation() {
         let mut orbit = OrbitState::default();
         orbit.apply_preset(CameraPreset::Front);
-        let back_before = orbit.back_world();
-        let up_before = orbit.up_world();
+        let elev_before = orbit.back_world().y;
 
-        // Two rapid 90-degree clicks should chain to 180 degrees total roll
-        orbit.animate_roll(std::f32::consts::FRAC_PI_2);
-        orbit.animate_roll(std::f32::consts::FRAC_PI_2);
-        assert!(orbit.advance(0.11));
-        assert!(!orbit.advance(0.20));
-
-        let back_after = orbit.back_world();
-        let up_after = orbit.up_world();
-        assert!((back_before - back_after).norm() < 1e-4, "roll must preserve viewing axis");
+        // Large vertical drag must NOT pitch or flip the camera; horizontal drag rotates yaw only
+        orbit.drag_orbit(120.0, 600.0);
         assert!(
-            (up_before + up_after).norm() < 1e-4,
-            "two chained 90-deg rolls must invert camera up"
+            (orbit.back_world().y - elev_before).abs() < 1e-5,
+            "vertical drag must not alter camera elevation"
         );
+        assert!(
+            orbit.right_world().y.abs() < 1e-5,
+            "camera horizon must remain strictly level (zero roll)"
+        );
+        assert!(
+            orbit.up_world().y > 0.9,
+            "world +Y must always remain upright on screen"
+        );
+        assert!(orbit.yaw_rad.abs() > 0.5, "horizontal drag must rotate yaw around +Y");
+
+        // Roll attempts must be ignored so horizon never tilts
+        orbit.animate_roll(FRAC_PI_2);
+        assert!(orbit.right_world().y.abs() < 1e-5);
+
+        // 180-degree Front -> Back transition must orbit horizontally, never tipping over top pole
+        orbit.apply_preset(CameraPreset::Front);
+        orbit.animate_to_yaw(PI);
+        assert!(orbit.advance(0.11));
+        assert!(
+            (orbit.back_world().y - elev_before).abs() < 1e-5,
+            "midpoint of 180-deg turn must stay at exact fixed upright elevation"
+        );
+        assert!(orbit.right_world().y.abs() < 1e-5);
+        assert!(!orbit.advance(0.20));
+        assert!(orbit.back_world().z < -0.9, "must finish facing Back");
     }
 }

@@ -1,0 +1,24 @@
+[package]
+name = "rk-mcp"
+description = "Rocky Studio Model Context Protocol (MCP) engine built on craft-mcp-server (WASM + native stdio/HTTP)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "rk_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rk-mcp"
+path = "src/main.rs"
+
+[dependencies]
+craft-mcp-server.workspace = true
+rk-proto.workspace = true
+rk-control.workspace = true
+rk-sim.workspace = true
+rk-model.workspace = true
+rk-link.workspace = true
+serde.workspace = true
+serde_json.workspace = true

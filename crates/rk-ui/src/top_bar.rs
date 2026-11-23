@@ -190,6 +190,7 @@ impl RockyStudioApp {
                     .corner_radius(CornerRadius::same(5));
 
                     if ui.add(estop_btn).clicked() {
+                        self.mcp.on_estop_disarm();
                         self.model.trigger_estop();
                     }
 
@@ -249,6 +250,53 @@ impl RockyStudioApp {
                             self.model.status_message = err;
                         }
                     }
+                }
+
+                let mcp_enabled = self.mcp.policy.enabled;
+                let mcp_armed = self.mcp.policy.drive_armed;
+                let recent_pulse = (self.sim_time_sec - self.mcp.last_activity_sim_time) < 1.2;
+                let (mcp_lbl, mcp_txt, mcp_fill, mcp_stroke) = if !mcp_enabled {
+                    (
+                        "MCP OFF",
+                        Color32::from_rgb(142, 156, 176),
+                        Color32::from_rgb(22, 28, 38),
+                        Color32::from_rgb(44, 56, 74),
+                    )
+                } else if mcp_armed {
+                    (
+                        "MCP ARMED",
+                        Color32::from_rgb(254, 243, 199),
+                        Color32::from_rgb(120, 74, 14),
+                        Color32::from_rgb(251, 191, 36),
+                    )
+                } else if self.mcp.drawer_open || recent_pulse {
+                    (
+                        "MCP ON",
+                        Color32::WHITE,
+                        Color32::from_rgb(14, 116, 144),
+                        Color32::from_rgb(103, 232, 249),
+                    )
+                } else {
+                    (
+                        "MCP ON",
+                        Color32::from_rgb(125, 224, 248),
+                        Color32::from_rgb(18, 42, 58),
+                        Color32::from_rgb(40, 128, 160),
+                    )
+                };
+                let mcp_btn = egui::Button::new(
+                    RichText::new(mcp_lbl).strong().size(11.5).color(mcp_txt),
+                )
+                .fill(mcp_fill)
+                .stroke(Stroke::new(1.0, mcp_stroke))
+                .min_size(Vec2::new(0.0, m.authority_btn_height))
+                .corner_radius(CornerRadius::same(5));
+                if ui
+                    .add(mcp_btn)
+                    .on_hover_text("Open MCP Agent Access panel, setup snippets & live tool log")
+                    .clicked()
+                {
+                    self.mcp.drawer_open = !self.mcp.drawer_open;
                 }
             });
         });

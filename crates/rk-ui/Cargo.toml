@@ -11,6 +11,7 @@ rk-sim.workspace = true
 rk-model.workspace = true
 rk-link.workspace = true
 rk-viewport.workspace = true
+rk-mcp.workspace = true
 
 egui.workspace = true
 egui_plot.workspace = true
@@ -22,4 +23,15 @@ serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Headers",
+    "Response",
+] }

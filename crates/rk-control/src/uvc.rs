@@ -867,6 +867,7 @@ mod tests {
 
         // Lean forward ~12 deg -> must enter ActiveCatchStep and step foot forward (+dxi)
         let imu_lean = ImuState {
+            available: true,
             pitch_rad: 0.21,
             roll_rad: 0.09,
             pitch_rate_rad_s: 0.8,
@@ -883,6 +884,7 @@ mod tests {
 
         // Exceed fall cutoff -> enters protective FallTuck for 40 ms before cutoff ready
         let imu_fall = ImuState {
+            available: true,
             pitch_rad: 0.85,
             roll_rad: 0.0,
             pitch_rate_rad_s: 2.0,

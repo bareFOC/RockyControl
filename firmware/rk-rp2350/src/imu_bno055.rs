@@ -181,6 +181,7 @@ async fn bno055_task(mut i2c: I2c<'static, I2C0, Async>) {
             let gyr_y_raw = i16::from_le_bytes([gyr_buf[2], gyr_buf[3]]);
 
             let state = ImuState {
+                available: true,
                 pitch_rad: (pitch_raw as f32) * RAD_PER_LSB,
                 roll_rad: (roll_raw as f32) * RAD_PER_LSB,
                 pitch_rate_rad_s: (gyr_x_raw as f32) * RAD_PER_LSB,

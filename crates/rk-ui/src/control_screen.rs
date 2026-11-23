@@ -16,6 +16,8 @@ impl RockyStudioApp {
             .input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
         let hud_blocked = self.show_paste_urdf_dialog
             || self.show_import_dialog
+            || (self.mcp.drawer_open
+                && pointer_pos.is_some_and(|p| self.mcp.drawer_rect.contains(p)))
             || pointer_pos.is_some_and(|p| self.viewport_hud_rects.iter().any(|r| r.contains(p)));
 
         let telem = self.model.latest_telemetry;
@@ -39,6 +41,7 @@ impl RockyStudioApp {
                 show_view_cube: true,
                 show_protractor: false,
                 interactive_drag: !estop,
+                imu_available: telem.imu.available,
                 imu_pitch_rad: telem.imu.pitch_rad,
                 imu_roll_rad: telem.imu.roll_rad,
             },
@@ -127,9 +130,19 @@ impl RockyStudioApp {
             });
 
             ui.add_space(4.0);
-            paint_tilt_bar(ui, "Pitch", pitch_deg, 38.0);
-            ui.add_space(3.0);
-            paint_tilt_bar(ui, "Roll ", roll_deg, 38.0);
+            if telem.imu.available {
+                paint_tilt_bar(ui, "Pitch", pitch_deg, 38.0);
+                ui.add_space(3.0);
+                paint_tilt_bar(ui, "Roll ", roll_deg, 38.0);
+            } else {
+                ui.label(
+                    RichText::new("NO IMU · UPRIGHT LOCK (0.0° / 0.0°)")
+                        .monospace()
+                        .strong()
+                        .size(11.0)
+                        .color(Color32::from_rgb(148, 166, 190)),
+                );
+            }
 
             ui.add_space(4.0);
             ui.label(

@@ -50,7 +50,7 @@ pub fn build_view_cube_regions() -> Vec<ViewCubeRegion> {
         ("BACK", "Back (-Z)", -Vector3::z(), -Vector3::x(), Vector3::y(), Vector3::y()),
         ("RIGHT", "Right (+X)", Vector3::x(), -Vector3::z(), Vector3::y(), Vector3::y()),
         ("LEFT", "Left (-X)", -Vector3::x(), Vector3::z(), Vector3::y(), Vector3::y()),
-        ("TOP", "Top (+Y)", Vector3::y(), Vector3::x(), -Vector3::z(), -Vector3::z()),
+        ("TOP", "Top (Upright Lock — Reset Home)", Vector3::y(), Vector3::x(), -Vector3::z(), -Vector3::z()),
         ("BOTTOM", "Bottom (-Y)", -Vector3::y(), Vector3::x(), Vector3::z(), Vector3::z()),
     ];
 
@@ -173,11 +173,8 @@ pub struct ViewCubeFrame {
     pub consumed: bool,
     scale: f32,
     box_rect: Rect,
-    center: Pos2,
     home_rect: Rect,
     home_hovered: bool,
-    ccw_hovered: bool,
-    cw_hovered: bool,
     widget_hot: bool,
     hovered_id: Option<usize>,
     visible: Vec<ProjectedRegionData>,
@@ -288,7 +285,7 @@ pub fn interact_view_cube(
             ui.scope_id().with("viewcube_home"),
             Sense::click(),
         )
-        .on_hover_text("Home (Isometric Front-Right-Top)");
+        .on_hover_text("Home (Upright Isometric)");
     let home_hit = pointer_pos.is_some_and(|p| home_rect.contains(p));
     if home_resp.clicked() || (home_hit && primary_released && !state.dragging_cube) {
         orbit.animate_home();
@@ -298,51 +295,7 @@ pub fn interact_view_cube(
         consumed = true;
     }
 
-    // 2. Curved 90-degree CCW and CW roll arrows (symmetrical around top-right arc of cube)
-    let roll_ccw_rect = Rect::from_center_size(
-        center + vec2(22.0, -49.0) * scale,
-        vec2(28.0, 20.0) * scale,
-    );
-    let roll_cw_rect = Rect::from_center_size(
-        center + vec2(49.0, -22.0) * scale,
-        vec2(20.0, 28.0) * scale,
-    );
-
-    let ccw_resp = ui
-        .interact(
-            roll_ccw_rect,
-            ui.scope_id().with("viewcube_roll_ccw"),
-            Sense::click(),
-        )
-        .on_hover_text("Roll view counterclockwise 90 deg");
-    let ccw_hit = pointer_pos.is_some_and(|p| roll_ccw_rect.contains(p));
-    if ccw_resp.clicked() || (ccw_hit && primary_released && !state.dragging_cube) {
-        orbit.animate_roll(std::f32::consts::FRAC_PI_2);
-        consumed = true;
-    }
-    let cw_resp = ui
-        .interact(
-            roll_cw_rect,
-            ui.scope_id().with("viewcube_roll_cw"),
-            Sense::click(),
-        )
-        .on_hover_text("Roll view clockwise 90 deg");
-    let cw_hit = pointer_pos.is_some_and(|p| roll_cw_rect.contains(p));
-    if cw_resp.clicked() || (cw_hit && primary_released && !state.dragging_cube) {
-        orbit.animate_roll(-std::f32::consts::FRAC_PI_2);
-        consumed = true;
-    }
-    if ccw_resp.hovered()
-        || cw_resp.hovered()
-        || ccw_resp.is_pointer_button_down_on()
-        || cw_resp.is_pointer_button_down_on()
-        || ccw_hit
-        || cw_hit
-    {
-        consumed = true;
-    }
-
-    // 3. Project all 26 ViewCube regions using the live camera orientation
+    // 2. Project all 26 ViewCube regions using the live gravity-locked camera orientation
     let cube_hit_rect = Rect::from_center_size(center, vec2(84.0, 84.0) * scale);
     let cube_resp = ui.interact(
         cube_hit_rect,
@@ -354,7 +307,7 @@ pub fn interact_view_cube(
     let visible = project_regions(&regions, &orbit.orientation, center, cube_radius);
 
     // Hit-test pointer front-to-back across the 26 projected polygons
-    let hovered_id: Option<usize> = if !state.dragging_cube && !home_hit && !ccw_hit && !cw_hit {
+    let hovered_id: Option<usize> = if !state.dragging_cube && !home_hit {
         pointer_pos.and_then(|pos| {
             visible
                 .iter()
@@ -366,7 +319,7 @@ pub fn interact_view_cube(
         None
     };
 
-    // Handle direct cube drag-to-orbit vs click-to-snap reliably across mouse, touch, and fast taps
+    // Handle direct cube drag-to-orbit (horizontal yaw only) vs click-to-snap
     let mut orientation_changed = false;
     if (primary_pressed && hovered_id.is_some()) || cube_resp.drag_started() {
         state.drag_accum_px = 0.0;
@@ -386,7 +339,7 @@ pub fn interact_view_cube(
         state.drag_accum_px += delta.length();
         if state.drag_accum_px > 4.0 {
             state.dragging_cube = true;
-            orbit.drag_orbit(delta.x, delta.y);
+            orbit.drag_orbit(delta.x, 0.0);
             orientation_changed = true;
         }
         consumed = true;
@@ -396,7 +349,7 @@ pub fn interact_view_cube(
         || cube_resp.drag_stopped()
         || (primary_released && (state.pressed_region_id.is_some() || hovered_id.is_some()));
 
-    if released_on_cube && !home_hit && !ccw_hit && !cw_hit {
+    if released_on_cube && !home_hit {
         if !state.dragging_cube {
             let release_hit = cube_resp
                 .interact_pointer_pos()
@@ -412,7 +365,7 @@ pub fn interact_view_cube(
 
             if let Some(hit_id) = release_hit {
                 if let Some(reg) = regions.get(hit_id) {
-                    orbit.animate_to_dir_up(reg.view_dir, reg.up_hint);
+                    orbit.animate_to_dir_up(reg.view_dir, Vector3::y());
                 }
             }
         }
@@ -450,11 +403,8 @@ pub fn interact_view_cube(
         consumed,
         scale,
         box_rect,
-        center,
         home_rect,
         home_hovered: home_resp.hovered(),
-        ccw_hovered: ccw_resp.hovered(),
-        cw_hovered: cw_resp.hovered(),
         widget_hot,
         hovered_id,
         visible: final_visible,
@@ -462,30 +412,12 @@ pub fn interact_view_cube(
     })
 }
 
-/// Paints the ViewCube, Home icon, curved roll arrows, and XYZ world-axis triad on top of WebGL2.
+/// Paints the ViewCube, Home icon, and XYZ world-axis triad on top of WebGL2.
 pub fn paint_view_cube(painter: &egui::Painter, frame: &ViewCubeFrame) {
     let scale = frame.scale;
 
     // 1. Home button
     paint_home_button(painter, frame.home_rect, frame.home_hovered, frame.widget_hot);
-
-    // 2. Curved 90-degree CCW and CW roll arrows framing the top-right quadrant of the cube
-    paint_curved_roll_arrow(
-        painter,
-        frame.center,
-        false,
-        frame.ccw_hovered,
-        frame.widget_hot,
-        scale,
-    );
-    paint_curved_roll_arrow(
-        painter,
-        frame.center,
-        true,
-        frame.cw_hovered,
-        frame.widget_hot,
-        scale,
-    );
 
     // 3. Solid directional-shaded 26-region chamfered ViewCube (sculpted CAD slate look)
     let light_dir = Vector3::new(-0.32, 0.58, 0.75).normalize();
@@ -603,65 +535,6 @@ fn paint_home_button(painter: &egui::Painter, rect: Rect, hovered: bool, visible
         pos2(c.x + r * 0.72, c.y + r * 0.95),
     );
     painter.rect_stroke(walls, 1.0, Stroke::new(1.3, col), egui::StrokeKind::Inside);
-}
-
-fn paint_curved_roll_arrow(
-    painter: &egui::Painter,
-    cube_center: Pos2,
-    clockwise: bool,
-    hovered: bool,
-    widget_hot: bool,
-    scale: f32,
-) {
-    // Frame the top-right quadrant cleanly around the ViewCube (screen +Y is down, so -PI/2 is top, 0 is right)
-    let (start, end) = if clockwise {
-        (-std::f32::consts::FRAC_PI_4 + 0.14, -0.10)
-    } else {
-        (-std::f32::consts::FRAC_PI_4 - 0.14, -std::f32::consts::FRAC_PI_2 + 0.10)
-    };
-    let radius = 52.0 * scale;
-    let pts: Vec<Pos2> = (0..=14)
-        .map(|i| {
-            let t = i as f32 / 14.0;
-            let ang = start + (end - start) * t;
-            cube_center + vec2(ang.cos(), ang.sin()) * radius
-        })
-        .collect();
-
-    let (outer, inner) = if hovered {
-        (
-            Color32::from_rgb(56, 189, 248),
-            Color32::from_rgb(224, 242, 254),
-        )
-    } else if widget_hot {
-        (
-            Color32::from_rgba_unmultiplied(54, 74, 102, 230),
-            Color32::from_rgba_unmultiplied(206, 222, 242, 235),
-        )
-    } else {
-        (
-            Color32::from_rgba_unmultiplied(44, 60, 84, 160),
-            Color32::from_rgba_unmultiplied(166, 186, 212, 175),
-        )
-    };
-
-    painter.add(Shape::line(pts.clone(), Stroke::new(3.4 * scale, outer)));
-    painter.add(Shape::line(pts.clone(), Stroke::new(1.8 * scale, inner)));
-
-    if let Some(&tip) = pts.last() {
-        let sign = if clockwise { 1.0 } else { -1.0 };
-        let dir = vec2(-end.sin(), end.cos()) * sign;
-        let side = vec2(-dir.y, dir.x);
-        painter.add(Shape::convex_polygon(
-            vec![
-                tip + dir * (5.2 * scale),
-                tip - dir * (3.2 * scale) + side * (4.0 * scale),
-                tip - dir * (3.2 * scale) - side * (4.0 * scale),
-            ],
-            inner,
-            Stroke::new(0.8, outer),
-        ));
-    }
 }
 
 fn paint_axis_triad(

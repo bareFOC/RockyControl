@@ -9,6 +9,7 @@ members = [
     "crates/rk-model",
     "crates/rk-link",
     "crates/rk-viewport",
+    "crates/rk-mcp",
     "crates/rk-ui",
     "apps/rk-desktop",
     "apps/rk-web",
@@ -33,6 +34,7 @@ rk-sim = { path = "crates/rk-sim" }
 rk-model = { path = "crates/rk-model" }
 rk-link = { path = "crates/rk-link" }
 rk-viewport = { path = "crates/rk-viewport" }
+rk-mcp = { path = "crates/rk-mcp" }
 rk-ui = { path = "crates/rk-ui" }
 
 # Pinned storytold/craft-libs ecosystem (immutable commit SHA)
@@ -42,6 +44,7 @@ craft-atomic = { git = "https://github.com/storytold/craft-libs.git", rev = "068
 craft-platform = { git = "https://github.com/storytold/craft-libs.git", rev = "068e079c7be4b100a8a6b305b31ac881e069727e" }
 craft-quit = { git = "https://github.com/storytold/craft-libs.git", rev = "068e079c7be4b100a8a6b305b31ac881e069727e", features = ["egui"] }
 craft-xtask = { git = "https://github.com/storytold/craft-libs.git", rev = "068e079c7be4b100a8a6b305b31ac881e069727e" }
+craft-mcp-server = { git = "https://github.com/storytold/craft-libs.git", rev = "068e079c7be4b100a8a6b305b31ac881e069727e" }
 
 # egui / eframe (matched to storytold/craft-libs egui 0.37 via [patch.crates-io])
 egui = { version = "0.37", default-features = false, features = ["default_fonts", "serde"] }

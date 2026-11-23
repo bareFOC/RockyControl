@@ -29,6 +29,9 @@ pub struct SimFaultInjection {
     pub servo_bus_error: bool,
     /// Drives a smooth external sinusoidal hand wave in Teach mode to test Robot -> GUI mirroring.
     pub external_hand_wave: bool,
+    /// Disables the simulated IMU so Rocky reports no IMU available (3D viewport locks upright).
+    #[serde(default)]
+    pub imu_disconnected: bool,
     /// Actuator responsiveness factor (0.04 = slow/visible ghost lag, 0.35 = crisp).
     pub servo_lag_factor: f32,
 }
@@ -41,6 +44,7 @@ impl Default for SimFaultInjection {
             voltage_sag: false,
             servo_bus_error: false,
             external_hand_wave: false,
+            imu_disconnected: false,
             servo_lag_factor: 0.12,
         }
     }
@@ -337,11 +341,16 @@ impl SimulatedServoPlant {
             temp_c,
             bus_voltage_mv,
             bus_error: self.faults.servo_bus_error,
-            imu: rk_proto::ImuState {
-                pitch_rad: self.torso_pitch_rad,
-                roll_rad: self.torso_roll_rad,
-                pitch_rate_rad_s: self.pitch_rate_rad_s,
-                roll_rate_rad_s: self.roll_rate_rad_s,
+            imu: if self.faults.imu_disconnected {
+                rk_proto::ImuState::default()
+            } else {
+                rk_proto::ImuState {
+                    available: true,
+                    pitch_rad: self.torso_pitch_rad,
+                    roll_rad: self.torso_roll_rad,
+                    pitch_rate_rad_s: self.pitch_rate_rad_s,
+                    roll_rate_rad_s: self.roll_rate_rad_s,
+                }
             },
         }
     }

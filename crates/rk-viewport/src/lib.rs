@@ -92,8 +92,22 @@ pub struct ViewportOptions {
     pub show_view_cube: bool,
     pub show_protractor: bool,
     pub interactive_drag: bool,
+    /// When true, orient robot per live real-world IMU pitch/roll; when false, always keep upright (top-up).
+    pub imu_available: bool,
     pub imu_pitch_rad: f32,
     pub imu_roll_rad: f32,
+}
+
+impl ViewportOptions {
+    /// Returns the effective `(pitch_rad, roll_rad)` applied to the 3D robot.
+    /// Uses real-world IMU orientation when `imu_available` is true, or strictly upright `(0.0, 0.0)` otherwise.
+    pub fn effective_imu_tilt(self) -> (f32, f32) {
+        if self.imu_available {
+            (self.imu_pitch_rad, self.imu_roll_rad)
+        } else {
+            (0.0, 0.0)
+        }
+    }
 }
 
 impl Default for ViewportOptions {
@@ -105,6 +119,7 @@ impl Default for ViewportOptions {
             show_view_cube: true,
             show_protractor: true,
             interactive_drag: true,
+            imu_available: false,
             imu_pitch_rad: 0.0,
             imu_roll_rad: 0.0,
         }
@@ -261,10 +276,11 @@ impl HumanoidViewport {
             CAMERA_FOV_DEG,
         );
 
+        let (eff_pitch_rad, eff_roll_rad) = opts.effective_imu_tilt();
         let measured_transforms =
-            rig.compute_link_transforms_with_tilt(measured_rad, opts.imu_pitch_rad, opts.imu_roll_rad);
+            rig.compute_link_transforms_with_tilt(measured_rad, eff_pitch_rad, eff_roll_rad);
         let target_transforms = if opts.show_ghost {
-            rig.compute_link_transforms_with_tilt(target_rad, opts.imu_pitch_rad, opts.imu_roll_rad)
+            rig.compute_link_transforms_with_tilt(target_rad, eff_pitch_rad, eff_roll_rad)
         } else {
             HashMap::new()
         };
@@ -432,8 +448,8 @@ impl HumanoidViewport {
             match self.active_drag {
                 Some(ActiveViewportDrag::Orbit { button }) if response.dragged_by(button) => {
                     let delta = response.drag_delta();
-                    if delta.length_sq() > 0.0 {
-                        self.orbit.drag_orbit(delta.x, delta.y);
+                    if delta.x.abs() > 0.0 {
+                        self.orbit.drag_orbit(delta.x, 0.0);
                         ui.ctx().request_repaint();
                     }
                 }
@@ -506,8 +522,8 @@ impl HumanoidViewport {
                                         link_name,
                                         target_rad,
                                         world_target,
-                                        opts.imu_pitch_rad,
-                                        opts.imu_roll_rad,
+                                        eff_pitch_rad,
+                                        eff_roll_rad,
                                         calibration,
                                     ) {
                                         interaction.picked_joint = Some(*joint_idx);

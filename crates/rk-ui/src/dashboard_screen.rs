@@ -155,6 +155,9 @@ impl RockyStudioApp {
                             if ui.add(connect_btn).clicked() {
                                 self.connect_active_transport();
                             }
+
+                            ui.add_space(14.0);
+                            self.render_home_mcp_bar(ui);
                         });
                     });
 
@@ -467,6 +470,9 @@ impl RockyStudioApp {
                                 );
                             });
                         }
+
+                        ui.add_space(12.0);
+                        self.render_home_mcp_bar(ui);
                     },
                 );
                 ui.add_space(16.0);
@@ -601,25 +607,35 @@ impl RockyStudioApp {
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
-            let bal_col = if faults.contains(FaultFlags::TILT_FALL_CUTOFF) {
+            let imu_avail = self.model.latest_telemetry.imu.available;
+            let bal_col = if !imu_avail {
+                Color32::from_rgb(148, 166, 190)
+            } else if faults.contains(FaultFlags::TILT_FALL_CUTOFF) {
                 Color32::from_rgb(248, 113, 113)
             } else if pitch_deg.abs() > 8.0 || roll_deg.abs() > 8.0 {
                 Color32::from_rgb(251, 191, 36)
             } else {
                 Color32::from_rgb(74, 222, 128)
             };
-            let bal_state = if faults.contains(FaultFlags::TILT_FALL_CUTOFF) {
+            let bal_val = if imu_avail {
+                format!("P {pitch_deg:+.1}°  R {roll_deg:+.1}°")
+            } else {
+                "NO IMU".to_string()
+            };
+            let bal_state = if !imu_avail {
+                "ALWAYS UPRIGHT (TOP-UP)"
+            } else if faults.contains(FaultFlags::TILT_FALL_CUTOFF) {
                 "FALL CUTOFF"
             } else if self.model.walk_cmd.balance_enabled {
-                "UPRIGHT · MCU ON"
+                "REAL-WORLD IMU · MCU ON"
             } else {
-                "BALANCE OFF"
+                "REAL-WORLD IMU · BAL OFF"
             };
             stat_card(
                 ui,
                 card_w,
                 "IMU ATTITUDE & BALANCE",
-                &format!("P {pitch_deg:+.1}°  R {roll_deg:+.1}°"),
+                &bal_val,
                 bal_state,
                 bal_col,
             );
@@ -703,6 +719,7 @@ impl RockyStudioApp {
                     show_view_cube: false,
                     show_protractor: false,
                     interactive_drag: false,
+                    imu_available: telem.imu.available,
                     imu_pitch_rad: telem.imu.pitch_rad,
                     imu_roll_rad: telem.imu.roll_rad,
                 };
