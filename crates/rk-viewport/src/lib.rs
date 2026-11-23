@@ -20,7 +20,7 @@ use egui::{Color32, CornerRadius, FontId, Pos2, Rect, Stroke, pos2, vec2};
 use glow::HasContext as _;
 use rk_control::JointCalibration;
 use rk_model::nalgebra::{Isometry3, Point3, Vector3};
-use rk_model::{AssetBundle, KinematicRig, VisualShape};
+use rk_model::{AssetBundle, KinematicRig, UpAxis, VisualShape};
 use rk_proto::MAX_JOINTS;
 use three_d::{ScissorBox, Viewport};
 
@@ -111,8 +111,25 @@ impl Default for ViewportOptions {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PickVolume {
+    BoxHalf([f32; 3]),
+    Sphere(f32),
+}
+
 #[derive(Clone, Debug)]
-enum ActiveRobotDrag {
+struct PickBound {
+    link_name: String,
+    joint_index: Option<usize>,
+    world: Isometry3<f32>,
+    volume: PickVolume,
+}
+
+#[derive(Clone, Debug)]
+enum ActiveViewportDrag {
+    Orbit {
+        button: egui::PointerButton,
+    },
     Fk {
         joint_idx: usize,
         pivot: Point3<f32>,
@@ -142,10 +159,10 @@ pub struct HumanoidViewport {
     viewport_id: u64,
     rig_generation: u64,
     last_error: Option<String>,
-    pick_bounds: Vec<(String, Option<usize>, Isometry3<f32>, f32)>,
+    pick_bounds: Vec<PickBound>,
     joint_pick_spheres: Vec<(usize, Point3<f32>, f32)>,
     view_cube: ViewCubeState,
-    active_drag: Option<ActiveRobotDrag>,
+    active_drag: Option<ActiveViewportDrag>,
 }
 
 impl Drop for HumanoidViewport {
@@ -254,6 +271,7 @@ impl HumanoidViewport {
 
         let marker_radius = (rig.bounds_radius() * 0.024).clamp(0.012, 0.034);
         let pick_scale = self.pick_radius_scale.clamp(0.9, 2.0);
+        let hit_pad = if self.touch_mode { 0.012 } else { 0.008 } * (pick_scale / 1.25);
 
         // Collect live world-space positions of movable joints for markers & direct grabbing
         let mut joint_positions = Vec::with_capacity(rig.joints.len());
@@ -265,29 +283,45 @@ impl HumanoidViewport {
                 self.joint_pick_spheres.push((
                     j.index,
                     Point3::new(t.x, t.y, t.z),
-                    (marker_radius * 2.6 * pick_scale).max(0.042),
+                    (marker_radius * 1.9 * pick_scale).max(0.028),
                 ));
             }
         }
 
-        // Update link pick bounds for direct click/drag on limbs
+        // Update exact oriented link pick volumes for direct robot hit-testing vs empty-space orbit
         self.pick_bounds.clear();
         for vis in &rig.visuals {
             if let Some(iso) = measured_transforms.get(&vis.link_name) {
                 let world = iso * vis.local_offset;
-                let radius = match vis.shape {
-                    VisualShape::Box(s) => (s[0].max(s[1]).max(s[2]) * 0.62).max(0.055),
+                let volume = match vis.shape {
+                    VisualShape::Box(s) => PickVolume::BoxHalf([
+                        s[0].max(0.01) * 0.5 + hit_pad,
+                        s[1].max(0.01) * 0.5 + hit_pad,
+                        s[2].max(0.01) * 0.5 + hit_pad,
+                    ]),
                     VisualShape::Cylinder { radius, length } => {
-                        (radius.max(length * 0.52)).max(0.055)
+                        let r = radius.max(0.01) + hit_pad;
+                        let half_l = length.max(0.01) * 0.5 + hit_pad;
+                        match rig.up_axis {
+                            UpAxis::YUp => PickVolume::BoxHalf([r, half_l, r]),
+                            UpAxis::ZUp => PickVolume::BoxHalf([r, r, half_l]),
+                        }
                     }
-                    VisualShape::Sphere { radius } => radius.max(0.055),
-                    VisualShape::Mesh { scale, .. } => {
+                    VisualShape::Sphere { radius } => {
+                        PickVolume::Sphere(radius.max(0.015) + hit_pad)
+                    }
+                    VisualShape::Mesh { scale, .. } => PickVolume::Sphere(
                         (scale[0].abs().max(scale[1].abs()).max(scale[2].abs()) * 0.14)
-                            .clamp(0.06, 0.35)
-                    }
-                } * pick_scale;
-                self.pick_bounds
-                    .push((vis.link_name.clone(), vis.joint_index, world, radius));
+                            .clamp(0.055, 0.25)
+                            + hit_pad,
+                    ),
+                };
+                self.pick_bounds.push(PickBound {
+                    link_name: vis.link_name.clone(),
+                    joint_index: vis.joint_index,
+                    world,
+                    volume,
+                });
             }
         }
 
@@ -296,173 +330,208 @@ impl HumanoidViewport {
             ..Default::default()
         };
 
-        // 2. Direct 3D Robot Manipulation (ViewCube handles orientation; dragging robot moves joints/arms)
-        if !opts.interactive_drag || opts.hud_blocked || cube_consumed {
-            if !ui.ctx().input(|i| i.pointer.primary_down()) {
+        // 2. Canvas interaction: dragging a robot part moves the robot (FK/IK);
+        //    dragging empty space (or secondary/middle drag) orbits the camera view.
+        if opts.hud_blocked || cube_consumed {
+            if !ui.ctx().input(|i| i.pointer.any_down()) {
                 self.active_drag = None;
             }
         } else {
-            // Start direct joint/limb drag when primary drag begins over the robot
+            // Start drag: check robot part hit first, fall back to empty-space camera orbit
             if response.drag_started_by(egui::PointerButton::Primary) {
                 if let Some(ptr) = ui
                     .ctx()
                     .input(|i| i.pointer.press_origin().or_else(|| i.pointer.interact_pos()))
                 {
-                    if let Some((hit_link, hit_joint, hit_pt, from_joint_sphere)) =
-                        self.pick_hit_at(ptr, rect)
-                    {
-                        interaction.picked_joint = Some(hit_joint);
-                        let use_ik = match self.drag_mode {
-                            DragMode::LimbIk => hit_link.is_some(),
-                            DragMode::FkJoint => false,
-                            DragMode::Auto => {
-                                !from_joint_sphere
-                                    && hit_link
-                                        .as_deref()
-                                        .is_some_and(|l| rig.is_ik_end_effector(l))
-                            }
-                        };
-
-                        if use_ik {
-                            if let Some(link_name) = hit_link {
-                                let forward = -self.orbit.back_world();
-                                self.active_drag = Some(ActiveRobotDrag::Ik {
-                                    link_name,
-                                    joint_idx: hit_joint,
-                                    plane_point: hit_pt,
-                                    plane_normal: forward,
-                                });
-                            }
-                        } else if let Some((pivot, axis)) =
-                            rig.joint_world_pivot_and_axis(hit_joint, &measured_transforms)
+                    if opts.interactive_drag {
+                        if let Some((hit_link, hit_joint, hit_pt, from_joint_sphere)) =
+                            self.pick_hit_at(ptr, rect)
                         {
-                            let (ray_o, ray_d) = self.pointer_ray(ptr, rect);
-                            let start_dir = intersect_ray_plane(ray_o, ray_d, pivot, axis)
-                                .and_then(|p| (p - pivot).try_normalize(1e-4));
-
-                            // Compute robust screen-space tangent perpendicular to projected axis for edge-on views
-                            let p0 = self.project_world_to_screen(pivot, rect);
-                            let p1 = self.project_world_to_screen(pivot + axis * 0.15, rect);
-                            let tangent_2d = match (p0, p1) {
-                                (Some(a), Some(b)) => {
-                                    let d = b - a;
-                                    if d.length_sq() > 1.0 {
-                                        egui::vec2(-d.y, d.x).normalized()
-                                    } else {
-                                        egui::vec2(1.0, 0.0)
-                                    }
+                            interaction.picked_joint = Some(hit_joint);
+                            let use_ik = match self.drag_mode {
+                                DragMode::LimbIk => hit_link.is_some(),
+                                DragMode::FkJoint => false,
+                                DragMode::Auto => {
+                                    !from_joint_sphere
+                                        && hit_link
+                                            .as_deref()
+                                            .is_some_and(|l| rig.is_ik_end_effector(l))
                                 }
-                                _ => egui::vec2(1.0, 0.0),
                             };
 
-                            let start_angle = target_rad
-                                .get(hit_joint)
-                                .copied()
-                                .unwrap_or(0.0);
+                            if use_ik {
+                                if let Some(link_name) = hit_link {
+                                    let forward = -self.orbit.back_world();
+                                    self.active_drag = Some(ActiveViewportDrag::Ik {
+                                        link_name,
+                                        joint_idx: hit_joint,
+                                        plane_point: hit_pt,
+                                        plane_normal: forward,
+                                    });
+                                }
+                            } else if let Some((pivot, axis)) =
+                                rig.joint_world_pivot_and_axis(hit_joint, &measured_transforms)
+                            {
+                                let (ray_o, ray_d) = self.pointer_ray(ptr, rect);
+                                let start_dir = intersect_ray_plane(ray_o, ray_d, pivot, axis)
+                                    .and_then(|p| (p - pivot).try_normalize(1e-4));
 
-                            self.active_drag = Some(ActiveRobotDrag::Fk {
-                                joint_idx: hit_joint,
+                                // Compute robust screen-space tangent perpendicular to projected axis for edge-on views
+                                let p0 = self.project_world_to_screen(pivot, rect);
+                                let p1 = self.project_world_to_screen(pivot + axis * 0.15, rect);
+                                let tangent_2d = match (p0, p1) {
+                                    (Some(a), Some(b)) => {
+                                        let d = b - a;
+                                        if d.length_sq() > 1.0 {
+                                            egui::vec2(-d.y, d.x).normalized()
+                                        } else {
+                                            egui::vec2(1.0, 0.0)
+                                        }
+                                    }
+                                    _ => egui::vec2(1.0, 0.0),
+                                };
+
+                                let start_angle = target_rad
+                                    .get(hit_joint)
+                                    .copied()
+                                    .unwrap_or(0.0);
+
+                                self.active_drag = Some(ActiveViewportDrag::Fk {
+                                    joint_idx: hit_joint,
+                                    pivot,
+                                    axis,
+                                    start_dir,
+                                    start_screen: ptr,
+                                    tangent_2d,
+                                    start_angle,
+                                    current_angle: start_angle,
+                                });
+                            }
+                        } else if !self.hits_any_robot_part(ptr, rect) {
+                            self.active_drag = Some(ActiveViewportDrag::Orbit {
+                                button: egui::PointerButton::Primary,
+                            });
+                        }
+                    } else if !self.hits_any_robot_part(ptr, rect) {
+                        self.active_drag = Some(ActiveViewportDrag::Orbit {
+                            button: egui::PointerButton::Primary,
+                        });
+                    }
+                }
+            } else if response.drag_started_by(egui::PointerButton::Secondary) {
+                self.active_drag = Some(ActiveViewportDrag::Orbit {
+                    button: egui::PointerButton::Secondary,
+                });
+            } else if response.drag_started_by(egui::PointerButton::Middle) {
+                self.active_drag = Some(ActiveViewportDrag::Orbit {
+                    button: egui::PointerButton::Middle,
+                });
+            }
+
+            // Continue active camera orbit or direct robot joint/limb drag
+            match self.active_drag {
+                Some(ActiveViewportDrag::Orbit { button }) if response.dragged_by(button) => {
+                    let delta = response.drag_delta();
+                    if delta.length_sq() > 0.0 {
+                        self.orbit.drag_orbit(delta.x, delta.y);
+                        ui.ctx().request_repaint();
+                    }
+                }
+                _ if opts.interactive_drag && response.dragged_by(egui::PointerButton::Primary) => {
+                    if let Some(ptr) = response.interact_pointer_pos() {
+                        let (ray_o, ray_d) = self.pointer_ray(ptr, rect);
+                        let mut active_drag = self.active_drag.take();
+                        match &mut active_drag {
+                            Some(ActiveViewportDrag::Fk {
+                                joint_idx,
                                 pivot,
                                 axis,
                                 start_dir,
-                                start_screen: ptr,
+                                start_screen,
                                 tangent_2d,
                                 start_angle,
-                                current_angle: start_angle,
-                            });
-                        }
-                    }
-                }
-            }
+                                current_angle,
+                            }) => {
+                                let (lo, hi) = calibration
+                                    .get(*joint_idx)
+                                    .map(|c| (c.min_rad, c.max_rad))
+                                    .unwrap_or((-1.57, 1.57));
 
-            // Continue active direct joint or limb IK drag
-            if response.dragged_by(egui::PointerButton::Primary) {
-                if let Some(ptr) = response.interact_pointer_pos() {
-                    let (ray_o, ray_d) = self.pointer_ray(ptr, rect);
-                    let mut active_drag = self.active_drag.take();
-                    match &mut active_drag {
-                        Some(ActiveRobotDrag::Fk {
-                            joint_idx,
-                            pivot,
-                            axis,
-                            start_dir,
-                            start_screen,
-                            tangent_2d,
-                            start_angle,
-                            current_angle,
-                        }) => {
-                            let (lo, hi) = calibration
-                                .get(*joint_idx)
-                                .map(|c| (c.min_rad, c.max_rad))
-                                .unwrap_or((-1.57, 1.57));
-
-                            let ray_dot = ray_d.dot(axis).abs();
-                            let delta_rad = if ray_dot > 0.22 {
-                                if let (Some(s_dir), Some(hit_pt)) =
-                                    (*start_dir, intersect_ray_plane(ray_o, ray_d, *pivot, *axis))
-                                {
-                                    if let Some(cur_dir) = (hit_pt - *pivot).try_normalize(1e-4) {
-                                        let sin_a = s_dir.cross(&cur_dir).dot(axis);
-                                        let cos_a = s_dir.dot(&cur_dir);
-                                        sin_a.atan2(cos_a)
+                                let ray_dot = ray_d.dot(axis).abs();
+                                let delta_rad = if ray_dot > 0.22 {
+                                    if let (Some(s_dir), Some(hit_pt)) = (
+                                        *start_dir,
+                                        intersect_ray_plane(ray_o, ray_d, *pivot, *axis),
+                                    ) {
+                                        if let Some(cur_dir) =
+                                            (hit_pt - *pivot).try_normalize(1e-4)
+                                        {
+                                            let sin_a = s_dir.cross(&cur_dir).dot(axis);
+                                            let cos_a = s_dir.dot(&cur_dir);
+                                            sin_a.atan2(cos_a)
+                                        } else {
+                                            0.0
+                                        }
                                     } else {
-                                        0.0
+                                        (ptr - *start_screen).dot(*tangent_2d) * 0.012
                                     }
                                 } else {
+                                    // Smooth edge-on view fallback along screen tangent
                                     (ptr - *start_screen).dot(*tangent_2d) * 0.012
-                                }
-                            } else {
-                                // Smooth edge-on view fallback along screen tangent
-                                (ptr - *start_screen).dot(*tangent_2d) * 0.012
-                            };
+                                };
 
-                            let next_angle = (*start_angle + delta_rad).clamp(lo, hi);
-                            *current_angle = next_angle;
-                            interaction.picked_joint = Some(*joint_idx);
-                            interaction.dragged_joint = Some((*joint_idx, next_angle));
-                            interaction.is_dragging_robot = true;
-                            if let Some(jm) = rig.joints.get(*joint_idx) {
-                                interaction.active_drag_label =
-                                    Some(format!("FK {} ({:+.1} deg)", jm.label, next_angle.to_degrees()));
-                            }
-                        }
-                        Some(ActiveRobotDrag::Ik {
-                            link_name,
-                            joint_idx,
-                            plane_point,
-                            plane_normal,
-                        }) => {
-                            if let Some(world_target) =
-                                intersect_ray_plane(ray_o, ray_d, *plane_point, *plane_normal)
-                            {
-                                if let Some(solved) = rig.solve_limb_ik(
-                                    link_name,
-                                    target_rad,
-                                    world_target,
-                                    opts.imu_pitch_rad,
-                                    opts.imu_roll_rad,
-                                    calibration,
-                                ) {
-                                    interaction.picked_joint = Some(*joint_idx);
-                                    interaction.ik_pose = Some((link_name.clone(), solved));
-                                    interaction.is_dragging_robot = true;
-                                    interaction.active_drag_label =
-                                        Some(format!("IK Limb Reach: {}", link_name));
+                                let next_angle = (*start_angle + delta_rad).clamp(lo, hi);
+                                *current_angle = next_angle;
+                                interaction.picked_joint = Some(*joint_idx);
+                                interaction.dragged_joint = Some((*joint_idx, next_angle));
+                                interaction.is_dragging_robot = true;
+                                if let Some(jm) = rig.joints.get(*joint_idx) {
+                                    interaction.active_drag_label = Some(format!(
+                                        "FK {} ({:+.1} deg)",
+                                        jm.label,
+                                        next_angle.to_degrees()
+                                    ));
                                 }
                             }
+                            Some(ActiveViewportDrag::Ik {
+                                link_name,
+                                joint_idx,
+                                plane_point,
+                                plane_normal,
+                            }) => {
+                                if let Some(world_target) =
+                                    intersect_ray_plane(ray_o, ray_d, *plane_point, *plane_normal)
+                                {
+                                    if let Some(solved) = rig.solve_limb_ik(
+                                        link_name,
+                                        target_rad,
+                                        world_target,
+                                        opts.imu_pitch_rad,
+                                        opts.imu_roll_rad,
+                                        calibration,
+                                    ) {
+                                        interaction.picked_joint = Some(*joint_idx);
+                                        interaction.ik_pose = Some((link_name.clone(), solved));
+                                        interaction.is_dragging_robot = true;
+                                        interaction.active_drag_label =
+                                            Some(format!("IK Limb Reach: {}", link_name));
+                                    }
+                                }
+                            }
+                            Some(ActiveViewportDrag::Orbit { .. }) | None => {}
                         }
-                        None => {}
+                        self.active_drag = active_drag;
                     }
-                    self.active_drag = active_drag;
                 }
+                _ => {}
             }
 
-            if response.drag_stopped() || !ui.ctx().input(|i| i.pointer.primary_down()) {
+            if response.drag_stopped() || !ui.ctx().input(|i| i.pointer.any_down()) {
                 self.active_drag = None;
             }
 
             // Simple click/tap selects joint or limb cleanly
-            if response.clicked() && self.active_drag.is_none() {
+            if opts.interactive_drag && response.clicked() && self.active_drag.is_none() {
                 if let Some(pointer_pos) = response.interact_pointer_pos() {
                     if let Some((_, j_idx, _, _)) = self.pick_hit_at(pointer_pos, rect) {
                         interaction.picked_joint = Some(j_idx);
@@ -471,7 +540,7 @@ impl HumanoidViewport {
             }
         }
 
-        // Visual cursor feedback when hovering or dragging a robot joint/limb
+        // Visual cursor feedback when orbiting empty space or hovering/dragging a robot part
         if self.active_drag.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         } else if opts.interactive_drag && !opts.hud_blocked && !cube_consumed {
@@ -585,7 +654,11 @@ impl HumanoidViewport {
 
         // 2. Paint 3D Protractor Rotation Arc Gizmo over the active/selected joint
         let overlay_painter = ui.painter_at(rect);
-        if opts.show_protractor || self.active_drag.is_some() {
+        let is_robot_drag = matches!(
+            self.active_drag,
+            Some(ActiveViewportDrag::Fk { .. } | ActiveViewportDrag::Ik { .. })
+        );
+        if opts.show_protractor || is_robot_drag {
             self.paint_joint_protractor_gizmo(
                 &overlay_painter,
                 rect,
@@ -646,7 +719,7 @@ impl HumanoidViewport {
         Some(pos2(sx, sy))
     }
 
-    /// Picks either a joint pivot sphere (preferred for exact FK) or a link visual (for Limb IK / FK).
+    /// Picks either a joint pivot sphere (preferred for exact FK) or a movable link visual (for Limb IK / FK).
     /// Returns `(link_name, joint_idx, world_hit_point, hit_joint_sphere)`.
     fn pick_hit_at(&self, pos: Pos2, rect: Rect) -> Option<(Option<String>, usize, Point3<f32>, bool)> {
         let (eye, ray_dir) = self.pointer_ray(pos, rect);
@@ -668,22 +741,37 @@ impl HumanoidViewport {
             }
         }
 
-        // 2. Check link visual geometries (forearms, hands, torso, legs, feet)
+        // 2. Check movable link visual geometries (forearms, hands, torso, legs, feet) via exact OBB/sphere
         let mut best_t = f32::INFINITY;
         let mut best_link = None;
-        for (link_name, joint_idx, iso, radius) in &self.pick_bounds {
-            let Some(j_idx) = joint_idx else {
+        for bound in &self.pick_bounds {
+            let Some(j_idx) = bound.joint_index else {
                 continue;
             };
-            let center = Point3::new(iso.translation.x, iso.translation.y, iso.translation.z);
-            if let Some(t) = ray_sphere_hit(eye, ray_dir, center, *radius) {
+            if let Some(t) = ray_pick_bound_hit(eye, ray_dir, bound) {
                 if t < best_t {
                     best_t = t;
-                    best_link = Some((Some(link_name.clone()), *j_idx, eye + ray_dir * t, false));
+                    best_link = Some((Some(bound.link_name.clone()), j_idx, eye + ray_dir * t, false));
                 }
             }
         }
         best_link
+    }
+
+    /// Returns `true` if the ray hits any robot visual (including static root links like `pelvis`)
+    /// or visible joint marker, distinguishing robot clicks from empty-space clicks.
+    fn hits_any_robot_part(&self, pos: Pos2, rect: Rect) -> bool {
+        let (eye, ray_dir) = self.pointer_ray(pos, rect);
+        if self.show_joint_markers {
+            for &(_, center, radius) in &self.joint_pick_spheres {
+                if ray_sphere_hit(eye, ray_dir, center, radius).is_some() {
+                    return true;
+                }
+            }
+        }
+        self.pick_bounds
+            .iter()
+            .any(|bound| ray_pick_bound_hit(eye, ray_dir, bound).is_some())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -811,6 +899,64 @@ impl HumanoidViewport {
 }
 
 #[inline]
+fn ray_pick_bound_hit(
+    eye: Point3<f32>,
+    ray_dir: Vector3<f32>,
+    bound: &PickBound,
+) -> Option<f32> {
+    match bound.volume {
+        PickVolume::BoxHalf(half) => ray_obb_hit(eye, ray_dir, &bound.world, half),
+        PickVolume::Sphere(radius) => {
+            let center = Point3::new(
+                bound.world.translation.x,
+                bound.world.translation.y,
+                bound.world.translation.z,
+            );
+            ray_sphere_hit(eye, ray_dir, center, radius)
+        }
+    }
+}
+
+#[inline]
+fn ray_obb_hit(
+    eye: Point3<f32>,
+    ray_dir: Vector3<f32>,
+    world: &Isometry3<f32>,
+    half: [f32; 3],
+) -> Option<f32> {
+    let inv = world.inverse();
+    let o = inv * eye;
+    let d = inv.rotation * ray_dir;
+
+    let mut t_min = 0.05_f32;
+    let mut t_max = f32::INFINITY;
+    let origins = [o.x, o.y, o.z];
+    let dirs = [d.x, d.y, d.z];
+
+    for axis in 0..3 {
+        let h = half[axis];
+        if dirs[axis].abs() < 1e-6 {
+            if origins[axis] < -h || origins[axis] > h {
+                return None;
+            }
+        } else {
+            let inv_d = 1.0 / dirs[axis];
+            let mut t1 = (-h - origins[axis]) * inv_d;
+            let mut t2 = (h - origins[axis]) * inv_d;
+            if t1 > t2 {
+                core::mem::swap(&mut t1, &mut t2);
+            }
+            t_min = t_min.max(t1);
+            t_max = t_max.min(t2);
+            if t_min > t_max {
+                return None;
+            }
+        }
+    }
+    Some(t_min)
+}
+
+#[inline]
 fn ray_sphere_hit(
     eye: Point3<f32>,
     ray_dir: Vector3<f32>,
@@ -871,5 +1017,29 @@ mod tests {
         let projected = vp.project_world_to_screen(target, rect).expect("project target");
         assert!((projected.x - 500.0).abs() < 1.0);
         assert!((projected.y - 400.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn obb_picking_hits_limb_and_misses_adjacent_empty_space() {
+        let mut vp = HumanoidViewport::new();
+        vp.orbit.apply_preset(CameraPreset::Front);
+        vp.orbit.target = [0.0, 0.5, 0.0];
+        vp.orbit.distance = 2.0;
+
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0));
+        vp.pick_bounds.push(PickBound {
+            link_name: "l_thigh".into(),
+            joint_index: Some(11),
+            world: Isometry3::translation(0.0, 0.5, 0.0),
+            volume: PickVolume::BoxHalf([0.04, 0.16, 0.04]),
+        });
+
+        // Dead center hits the limb
+        assert!(vp.hits_any_robot_part(pos2(500.0, 400.0), rect));
+        assert_eq!(vp.pick_hit_at(pos2(500.0, 400.0), rect).map(|h| h.1), Some(11));
+
+        // 90 px to the right is empty space outside the thin thigh -> misses robot so drag orbits view
+        assert!(!vp.hits_any_robot_part(pos2(590.0, 400.0), rect));
+        assert!(vp.pick_hit_at(pos2(590.0, 400.0), rect).is_none());
     }
 }

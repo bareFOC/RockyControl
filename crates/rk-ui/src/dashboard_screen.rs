@@ -539,7 +539,7 @@ impl RockyStudioApp {
                         .to_string();
             } else if target == AppScreen::Config {
                 self.model.status_message =
-                    "Config & Calibration: Click/drag joints or arms directly on Rocky; use ViewCube to orient camera."
+                    "Config & Calibration: Click/drag robot parts to pose; drag empty space or ViewCube to rotate view."
                         .to_string();
             }
         }

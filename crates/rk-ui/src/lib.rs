@@ -363,7 +363,7 @@ impl RockyStudioApp {
             self.model.selected_joint = picked_idx;
             if let Some(j) = self.model.rig.joints.get(picked_idx) {
                 self.model.status_message = format!(
-                    "Selected #{:02} {} ({}) — drag directly to rotate or use ViewCube to orient.",
+                    "Selected #{:02} {} ({}) — drag robot to pose, or drag empty space / ViewCube to rotate view.",
                     picked_idx, j.label, j.name
                 );
             }
