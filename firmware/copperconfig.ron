@@ -4,7 +4,7 @@
             id: "servo_ctrl",
             type: "rk_fw_core::copper::DirectServoCuTask",
             config: {
-                "joint_count": 17,
+                "joint_count": 21,
             },
         ),
     ],

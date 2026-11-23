@@ -11,8 +11,8 @@ pub const CONTROL_DT_SEC: f32 = 1.0_f32 / CONTROL_LOOP_HZ as f32;
 /// Fed only after a successful `copper-rs` control iteration.
 pub const HW_WATCHDOG_TIMEOUT_MS: u64 = 250;
 
-/// Default number of active humanoid joints for Rocky Mk1.
-pub const DEFAULT_JOINT_COUNT: usize = 17;
+/// Default number of active humanoid joints for Rocky Mk1 (21-DoF with 6-DoF legs for UVC).
+pub const DEFAULT_JOINT_COUNT: usize = 21;
 
 /// USB device identification (pid.codes open-source test VID/PID range).
 pub const USB_VID: u16 = 0x1209;

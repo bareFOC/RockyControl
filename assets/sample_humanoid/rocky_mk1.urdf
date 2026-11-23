@@ -147,20 +147,35 @@
     <limit lower="-2.25" upper="0.05" effort="18.0" velocity="6.0" />
   </joint>
 
-  <!-- Left Leg -->
-  <link name="l_hip">
+  <!-- Left Leg (6-DoF: Hip Yaw -> Hip Roll -> Hip Pitch -> Knee Pitch -> Ankle Pitch -> Ankle Roll) -->
+  <link name="l_hip_yaw_link">
     <visual>
-      <origin xyz="0 -0.02 0" rpy="0 0 0" />
-      <geometry><cylinder radius="0.055" length="0.07" /></geometry>
+      <origin xyz="0 -0.015 0" rpy="0 0 0" />
+      <geometry><cylinder radius="0.048" length="0.03" /></geometry>
       <material name="servo_ring"><color rgba="0.18 0.21 0.26 1.0" /></material>
     </visual>
   </link>
-  <joint name="l_hip_pitch" type="revolute">
+  <joint name="l_hip_yaw" type="revolute">
     <parent link="pelvis" />
-    <child link="l_hip" />
+    <child link="l_hip_yaw_link" />
     <origin xyz="0.095 -0.06 0" rpy="0 0 0" />
-    <axis xyz="1 0 0" />
-    <limit lower="-1.75" upper="0.95" effort="32.0" velocity="6.0" />
+    <axis xyz="0 1 0" />
+    <limit lower="-0.85" upper="0.85" effort="24.0" velocity="6.0" />
+  </joint>
+
+  <link name="l_hip_roll_link">
+    <visual>
+      <origin xyz="0 -0.015 0" rpy="0 0 0" />
+      <geometry><cylinder radius="0.052" length="0.04" /></geometry>
+      <material name="servo_accent"><color rgba="0.12 0.52 0.68 1.0" /></material>
+    </visual>
+  </link>
+  <joint name="l_hip_roll" type="revolute">
+    <parent link="l_hip_yaw_link" />
+    <child link="l_hip_roll_link" />
+    <origin xyz="0 -0.03 0" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.55" upper="0.65" effort="28.0" velocity="6.0" />
   </joint>
 
   <link name="l_thigh">
@@ -170,12 +185,12 @@
       <material name="armor_slate"><color rgba="0.30 0.35 0.42 1.0" /></material>
     </visual>
   </link>
-  <joint name="l_hip_roll" type="revolute">
-    <parent link="l_hip" />
+  <joint name="l_hip_pitch" type="revolute">
+    <parent link="l_hip_roll_link" />
     <child link="l_thigh" />
     <origin xyz="0 -0.03 0" rpy="0 0 0" />
-    <axis xyz="0 0 1" />
-    <limit lower="-0.35" upper="0.65" effort="26.0" velocity="6.0" />
+    <axis xyz="1 0 0" />
+    <limit lower="-1.75" upper="0.95" effort="32.0" velocity="6.0" />
   </joint>
 
   <link name="l_shin">
@@ -193,35 +208,65 @@
     <limit lower="0.00" upper="2.15" effort="34.0" velocity="6.0" />
   </joint>
 
-  <link name="l_foot">
+  <link name="l_ankle_link">
     <visual>
-      <origin xyz="0 -0.03 0.04" rpy="0 0 0" />
-      <geometry><box size="0.11 0.055 0.22" /></geometry>
-      <material name="servo_ring"><color rgba="0.18 0.21 0.26 1.0" /></material>
+      <origin xyz="0 -0.015 0" rpy="0 0 0" />
+      <geometry><cylinder radius="0.044" length="0.035" /></geometry>
+      <material name="servo_accent"><color rgba="0.12 0.52 0.68 1.0" /></material>
     </visual>
   </link>
   <joint name="l_ankle_pitch" type="revolute">
     <parent link="l_shin" />
-    <child link="l_foot" />
+    <child link="l_ankle_link" />
     <origin xyz="0 -0.32 0" rpy="0 0 0" />
     <axis xyz="1 0 0" />
-    <limit lower="-0.85" upper="0.85" effort="22.0" velocity="6.0" />
+    <limit lower="-0.85" upper="0.85" effort="24.0" velocity="6.0" />
   </joint>
 
-  <!-- Right Leg -->
-  <link name="r_hip">
+  <link name="l_foot">
     <visual>
-      <origin xyz="0 -0.02 0" rpy="0 0 0" />
-      <geometry><cylinder radius="0.055" length="0.07" /></geometry>
+      <origin xyz="0 -0.025 0.04" rpy="0 0 0" />
+      <geometry><box size="0.11 0.05 0.22" /></geometry>
       <material name="servo_ring"><color rgba="0.18 0.21 0.26 1.0" /></material>
     </visual>
   </link>
-  <joint name="r_hip_pitch" type="revolute">
+  <joint name="l_ankle_roll" type="revolute">
+    <parent link="l_ankle_link" />
+    <child link="l_foot" />
+    <origin xyz="0 -0.03 0" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.65" upper="0.65" effort="22.0" velocity="6.0" />
+  </joint>
+
+  <!-- Right Leg (6-DoF: Hip Yaw -> Hip Roll -> Hip Pitch -> Knee Pitch -> Ankle Pitch -> Ankle Roll) -->
+  <link name="r_hip_yaw_link">
+    <visual>
+      <origin xyz="0 -0.015 0" rpy="0 0 0" />
+      <geometry><cylinder radius="0.048" length="0.03" /></geometry>
+      <material name="servo_ring"><color rgba="0.18 0.21 0.26 1.0" /></material>
+    </visual>
+  </link>
+  <joint name="r_hip_yaw" type="revolute">
     <parent link="pelvis" />
-    <child link="r_hip" />
+    <child link="r_hip_yaw_link" />
     <origin xyz="-0.095 -0.06 0" rpy="0 0 0" />
-    <axis xyz="1 0 0" />
-    <limit lower="-1.75" upper="0.95" effort="32.0" velocity="6.0" />
+    <axis xyz="0 1 0" />
+    <limit lower="-0.85" upper="0.85" effort="24.0" velocity="6.0" />
+  </joint>
+
+  <link name="r_hip_roll_link">
+    <visual>
+      <origin xyz="0 -0.015 0" rpy="0 0 0" />
+      <geometry><cylinder radius="0.052" length="0.04" /></geometry>
+      <material name="servo_accent"><color rgba="0.12 0.52 0.68 1.0" /></material>
+    </visual>
+  </link>
+  <joint name="r_hip_roll" type="revolute">
+    <parent link="r_hip_yaw_link" />
+    <child link="r_hip_roll_link" />
+    <origin xyz="0 -0.03 0" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.65" upper="0.55" effort="28.0" velocity="6.0" />
   </joint>
 
   <link name="r_thigh">
@@ -231,12 +276,12 @@
       <material name="armor_slate"><color rgba="0.30 0.35 0.42 1.0" /></material>
     </visual>
   </link>
-  <joint name="r_hip_roll" type="revolute">
-    <parent link="r_hip" />
+  <joint name="r_hip_pitch" type="revolute">
+    <parent link="r_hip_roll_link" />
     <child link="r_thigh" />
     <origin xyz="0 -0.03 0" rpy="0 0 0" />
-    <axis xyz="0 0 1" />
-    <limit lower="-0.65" upper="0.35" effort="26.0" velocity="6.0" />
+    <axis xyz="1 0 0" />
+    <limit lower="-1.75" upper="0.95" effort="32.0" velocity="6.0" />
   </joint>
 
   <link name="r_shin">
@@ -254,18 +299,33 @@
     <limit lower="0.00" upper="2.15" effort="34.0" velocity="6.0" />
   </joint>
 
-  <link name="r_foot">
+  <link name="r_ankle_link">
     <visual>
-      <origin xyz="0 -0.03 0.04" rpy="0 0 0" />
-      <geometry><box size="0.11 0.055 0.22" /></geometry>
-      <material name="servo_ring"><color rgba="0.18 0.21 0.26 1.0" /></material>
+      <origin xyz="0 -0.015 0" rpy="0 0 0" />
+      <geometry><cylinder radius="0.044" length="0.035" /></geometry>
+      <material name="servo_accent"><color rgba="0.12 0.52 0.68 1.0" /></material>
     </visual>
   </link>
   <joint name="r_ankle_pitch" type="revolute">
     <parent link="r_shin" />
-    <child link="r_foot" />
+    <child link="r_ankle_link" />
     <origin xyz="0 -0.32 0" rpy="0 0 0" />
     <axis xyz="1 0 0" />
-    <limit lower="-0.85" upper="0.85" effort="22.0" velocity="6.0" />
+    <limit lower="-0.85" upper="0.85" effort="24.0" velocity="6.0" />
+  </joint>
+
+  <link name="r_foot">
+    <visual>
+      <origin xyz="0 -0.025 0.04" rpy="0 0 0" />
+      <geometry><box size="0.11 0.05 0.22" /></geometry>
+      <material name="servo_ring"><color rgba="0.18 0.21 0.26 1.0" /></material>
+    </visual>
+  </link>
+  <joint name="r_ankle_roll" type="revolute">
+    <parent link="r_ankle_link" />
+    <child link="r_foot" />
+    <origin xyz="0 -0.03 0" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="-0.65" upper="0.65" effort="22.0" velocity="6.0" />
   </joint>
 </robot>

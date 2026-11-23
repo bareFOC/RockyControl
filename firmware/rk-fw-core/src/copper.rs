@@ -26,6 +26,7 @@ use rk_proto::{ConfigCmd, ControlMode, FaultFlags, HostToMcu, MAX_JOINTS, McuToH
 use serde::{Deserialize, Serialize};
 
 use crate::config::{CONTROL_DT_SEC, DEFAULT_JOINT_COUNT};
+use crate::imu::IMU_SLOT;
 use crate::servo_bus::SERVO_BUS_SLOT;
 use crate::status_led::StatusLedMode;
 use crate::transport::HOST_LINK_MAILBOX;
@@ -101,11 +102,11 @@ impl HostCmdMsg {
                 ConfigCmd::SetBalanceGains(g) => (
                     6,
                     0,
-                    g.kp_pitch,
-                    g.kd_pitch,
-                    g.kp_roll,
-                    g.kd_roll,
-                    g.ankle_ratio,
+                    g.uvc_gain_pitch,
+                    g.uvc_gain_roll,
+                    g.tilt_deadband_rad,
+                    g.gyro_damp_pitch,
+                    g.gyro_damp_roll,
                     g.arm_assist,
                     g.fall_cutoff_rad,
                     false,
@@ -165,11 +166,11 @@ impl HostCmdMsg {
             4 => ConfigCmd::ClearFaults,
             5 => ConfigCmd::CommitFlash,
             6 => ConfigCmd::SetBalanceGains(rk_proto::BalanceGains {
-                kp_pitch: self.cfg_f0,
-                kd_pitch: self.cfg_f1,
-                kp_roll: self.cfg_f2,
-                kd_roll: self.cfg_f3,
-                ankle_ratio: self.cfg_f4,
+                uvc_gain_pitch: self.cfg_f0,
+                uvc_gain_roll: self.cfg_f1,
+                tilt_deadband_rad: self.cfg_f2,
+                gyro_damp_pitch: self.cfg_f3,
+                gyro_damp_roll: self.cfg_f4,
                 arm_assist: self.cfg_f5,
                 fall_cutoff_rad: self.cfg_f6,
             }),
@@ -271,6 +272,11 @@ pub struct ControlStepMsg {
     pub telem_roll_corr_rad: f32,
     pub telem_balance_active: bool,
     pub telem_walk_active: bool,
+    pub telem_uvc_phase: u8,
+    pub telem_support_foot: u8,
+    pub telem_foot_dx_m: f32,
+    pub telem_foot_dy_m: f32,
+    pub telem_hip_height_m: f32,
 }
 
 impl ControlStepMsg {
@@ -310,6 +316,11 @@ impl ControlStepMsg {
                 roll_corr_rad: self.telem_roll_corr_rad,
                 balance_active: self.telem_balance_active,
                 walk_active: self.telem_walk_active,
+                uvc_phase: self.telem_uvc_phase,
+                support_foot: self.telem_support_foot,
+                foot_dx_m: self.telem_foot_dx_m,
+                foot_dy_m: self.telem_foot_dy_m,
+                hip_height_m: self.telem_hip_height_m,
             },
         }
     }
@@ -413,6 +424,11 @@ impl CuTask for DirectServoCuTask {
             telem_roll_corr_rad: step.telemetry.balance.roll_corr_rad,
             telem_balance_active: step.telemetry.balance.balance_active,
             telem_walk_active: step.telemetry.balance.walk_active,
+            telem_uvc_phase: step.telemetry.balance.uvc_phase,
+            telem_support_foot: step.telemetry.balance.support_foot,
+            telem_foot_dx_m: step.telemetry.balance.foot_dx_m,
+            telem_foot_dy_m: step.telemetry.balance.foot_dy_m,
+            telem_hip_height_m: step.telemetry.balance.hip_height_m,
         });
 
         Ok(())
@@ -564,7 +580,10 @@ impl CuBridge for ServoBusBridge {
     {
         msg.tov = Tov::Time(ctx.now());
         if matches!(channel.id(), ServoBusRxId::RxState) {
-            let fb = SERVO_BUS_SLOT.read_feedback(CONTROL_DT_SEC);
+            let mut fb = SERVO_BUS_SLOT.read_feedback(CONTROL_DT_SEC);
+            if let Some(hw_imu) = IMU_SLOT.latest() {
+                fb.imu = hw_imu;
+            }
             let fb_msg = ServoFeedbackMsg::from(fb);
             let mut slot = Some(fb_msg);
             if let Some(target) = (&mut slot as &mut dyn core::any::Any).downcast_mut::<Option<Payload>>() {

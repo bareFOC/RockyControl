@@ -404,13 +404,13 @@ impl RockyStudioApp {
 
     fn render_balance_gait_tab(&mut self, ui: &mut egui::Ui) {
         ui.label(
-            RichText::new("MCU Upper-Body Vertical Balance (PD)")
+            RichText::new("MCU Geometric UVC Balance (ai2001)")
                 .strong()
                 .size(13.0)
                 .color(Color32::from_rgb(103, 232, 249)),
         );
         ui.label(
-            RichText::new("Runs strictly in #![no_std] f32 inside the MCU control kernel.")
+            RichText::new("Runs strictly in #![no_std] f32 with 6-DoF analytic leg IK on MCU.")
                 .size(11.0)
                 .color(Color32::from_rgb(148, 166, 190)),
         );
@@ -419,19 +419,28 @@ impl RockyStudioApp {
         let mut g = self.model.balance_gains;
         let mut changed = false;
         changed |= ui
-            .add(egui::Slider::new(&mut g.kp_pitch, 0.0..=3.5).text("Kp Pitch"))
+            .add(egui::Slider::new(&mut g.uvc_gain_pitch, 0.0..=0.80).text("UVC Pitch Gain"))
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut g.kd_pitch, 0.0..=1.2).text("Kd Pitch"))
+            .add(egui::Slider::new(&mut g.uvc_gain_roll, 0.0..=0.80).text("UVC Roll Gain"))
+            .changed();
+        let mut deadband_deg = g.tilt_deadband_rad.to_degrees();
+        if ui
+            .add(
+                egui::Slider::new(&mut deadband_deg, 0.5..=6.0)
+                    .suffix("°")
+                    .text("Deadband"),
+            )
+            .changed()
+        {
+            g.tilt_deadband_rad = deadband_deg.to_radians();
+            changed = true;
+        }
+        changed |= ui
+            .add(egui::Slider::new(&mut g.gyro_damp_pitch, 0.0..=0.35).text("Gyro Pitch Damp"))
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut g.kp_roll, 0.0..=3.5).text("Kp Roll"))
-            .changed();
-        changed |= ui
-            .add(egui::Slider::new(&mut g.kd_roll, 0.0..=1.2).text("Kd Roll"))
-            .changed();
-        changed |= ui
-            .add(egui::Slider::new(&mut g.ankle_ratio, 0.0..=1.0).text("Ankle Share"))
+            .add(egui::Slider::new(&mut g.gyro_damp_roll, 0.0..=0.35).text("Gyro Roll Damp"))
             .changed();
         changed |= ui
             .add(egui::Slider::new(&mut g.arm_assist, 0.0..=1.5).text("Arm Assist"))
@@ -439,7 +448,7 @@ impl RockyStudioApp {
         let mut cutoff_deg = g.fall_cutoff_rad.to_degrees();
         if ui
             .add(
-                egui::Slider::new(&mut cutoff_deg, 20.0..=70.0)
+                egui::Slider::new(&mut cutoff_deg, 20.0..=65.0)
                     .suffix("°")
                     .text("Fall Cutoff"),
             )
@@ -452,7 +461,7 @@ impl RockyStudioApp {
             self.model.update_balance_gains(g);
         }
 
-        if ui.small_button("Reset Default PD Gains").clicked() {
+        if ui.small_button("Reset Default UVC Gains").clicked() {
             self.model.update_balance_gains(BalanceGains::default());
         }
 

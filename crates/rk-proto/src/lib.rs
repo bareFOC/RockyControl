@@ -7,7 +7,7 @@
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 
-pub const MAX_JOINTS: usize = 20;
+pub const MAX_JOINTS: usize = 24;
 pub const WATCHDOG_TIMEOUT_MS: u32 = 100;
 pub const MAX_COBS_FRAME_BYTES: usize = 512;
 pub const MODEL_CHUNK_BYTES: usize = 256;
@@ -75,31 +75,35 @@ impl Default for WalkCmd {
     }
 }
 
-/// MCU-resident upper-body vertical balance controller PD gains & safety threshold.
+/// MCU-resident UVC (Upper Body Vertical Control) gains, deadband & safety cutoff.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct BalanceGains {
-    pub kp_pitch: f32,
-    pub kd_pitch: f32,
-    pub kp_roll: f32,
-    pub kd_roll: f32,
-    /// Share of pitch correction routed to ankles vs hips (`[0.0, 1.0]`).
-    pub ankle_ratio: f32,
-    /// Upper-body arm counter-swing assist gain during combat shoves (`[0.0, 1.5]`).
+    /// UVC sagittal tilt integration gain per 10 ms reference tick (ai2001 default `0.25`).
+    pub uvc_gain_pitch: f32,
+    /// UVC lateral tilt integration gain per 10 ms reference tick (ai2001 default `0.25`).
+    pub uvc_gain_roll: f32,
+    /// Radial IMU tilt deadband in radians before triggering catch-step (ai2001 default `0.033` rad ~ 1.9 deg).
+    pub tilt_deadband_rad: f32,
+    /// Direct ankle-pitch gyro rate damping gain (`rad / (rad/s)`).
+    pub gyro_damp_pitch: f32,
+    /// Direct ankle-roll gyro rate damping gain (`rad / (rad/s)`).
+    pub gyro_damp_roll: f32,
+    /// Upper-body arm counter-spread gain proportional to lateral step offset (`[0.0, 1.5]`).
     pub arm_assist: f32,
-    /// Tilt fall-cutoff threshold in radians (default ~42 deg = 0.733 rad).
+    /// Protective fall-tuck & torque cutoff threshold in radians (default ~37 deg = `0.65` rad).
     pub fall_cutoff_rad: f32,
 }
 
 impl Default for BalanceGains {
     fn default() -> Self {
         Self {
-            kp_pitch: 1.15,
-            kd_pitch: 0.24,
-            kp_roll: 1.05,
-            kd_roll: 0.22,
-            ankle_ratio: 0.45,
+            uvc_gain_pitch: 0.25,
+            uvc_gain_roll: 0.25,
+            tilt_deadband_rad: 0.033,
+            gyro_damp_pitch: 0.08,
+            gyro_damp_roll: 0.10,
             arm_assist: 0.65,
-            fall_cutoff_rad: 0.733,
+            fall_cutoff_rad: 0.65,
         }
     }
 }
@@ -113,7 +117,35 @@ pub struct ImuState {
     pub roll_rate_rad_s: f32,
 }
 
-/// Live MCU walking & upper-body balance loop telemetry returned in `McuToHost`.
+/// Wire-encoded UVC state machine phase identifiers (aligned with ai2001 modes 710..770 + FallTuck).
+pub mod uvc_phase {
+    pub const IDLE: u8 = 0;
+    pub const CROUCH_INIT: u8 = 1;
+    pub const CALIBRATE_IMU: u8 = 2;
+    pub const READY_WATCH: u8 = 3;
+    pub const ACTIVE_CATCH_STEP: u8 = 4;
+    pub const POST_STEP_SETTLE: u8 = 5;
+    pub const RETURN_TO_NEUTRAL: u8 = 6;
+    pub const RECOVERY_SETTLE: u8 = 7;
+    pub const FALL_TUCK: u8 = 8;
+
+    pub const fn label(phase: u8) -> &'static str {
+        match phase {
+            IDLE => "IDLE",
+            CROUCH_INIT => "INIT",
+            CALIBRATE_IMU => "CAL",
+            READY_WATCH => "READY",
+            ACTIVE_CATCH_STEP => "STEP",
+            POST_STEP_SETTLE => "SETTLE",
+            RETURN_TO_NEUTRAL => "RETURN",
+            RECOVERY_SETTLE => "RECOVER",
+            FALL_TUCK => "TUCK",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
+/// Live MCU walking & UVC upper-body vertical balance telemetry returned in `McuToHost`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub struct BalanceTelemetry {
     pub gait_phase_rad: f32,
@@ -121,6 +153,16 @@ pub struct BalanceTelemetry {
     pub roll_corr_rad: f32,
     pub balance_active: bool,
     pub walk_active: bool,
+    /// Active UVC state machine phase (`uvc_phase::*`).
+    pub uvc_phase: u8,
+    /// Current support foot (`0 = Right`, `1 = Left`).
+    pub support_foot: u8,
+    /// Support foot sagittal UVC offset (`dxi`, meters; positive = foot forward under forward lean).
+    pub foot_dx_m: f32,
+    /// Signed lateral UVC foot offset (meters; positive = stepped right, negative = stepped left).
+    pub foot_dy_m: f32,
+    /// Active UVC pelvis-to-ankle height (`auto_h`, meters).
+    pub hip_height_m: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
@@ -491,11 +533,11 @@ pub fn validate_host_packet(pkt: &HostToMcu) -> Result<(), CodecError> {
             return Err(CodecError::NonFiniteFloat);
         }
         ConfigCmd::SetBalanceGains(g)
-            if !g.kp_pitch.is_finite()
-                || !g.kd_pitch.is_finite()
-                || !g.kp_roll.is_finite()
-                || !g.kd_roll.is_finite()
-                || !g.ankle_ratio.is_finite()
+            if !g.uvc_gain_pitch.is_finite()
+                || !g.uvc_gain_roll.is_finite()
+                || !g.tilt_deadband_rad.is_finite()
+                || !g.gyro_damp_pitch.is_finite()
+                || !g.gyro_damp_roll.is_finite()
                 || !g.arm_assist.is_finite()
                 || !g.fall_cutoff_rad.is_finite() =>
         {
@@ -525,6 +567,9 @@ pub fn decode_mcu_cobs(buf: &mut [u8]) -> Result<McuToHost, CodecError> {
         || !pkt.balance.gait_phase_rad.is_finite()
         || !pkt.balance.pitch_corr_rad.is_finite()
         || !pkt.balance.roll_corr_rad.is_finite()
+        || !pkt.balance.foot_dx_m.is_finite()
+        || !pkt.balance.foot_dy_m.is_finite()
+        || !pkt.balance.hip_height_m.is_finite()
     {
         return Err(CodecError::NonFiniteFloat);
     }
@@ -617,6 +662,11 @@ mod tests {
                 roll_corr_rad: 0.06,
                 balance_active: true,
                 walk_active: true,
+                uvc_phase: uvc_phase::ACTIVE_CATCH_STEP,
+                support_foot: 1,
+                foot_dx_m: 0.045,
+                foot_dy_m: -0.032,
+                hip_height_m: 0.61,
             },
             ..Default::default()
         };

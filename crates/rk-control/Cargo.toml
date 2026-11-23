@@ -9,5 +9,6 @@ default = ["std"]
 std = ["rk-proto/std", "serde/std"]
 
 [dependencies]
+libm = "0.2"
 rk-proto.workspace = true
 serde.workspace = true

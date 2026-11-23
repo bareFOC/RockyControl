@@ -764,11 +764,13 @@ fn default_stance_angle(name: &str) -> f32 {
         "l_shoulder_roll" => 0.14,
         "r_shoulder_roll" => -0.14,
         "l_elbow_pitch" | "r_elbow_pitch" => -0.52,
-        "l_hip_pitch" | "r_hip_pitch" => -0.12,
+        "l_hip_pitch" | "r_hip_pitch" => -0.22,
         "l_hip_roll" => 0.04,
         "r_hip_roll" => -0.04,
-        "l_knee_pitch" | "r_knee_pitch" => 0.24,
-        "l_ankle_pitch" | "r_ankle_pitch" => -0.12,
+        "l_knee_pitch" | "r_knee_pitch" => 0.44,
+        "l_ankle_pitch" | "r_ankle_pitch" => -0.22,
+        "l_ankle_roll" => -0.04,
+        "r_ankle_roll" => 0.04,
         _ => 0.0,
     }
 }

@@ -30,7 +30,7 @@ mod tests {
     #[test]
     fn bundled_urdf_parses_and_evaluates_fk() {
         let rig = KinematicRig::from_urdf_xml(BUNDLED_URDF_XML).expect("parse bundled urdf");
-        assert_eq!(rig.joints.len(), 17);
+        assert_eq!(rig.joints.len(), 21);
         let transforms = rig.compute_link_transforms(&rig.default_pose());
         assert!(transforms.contains_key("pelvis"));
         assert!(transforms.contains_key("l_forearm"));
@@ -112,14 +112,14 @@ mod tests {
     fn mcu_blob_xml_and_deflate_round_trip_with_crc32() {
         let bundle = AssetBundle::bundled_rocky();
         let raw = bundle.urdf_xml.as_bytes();
-        let info_raw = ModelInfo::from_static("rocky_mk1", ModelFormat::UrdfXml, raw, 17);
+        let info_raw = ModelInfo::from_static("rocky_mk1", ModelFormat::UrdfXml, raw, 21);
         let parsed_raw = AssetBundle::from_mcu_blob(&info_raw, raw).expect("load raw mcu urdf");
         assert_eq!(parsed_raw.robot_name, "rocky_mk1");
 
         let deflated = bundle.to_deflated_urdf_bytes().expect("deflate urdf");
         assert!(deflated.len() < raw.len() / 3, "deflate should shrink URDF >3x");
         let info_def =
-            ModelInfo::from_static("rocky_mk1", ModelFormat::UrdfDeflate, &deflated, 17);
+            ModelInfo::from_static("rocky_mk1", ModelFormat::UrdfDeflate, &deflated, 21);
         let parsed_def =
             AssetBundle::from_mcu_blob(&info_def, &deflated).expect("load deflated mcu urdf");
         assert_eq!(parsed_def.urdf_xml, bundle.urdf_xml);

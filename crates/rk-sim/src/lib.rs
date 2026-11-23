@@ -57,13 +57,15 @@ pub struct SimulatedServoPlant {
     wave_phase: f32,
     last_cmd: RawServoCommand,
     faults: SimFaultInjection,
-    // Deterministic 2-axis LIPM torso dynamics + virtual IMU state
+    // Deterministic 2-axis stepping-aware LIPM torso dynamics + virtual IMU state
     torso_pitch_rad: f32,
     torso_roll_rad: f32,
     pitch_rate_rad_s: f32,
     roll_rate_rad_s: f32,
     act_pitch_corr: f32,
     act_roll_corr: f32,
+    act_foot_dx: f32,
+    act_foot_dy: f32,
     last_balance: rk_proto::BalanceTelemetry,
 }
 
@@ -88,6 +90,8 @@ impl SimulatedServoPlant {
             roll_rate_rad_s: 0.0,
             act_pitch_corr: 0.0,
             act_roll_corr: 0.0,
+            act_foot_dx: 0.0,
+            act_foot_dy: 0.0,
             last_balance: rk_proto::BalanceTelemetry::default(),
         }
     }
@@ -132,6 +136,8 @@ impl SimulatedServoPlant {
         self.roll_rate_rad_s = 0.0;
         self.act_pitch_corr = 0.0;
         self.act_roll_corr = 0.0;
+        self.act_foot_dx = 0.0;
+        self.act_foot_dy = 0.0;
     }
 
     pub fn set_balance_telemetry(&mut self, bal: rk_proto::BalanceTelemetry) {
@@ -201,59 +207,87 @@ impl SimulatedServoPlant {
             self.temp_c_f[i] = (self.temp_c_f[i] + (heat - cool) * dt).clamp(ambient, 98.0_f32);
         }
 
-        // Deterministic 2-axis inverted-pendulum torso tilt dynamics
-        let legs_mask: u32 = 0x1FE00; // joints 9..=16 (L/R hip, knee, ankle)
+        // Deterministic 2-axis stepping-aware LIPM torso tilt dynamics
+        let legs_mask: u32 = if self.joint_count >= 21 {
+            0x1FFE00 // joints 9..=20 (21-DoF L/R 6-DoF legs)
+        } else {
+            0x1FE00 // joints 9..=16 (legacy 17-DoF legs)
+        };
+        let leg_end = if self.joint_count >= 21 { 21 } else { 17 }.min(self.joint_count);
         let legs_energized = (self.last_cmd.torque_mask & legs_mask) != 0 && self.joint_count >= 17;
-        let leg_stalled = (9..self.joint_count.min(17)).any(|idx| self.faults.stalled_joints[idx]);
+        let leg_stalled = (9..leg_end).any(|idx| self.faults.stalled_joints[idx]);
 
         if legs_energized {
-            // Servo lag on hip/ankle balance actuation
-            let act_rate = 6.0_f32 + self.faults.servo_lag_factor * 45.0_f32;
+            // Servo lag on ankle gyro damping & UVC foot CoP placement
+            let act_rate = 7.0_f32 + self.faults.servo_lag_factor * 45.0_f32;
             let act_alpha = 1.0_f32 - (-act_rate * dt).exp();
-            let target_p = if self.last_balance.balance_active && !leg_stalled {
+            let balance_ready = self.last_balance.balance_active && !leg_stalled;
+            let target_p = if balance_ready {
                 self.last_balance.pitch_corr_rad
             } else {
                 0.0_f32
             };
-            let target_r = if self.last_balance.balance_active && !leg_stalled {
+            let target_r = if balance_ready {
                 self.last_balance.roll_corr_rad
+            } else {
+                0.0_f32
+            };
+            let target_dx = if balance_ready {
+                self.last_balance.foot_dx_m
+            } else {
+                0.0_f32
+            };
+            let target_dy = if balance_ready {
+                self.last_balance.foot_dy_m
             } else {
                 0.0_f32
             };
             self.act_pitch_corr += (target_p - self.act_pitch_corr) * act_alpha;
             self.act_roll_corr += (target_r - self.act_roll_corr) * act_alpha;
+            self.act_foot_dx += (target_dx - self.act_foot_dx) * act_alpha;
+            self.act_foot_dy += (target_dy - self.act_foot_dy) * act_alpha;
 
-            // Gravity destabilizing torque (g/L ~ 9.2 rad/s^2) + finite foot-sole support margin
+            // Gravity destabilizing torque (g/L ~ 9.2 rad/s^2) + finite foot-sole support polygon
             let k_grav = 9.2_f32;
             let passive_foot = |theta: f32| {
-                // Inside +-4.5 deg foot polygon: modest restoring torque; outside: tips over
+                // Inside +-4.5 deg foot polygon: modest restoring torque; outside: tips over unless UVC steps
                 let clamped = theta.clamp(-0.08_f32, 0.08_f32);
                 clamped * 11.5_f32
             };
 
             let walk_sway_pitch = if self.last_balance.walk_active {
-                (self.last_balance.gait_phase_rad * 2.0_f32).cos() * 0.55_f32
+                (self.last_balance.gait_phase_rad * 2.0_f32).cos() * 0.45_f32
             } else {
                 0.0_f32
             };
             let walk_sway_roll = if self.last_balance.walk_active {
-                self.last_balance.gait_phase_rad.sin() * 0.85_f32
+                self.last_balance.gait_phase_rad.sin() * 0.65_f32
             } else {
                 0.0_f32
             };
 
-            let k_act_pitch = 29.0_f32;
-            let k_act_roll = 26.0_f32;
-            let damping = 2.6_f32;
+            // UVC catch-step shifts Center of Pressure `(act_foot_dx, act_foot_dy)` under leaning torso
+            let h_com = self.last_balance.hip_height_m.clamp(0.42_f32, 0.72_f32);
+            let k_cop_pitch = 26.0_f32;
+            let k_cop_roll = 24.0_f32;
+            let cop_restore_pitch = -(self.act_foot_dx / h_com) * k_cop_pitch;
+            let cop_restore_roll = -(self.act_foot_dy / h_com) * k_cop_roll;
+
+            // Direct ankle gyro rate damping + micro-stance compliance
+            let k_ankle_pitch = 22.0_f32;
+            let k_ankle_roll = 20.0_f32;
+            let damping = 2.4_f32;
 
             let alpha_pitch = k_grav * self.torso_pitch_rad.sin()
                 - passive_foot(self.torso_pitch_rad)
-                + k_act_pitch * self.act_pitch_corr
+                + cop_restore_pitch
+                + k_ankle_pitch * self.act_pitch_corr
                 - damping * self.pitch_rate_rad_s
                 + walk_sway_pitch;
             let alpha_roll = k_grav * self.torso_roll_rad.sin()
                 - passive_foot(self.torso_roll_rad)
-                + k_act_roll * self.act_roll_corr
+                + cop_restore_roll
+                + k_ankle_roll * self.act_roll_corr
                 - damping * self.roll_rate_rad_s
                 + walk_sway_roll;
 
@@ -262,10 +296,12 @@ impl SimulatedServoPlant {
             self.torso_pitch_rad = (self.torso_pitch_rad + self.pitch_rate_rad_s * dt).clamp(-1.35, 1.35);
             self.torso_roll_rad = (self.torso_roll_rad + self.roll_rate_rad_s * dt).clamp(-1.35, 1.35);
         } else {
-            // Torque OFF: if knocked down (> 0.65 rad) stay resting tilted until Reset; otherwise workbench cradle damps upright
+            // Torque OFF: if knocked down (> 0.60 rad) stay resting tilted until Reset; otherwise workbench cradle damps upright
             self.act_pitch_corr = 0.0;
             self.act_roll_corr = 0.0;
-            if self.torso_pitch_rad.abs() > 0.65 || self.torso_roll_rad.abs() > 0.65 {
+            self.act_foot_dx = 0.0;
+            self.act_foot_dy = 0.0;
+            if self.torso_pitch_rad.abs() > 0.60 || self.torso_roll_rad.abs() > 0.60 {
                 self.pitch_rate_rad_s *= (1.0_f32 - 8.0_f32 * dt).max(0.0);
                 self.roll_rate_rad_s *= (1.0_f32 - 8.0_f32 * dt).max(0.0);
                 self.torso_pitch_rad =
@@ -361,7 +397,7 @@ impl CopperSimRunner {
     ) -> Self {
         let mcu_model_blob = DEFAULT_MCU_FLASH_URDF.to_vec();
         let mcu_model_info =
-            ModelInfo::from_static("rocky_mk1", ModelFormat::UrdfXml, &mcu_model_blob, 17);
+            ModelInfo::from_static("rocky_mk1", ModelFormat::UrdfXml, &mcu_model_blob, 21);
         Self {
             task: DirectServoTask::new(joint_count, initial_cal),
             host_bridge: HostLinkBridge::default(),
@@ -640,18 +676,18 @@ mod tests {
     }
 
     #[test]
-    fn mcu_balance_recovers_from_combat_shove_and_unassisted_falls() {
+    fn mcu_uvc_balance_catch_steps_combat_shove_and_unassisted_falls() {
         let cal = [JointCalibration {
             min_rad: -2.2,
             max_rad: 2.2,
             ..Default::default()
-        }; 17];
-        let mut sim = CopperSimRunner::new(17, &cal, [0.0; MAX_JOINTS]);
+        }; 21];
+        let mut sim = CopperSimRunner::new(21, &cal, [0.0; MAX_JOINTS]);
 
         let mut cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Drive,
-            torque_mask: (1u32 << 17) - 1,
+            torque_mask: (1u32 << 21) - 1,
             speed_limit_pct: 100,
             walk: WalkCmd {
                 walk_enabled: false,
@@ -661,8 +697,8 @@ mod tests {
             ..Default::default()
         };
 
-        // Warm up in Drive mode
-        for i in 1..=10 {
+        // Warm up in Drive mode through CrouchInit -> CalibrateImu -> ReadyWatch
+        for i in 1..=30 {
             cmd.seq = i;
             let _ = sim.tick(0.01, &cmd);
         }
@@ -670,25 +706,30 @@ mod tests {
         // Inject a sharp combat shove forward + sideways
         sim.apply_push_impulse(1.6, -1.1);
         let mut peak_pitch = 0.0_f32;
+        let mut saw_catch_step = false;
         let mut last = McuToHost::default();
-        for i in 11..=180 {
+        for i in 31..=320 {
             cmd.seq = i;
             last = sim.tick(0.01, &cmd);
             peak_pitch = peak_pitch.max(last.imu.pitch_rad.abs());
+            if last.balance.uvc_phase == rk_proto::uvc_phase::ACTIVE_CATCH_STEP {
+                saw_catch_step = true;
+            }
         }
         assert!(peak_pitch > 0.12, "shove must visibly tilt torso");
+        assert!(saw_catch_step, "UVC must trigger ActiveCatchStep on shove");
         assert_eq!(last.active_mode, ControlMode::Drive, "must stay standing");
         assert!(
-            last.imu.pitch_rad.abs() < 0.04 && last.imu.roll_rad.abs() < 0.04,
-            "MCU vertical balance must recover upright (pitch={:.3}, roll={:.3})",
+            last.imu.pitch_rad.abs() < 0.06 && last.imu.roll_rad.abs() < 0.06,
+            "MCU UVC balance must recover upright (pitch={:.3}, roll={:.3})",
             last.imu.pitch_rad,
             last.imu.roll_rad
         );
 
-        // Now disable balance and inject the same shove -> Rocky tips past 42 deg and latches TILT_FALL_CUTOFF
+        // Now disable balance and inject a shove -> Rocky tips past fall cutoff, tucks, and latches TILT_FALL_CUTOFF
         cmd.walk.balance_enabled = false;
         sim.apply_push_impulse(2.1, 0.0);
-        for i in 181..=360 {
+        for i in 321..=520 {
             cmd.seq = i;
             last = sim.tick(0.01, &cmd);
         }

@@ -166,7 +166,7 @@ impl RockyStudioApp {
                             .size(11.5)
                             .color(Color32::from_rgb(120, 138, 162)),
                     );
-                    if ui.small_button("Rocky Mk1 (17-DoF)").clicked() {
+                    if ui.small_button("Rocky Mk1 (21-DoF)").clicked() {
                         self.apply_loaded_bundle(AssetBundle::bundled_rocky());
                     }
                     if ui.small_button("Striker Biped (8-DoF)").clicked() {
@@ -661,14 +661,15 @@ impl RockyStudioApp {
                     );
                     ui.label(
                         RichText::new(format!(
-                            "Walk {}  ·  Vertical PD ({:.2}/{:.2})  ·  Fall Cutoff {:.0}°",
+                            "UVC {} ({:.2}/{:.2})  ·  Walk {}  ·  Fall Cutoff {:.0}°",
+                            rk_proto::uvc_phase::label(self.model.latest_telemetry.balance.uvc_phase),
+                            self.model.balance_gains.uvc_gain_pitch,
+                            self.model.balance_gains.uvc_gain_roll,
                             if self.model.walk_cmd.walk_enabled {
                                 "ON"
                             } else {
                                 "STANDBY"
                             },
-                            self.model.balance_gains.kp_pitch,
-                            self.model.balance_gains.kd_pitch,
                             self.model.balance_gains.fall_cutoff_rad.to_degrees(),
                         ))
                         .monospace()

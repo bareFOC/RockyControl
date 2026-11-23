@@ -1,5 +1,5 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-//! Layer 1 — Pure `#![no_std]` Safety, Walking & Vertical Balance Kernel (`rk-control`).
+//! Layer 1 — Pure `#![no_std]` Safety, Walking & UVC Vertical Balance Kernel (`rk-control`).
 //!
 //! Enforces:
 //! - 100 ms deadman watchdog (`WATCHDOG_TIMEOUT_MS`)
@@ -7,39 +7,58 @@
 //! - Slew-rate velocity clamp (`omega_base * speed_limit_pct / 100 * dt`)
 //! - Calibration zero-offset & sign-inversion mapping
 //! - Bumpless `Teach -> Drive` target handoff & safe Reset-to-Teach invariant
-//! - MCU-native bipedal walking gait oscillator (`WalkCmd`)
-//! - MCU-native 2-axis IMU upper-body vertical stabilization & tilt fall-cutoff latch
+//! - Geometric UVC (Upper Body Vertical Control) & 6-DoF analytic leg IK (`uvc.rs`)
+//! - Protective `FallTuck` -> `EStop` (`TILT_FALL_CUTOFF`) safety latch
 //!
 //! Strictly single-precision `f32` everywhere for RP2350 Cortex-M33 FPU numeric parity.
+
+pub mod uvc;
 
 use core::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use rk_proto::{
     BalanceGains, BalanceTelemetry, ConfigCmd, ControlMode, FaultFlags, HostToMcu, ImuState,
-    MAX_JOINTS, McuToHost, WATCHDOG_TIMEOUT_MS, WalkCmd,
+    MAX_JOINTS, McuToHost, WATCHDOG_TIMEOUT_MS, WalkCmd, uvc_phase,
 };
 use serde::{Deserialize, Serialize};
+pub use uvc::{LegGeometry, LegIkAngles, UvcController, UvcPhase, UvcStepOutput, solve_leg_ik};
 
 pub const DEFAULT_BASE_SLEW_RAD_PER_SEC: f32 = 2.0;
-pub const BALANCE_SLEW_RAD_PER_SEC: f32 = 4.2;
+pub const BALANCE_SLEW_RAD_PER_SEC: f32 = 5.5;
 pub const OVER_CURRENT_TRIP_MA: u16 = 1950;
 pub const OVER_TEMP_TRIP_C: u8 = 78;
 pub const UNDER_VOLTAGE_TRIP_MV: u16 = 10_500;
 
-// Standard Rocky 17-DoF humanoid joint indices (matches assets/sample_humanoid/rocky_mk1.urdf).
+// Common upper-body joint indices (identical in 17-DoF and 21-DoF Rocky Mk1 URDFs).
 const J_WAIST_YAW: usize = 0;
 const J_L_SHOULDER_PITCH: usize = 3;
 const J_L_SHOULDER_ROLL: usize = 4;
 const J_R_SHOULDER_PITCH: usize = 6;
 const J_R_SHOULDER_ROLL: usize = 7;
-const J_L_HIP_PITCH: usize = 9;
-const J_L_HIP_ROLL: usize = 10;
-const J_L_KNEE_PITCH: usize = 11;
-const J_L_ANKLE_PITCH: usize = 12;
-const J_R_HIP_PITCH: usize = 13;
-const J_R_HIP_ROLL: usize = 14;
-const J_R_KNEE_PITCH: usize = 15;
-const J_R_ANKLE_PITCH: usize = 16;
+
+// 21-DoF Rocky Mk1 6-DoF leg indices (matches assets/sample_humanoid/rocky_mk1.urdf).
+const J21_L_HIP_YAW: usize = 9;
+const J21_L_HIP_ROLL: usize = 10;
+const J21_L_HIP_PITCH: usize = 11;
+const J21_L_KNEE_PITCH: usize = 12;
+const J21_L_ANKLE_PITCH: usize = 13;
+const J21_L_ANKLE_ROLL: usize = 14;
+const J21_R_HIP_YAW: usize = 15;
+const J21_R_HIP_ROLL: usize = 16;
+const J21_R_HIP_PITCH: usize = 17;
+const J21_R_KNEE_PITCH: usize = 18;
+const J21_R_ANKLE_PITCH: usize = 19;
+const J21_R_ANKLE_ROLL: usize = 20;
+
+// Legacy 17-DoF 4-DoF leg fallback indices (graceful degradation for older 4-DoF URDFs).
+const J17_L_HIP_PITCH: usize = 9;
+const J17_L_HIP_ROLL: usize = 10;
+const J17_L_KNEE_PITCH: usize = 11;
+const J17_L_ANKLE_PITCH: usize = 12;
+const J17_R_HIP_PITCH: usize = 13;
+const J17_R_HIP_ROLL: usize = 14;
+const J17_R_KNEE_PITCH: usize = 15;
+const J17_R_ANKLE_PITCH: usize = 16;
 
 /// Deterministic `#![no_std]` single-precision sine accurate to < 2e-5 rad over all angles.
 #[inline]
@@ -47,7 +66,6 @@ pub fn sin_f32(mut x: f32) -> f32 {
     if !x.is_finite() {
         return 0.0;
     }
-    // Range-reduce to [-PI, PI]
     let k = ((x + PI) / TAU) as i32;
     x -= (k as f32) * TAU;
     if x > PI {
@@ -55,13 +73,11 @@ pub fn sin_f32(mut x: f32) -> f32 {
     } else if x < -PI {
         x += TAU;
     }
-    // Fold into [-PI/2, PI/2]
     if x > FRAC_PI_2 {
         x = PI - x;
     } else if x < -FRAC_PI_2 {
         x = -PI - x;
     }
-    // 7th-order minimax/Taylor polynomial on [-PI/2, PI/2]
     let x2 = x * x;
     x * (1.0_f32
         + x2 * (-0.166_666_67_f32
@@ -164,13 +180,11 @@ pub struct DirectServoKernel {
     applied_target_rad: [f32; MAX_JOINTS],
     initialized_targets: bool,
     flash_commit_count: u32,
-    // MCU-native walking oscillator & upper-body vertical balance state
+    // MCU-native geometric UVC balance & walking controller
     balance_gains: BalanceGains,
     last_walk_cmd: WalkCmd,
-    gait_phase_rad: f32,
-    walk_blend: f32,
-    pitch_int: f32,
-    roll_int: f32,
+    uvc: UvcController,
+    uvc_blend: f32,
 }
 
 impl DirectServoKernel {
@@ -196,10 +210,8 @@ impl DirectServoKernel {
             flash_commit_count: 0,
             balance_gains: BalanceGains::default(),
             last_walk_cmd: WalkCmd::default(),
-            gait_phase_rad: 0.0,
-            walk_blend: 0.0,
-            pitch_int: 0.0,
-            roll_int: 0.0,
+            uvc: UvcController::new(LegGeometry::rocky_mk1()),
+            uvc_blend: 0.0,
         }
     }
 
@@ -255,7 +267,6 @@ impl DirectServoKernel {
                 self.last_valid_rx_ms = Some(now_ms);
             }
 
-            // Apply configuration command
             let mut cleared_faults_this_tick = false;
             match cmd.config {
                 ConfigCmd::None => {}
@@ -296,20 +307,20 @@ impl DirectServoKernel {
                     }
                 }
                 ConfigCmd::SetBalanceGains(g) => {
-                    if g.kp_pitch.is_finite()
-                        && g.kd_pitch.is_finite()
-                        && g.kp_roll.is_finite()
-                        && g.kd_roll.is_finite()
-                        && g.ankle_ratio.is_finite()
+                    if g.uvc_gain_pitch.is_finite()
+                        && g.uvc_gain_roll.is_finite()
+                        && g.tilt_deadband_rad.is_finite()
+                        && g.gyro_damp_pitch.is_finite()
+                        && g.gyro_damp_roll.is_finite()
                         && g.arm_assist.is_finite()
                         && g.fall_cutoff_rad.is_finite()
                     {
                         self.balance_gains = BalanceGains {
-                            kp_pitch: g.kp_pitch.clamp(0.0, 4.0),
-                            kd_pitch: g.kd_pitch.clamp(0.0, 1.5),
-                            kp_roll: g.kp_roll.clamp(0.0, 4.0),
-                            kd_roll: g.kd_roll.clamp(0.0, 1.5),
-                            ankle_ratio: g.ankle_ratio.clamp(0.0, 1.0),
+                            uvc_gain_pitch: g.uvc_gain_pitch.clamp(0.0, 1.5),
+                            uvc_gain_roll: g.uvc_gain_roll.clamp(0.0, 1.5),
+                            tilt_deadband_rad: g.tilt_deadband_rad.clamp(0.005, 0.15),
+                            gyro_damp_pitch: g.gyro_damp_pitch.clamp(0.0, 0.5),
+                            gyro_damp_roll: g.gyro_damp_roll.clamp(0.0, 0.5),
                             arm_assist: g.arm_assist.clamp(0.0, 1.5),
                             fall_cutoff_rad: g.fall_cutoff_rad.clamp(0.30, 1.35),
                         };
@@ -324,9 +335,8 @@ impl DirectServoKernel {
                     self.active_mode = ControlMode::Teach;
                     self.applied_target_rad = measured_rad;
                     self.last_host_target_rad = measured_rad;
-                    self.pitch_int = 0.0;
-                    self.roll_int = 0.0;
-                    self.walk_blend = 0.0;
+                    self.uvc.reset();
+                    self.uvc_blend = 0.0;
                     cleared_faults_this_tick = true;
                 }
             }
@@ -347,8 +357,8 @@ impl DirectServoKernel {
                 if cmd.mode == ControlMode::Drive && self.active_mode == ControlMode::Teach {
                     // Enforce MCU-side bumpless sync on Teach -> Drive
                     self.applied_target_rad = measured_rad;
-                    self.pitch_int = 0.0;
-                    self.roll_int = 0.0;
+                    self.uvc.reset();
+                    self.uvc_blend = 0.0;
                 }
                 self.active_mode = cmd.mode;
             }
@@ -362,7 +372,7 @@ impl DirectServoKernel {
             }
         }
 
-        // 4. Evaluate hardware health advisories & tilt fall-cutoff latch
+        // 4. Evaluate hardware health advisories
         let mut transient_faults = FaultFlags::empty();
         if feedback.bus_error {
             transient_faults.insert(FaultFlags::SERVO_BUS_ERROR);
@@ -379,173 +389,100 @@ impl DirectServoKernel {
             }
         }
 
+        // 5. Compute MCU-native UVC upper-body balance + locomotion overlay
         let imu = feedback.imu;
-        let tilt_exceeded = imu.pitch_rad.abs() > self.balance_gains.fall_cutoff_rad
-            || imu.roll_rad.abs() > self.balance_gains.fall_cutoff_rad;
-        if self.active_mode == ControlMode::Drive && self.joint_count >= 17 && tilt_exceeded {
-            self.active_mode = ControlMode::EStop;
-            self.latched_faults.insert(FaultFlags::TILT_FALL_CUTOFF);
-        }
-
-        // 5. Compute MCU-native walking gait + upper-body vertical balance overlay
         let mut desired_rad = self.last_host_target_rad;
         let mut balance_telem = BalanceTelemetry {
-            gait_phase_rad: self.gait_phase_rad,
-            pitch_corr_rad: 0.0,
-            roll_corr_rad: 0.0,
-            balance_active: false,
-            walk_active: false,
+            hip_height_m: self.uvc.geometry().nominal_height,
+            ..Default::default()
         };
 
-        if self.active_mode == ControlMode::Drive && self.joint_count >= 17 {
+        let humanoid_legs_available = self.joint_count >= 17;
+        let has_6dof_legs = self.joint_count >= 21;
+
+        if self.active_mode == ControlMode::Drive && humanoid_legs_available {
             let walk = self.last_walk_cmd;
-            let vx = walk.vx.clamp(-1.0, 1.0);
-            let vy = walk.vy.clamp(-1.0, 1.0);
-            let yaw = walk.yaw_rate.clamp(-1.0, 1.0);
-            let crouch = walk.stance_crouch.clamp(0.0, 1.0);
-            let step_h = walk.step_height.clamp(0.1, 1.0);
-            let cadence = walk.cadence_hz.clamp(0.6, 2.8);
+            let uvc_engaged = walk.balance_enabled || walk.walk_enabled;
+            let tilt_exceeded = imu.pitch_rad.abs() >= self.balance_gains.fall_cutoff_rad
+                || imu.roll_rad.abs() >= self.balance_gains.fall_cutoff_rad;
 
-            // Smooth bumpless ramp for walk mode engagement
-            let target_blend = if walk.walk_enabled { 1.0_f32 } else { 0.0_f32 };
-            let blend_rate = (dt * 4.5_f32).clamp(0.0, 1.0);
-            self.walk_blend += (target_blend - self.walk_blend) * blend_rate;
+            if uvc_engaged || tilt_exceeded || self.uvc.phase() == UvcPhase::FallTuck {
+                let uvc_out = self.uvc.step(dt, imu, walk, self.balance_gains);
 
-            let speed_mag = (vx * vx + vy * vy + yaw * yaw).min(1.0);
-            if walk.walk_enabled && speed_mag > 0.002 {
-                self.gait_phase_rad += TAU * cadence * dt;
-                if self.gait_phase_rad >= TAU {
-                    self.gait_phase_rad -= TAU;
-                }
-            } else if self.walk_blend > 0.01 {
-                // Gently return gait phase to double-support stance (0 or PI) when stationary
-                let dist_to_zero = if self.gait_phase_rad > PI {
-                    self.gait_phase_rad - TAU
+                if uvc_out.fall_cutoff_ready {
+                    // Protective tuck complete -> drop torque & latch TILT_FALL_CUTOFF
+                    self.active_mode = ControlMode::EStop;
+                    self.latched_faults.insert(FaultFlags::TILT_FALL_CUTOFF);
                 } else {
-                    self.gait_phase_rad
+                    // Bumpless ramp into UVC leg targets (instant when actively catching a shove or tucking)
+                    let target_blend = 1.0_f32;
+                    let ramp_rate = if uvc_out.in_fall_tuck
+                        || uvc_out.phase == UvcPhase::ActiveCatchStep
+                    {
+                        24.0_f32
+                    } else {
+                        8.0_f32
+                    };
+                    self.uvc_blend += (target_blend - self.uvc_blend) * (dt * ramp_rate).clamp(0.0, 1.0);
+                    let b = self.uvc_blend;
+                    let lerp = |a: f32, t: f32| a + (t - a) * b;
+
+                    if has_6dof_legs {
+                        desired_rad[J21_L_HIP_YAW] = lerp(desired_rad[J21_L_HIP_YAW], uvc_out.left_leg.hip_yaw);
+                        desired_rad[J21_L_HIP_ROLL] = lerp(desired_rad[J21_L_HIP_ROLL], uvc_out.left_leg.hip_roll);
+                        desired_rad[J21_L_HIP_PITCH] = lerp(desired_rad[J21_L_HIP_PITCH], uvc_out.left_leg.hip_pitch);
+                        desired_rad[J21_L_KNEE_PITCH] = lerp(desired_rad[J21_L_KNEE_PITCH], uvc_out.left_leg.knee_pitch);
+                        desired_rad[J21_L_ANKLE_PITCH] = lerp(desired_rad[J21_L_ANKLE_PITCH], uvc_out.left_leg.ankle_pitch);
+                        desired_rad[J21_L_ANKLE_ROLL] = lerp(desired_rad[J21_L_ANKLE_ROLL], uvc_out.left_leg.ankle_roll);
+
+                        desired_rad[J21_R_HIP_YAW] = lerp(desired_rad[J21_R_HIP_YAW], uvc_out.right_leg.hip_yaw);
+                        desired_rad[J21_R_HIP_ROLL] = lerp(desired_rad[J21_R_HIP_ROLL], uvc_out.right_leg.hip_roll);
+                        desired_rad[J21_R_HIP_PITCH] = lerp(desired_rad[J21_R_HIP_PITCH], uvc_out.right_leg.hip_pitch);
+                        desired_rad[J21_R_KNEE_PITCH] = lerp(desired_rad[J21_R_KNEE_PITCH], uvc_out.right_leg.knee_pitch);
+                        desired_rad[J21_R_ANKLE_PITCH] = lerp(desired_rad[J21_R_ANKLE_PITCH], uvc_out.right_leg.ankle_pitch);
+                        desired_rad[J21_R_ANKLE_ROLL] = lerp(desired_rad[J21_R_ANKLE_ROLL], uvc_out.right_leg.ankle_roll);
+                    } else {
+                        // Graceful degradation for legacy 17-DoF 4-DoF-leg URDFs
+                        desired_rad[J17_L_HIP_PITCH] = lerp(desired_rad[J17_L_HIP_PITCH], uvc_out.left_leg.hip_pitch);
+                        desired_rad[J17_L_HIP_ROLL] = lerp(desired_rad[J17_L_HIP_ROLL], uvc_out.left_leg.hip_roll);
+                        desired_rad[J17_L_KNEE_PITCH] = lerp(desired_rad[J17_L_KNEE_PITCH], uvc_out.left_leg.knee_pitch);
+                        desired_rad[J17_L_ANKLE_PITCH] = lerp(desired_rad[J17_L_ANKLE_PITCH], uvc_out.left_leg.ankle_pitch);
+
+                        desired_rad[J17_R_HIP_PITCH] = lerp(desired_rad[J17_R_HIP_PITCH], uvc_out.right_leg.hip_pitch);
+                        desired_rad[J17_R_HIP_ROLL] = lerp(desired_rad[J17_R_HIP_ROLL], uvc_out.right_leg.hip_roll);
+                        desired_rad[J17_R_KNEE_PITCH] = lerp(desired_rad[J17_R_KNEE_PITCH], uvc_out.right_leg.knee_pitch);
+                        desired_rad[J17_R_ANKLE_PITCH] = lerp(desired_rad[J17_R_ANKLE_PITCH], uvc_out.right_leg.ankle_pitch);
+                    }
+
+                    // Waist coupling + upper-body arm counter-spread (`armCont`)
+                    desired_rad[J_WAIST_YAW] += uvc_out.waist_yaw * b;
+                    desired_rad[J_L_SHOULDER_PITCH] += uvc_out.l_shoulder_pitch_delta * b;
+                    desired_rad[J_L_SHOULDER_ROLL] += uvc_out.l_shoulder_roll_delta * b;
+                    desired_rad[J_R_SHOULDER_PITCH] += uvc_out.r_shoulder_pitch_delta * b;
+                    desired_rad[J_R_SHOULDER_ROLL] += uvc_out.r_shoulder_roll_delta * b;
+                }
+
+                balance_telem = BalanceTelemetry {
+                    gait_phase_rad: uvc_out.gait_phase_rad,
+                    pitch_corr_rad: uvc_out.pitch_corr_rad,
+                    roll_corr_rad: uvc_out.roll_corr_rad,
+                    balance_active: walk.balance_enabled && !uvc_out.fall_cutoff_ready,
+                    walk_active: uvc_out.walk_active && !uvc_out.fall_cutoff_ready,
+                    uvc_phase: uvc_out.phase.to_wire(),
+                    support_foot: uvc_out.support_foot,
+                    foot_dx_m: uvc_out.foot_dx_m,
+                    foot_dy_m: uvc_out.foot_dy_m,
+                    hip_height_m: uvc_out.hip_height_m,
                 };
-                self.gait_phase_rad -= dist_to_zero * (dt * 6.0_f32).clamp(0.0, 1.0);
-                if self.gait_phase_rad < 0.0 {
-                    self.gait_phase_rad += TAU;
-                }
-            }
-
-            // Stage A: Phase-locked bipedal walk oscillator (blended cleanly onto legs + subtle counter-swing)
-            if self.walk_blend > 0.005 {
-                let b = self.walk_blend;
-                let motion_scale = if speed_mag > 0.002 {
-                    (speed_mag * 2.2_f32).min(1.0)
-                } else {
-                    0.0_f32
-                };
-
-                let base_hip = -(0.12_f32 + crouch * 0.36_f32);
-                let base_knee = 2.0_f32 * (-base_hip);
-                let base_ankle = base_hip;
-
-                let phi_l = self.gait_phase_rad;
-                let phi_r = self.gait_phase_rad + PI;
-
-                let sl = sin_f32(phi_l);
-                let cl = cos_f32(phi_l);
-                let sr = sin_f32(phi_r);
-                let cr = cos_f32(phi_r);
-
-                // Smooth cycloidal swing foot lift (only positive half-wave)
-                let lift_l = if sl > 0.0 { sl * sl } else { 0.0 } * step_h * motion_scale;
-                let lift_r = if sr > 0.0 { sr * sr } else { 0.0 } * step_h * motion_scale;
-
-                let stride_amp = 0.34_f32 * vx + 0.10_f32 * yaw;
-                let stride_amp_r = 0.34_f32 * vx - 0.10_f32 * yaw;
-
-                let l_hip_pitch = base_hip - lift_l * 0.38_f32 - cl * stride_amp;
-                let l_knee_pitch = base_knee + lift_l * 0.72_f32 + (cl * stride_amp).abs() * 0.12;
-                let l_ankle_pitch = base_ankle - lift_l * 0.30_f32 + cl * stride_amp * 0.65;
-
-                let r_hip_pitch = base_hip - lift_r * 0.38_f32 - cr * stride_amp_r;
-                let r_knee_pitch = base_knee + lift_r * 0.72_f32 + (cr * stride_amp_r).abs() * 0.12;
-                let r_ankle_pitch = base_ankle - lift_r * 0.30_f32 + cr * stride_amp_r * 0.65;
-
-                // Natural lateral weight transfer + strafe command on hip roll
-                let weight_shift = sl * 0.095_f32 * motion_scale;
-                let strafe_l = 0.04_f32 + weight_shift + vy * (0.14_f32 + 0.10_f32 * sl);
-                let strafe_r = -0.04_f32 + weight_shift + vy * (0.14_f32 - 0.10_f32 * sr);
-
-                let lerp = |a: f32, target: f32| a + (target - a) * b;
-                desired_rad[J_L_HIP_PITCH] = lerp(desired_rad[J_L_HIP_PITCH], l_hip_pitch);
-                desired_rad[J_L_HIP_ROLL] = lerp(desired_rad[J_L_HIP_ROLL], strafe_l);
-                desired_rad[J_L_KNEE_PITCH] = lerp(desired_rad[J_L_KNEE_PITCH], l_knee_pitch);
-                desired_rad[J_L_ANKLE_PITCH] = lerp(desired_rad[J_L_ANKLE_PITCH], l_ankle_pitch);
-
-                desired_rad[J_R_HIP_PITCH] = lerp(desired_rad[J_R_HIP_PITCH], r_hip_pitch);
-                desired_rad[J_R_HIP_ROLL] = lerp(desired_rad[J_R_HIP_ROLL], strafe_r);
-                desired_rad[J_R_KNEE_PITCH] = lerp(desired_rad[J_R_KNEE_PITCH], r_knee_pitch);
-                desired_rad[J_R_ANKLE_PITCH] = lerp(desired_rad[J_R_ANKLE_PITCH], r_ankle_pitch);
-
-                // Subtle torso & arm counter-swing when actively walking
-                if motion_scale > 0.01 {
-                    let waist_swing = cl * vx * 0.16_f32 + yaw * 0.22_f32;
-                    let arm_swing = cl * vx * 0.26_f32;
-                    desired_rad[J_WAIST_YAW] += waist_swing * b;
-                    desired_rad[J_L_SHOULDER_PITCH] += arm_swing * b;
-                    desired_rad[J_R_SHOULDER_PITCH] -= arm_swing * b;
-                }
-                balance_telem.walk_active = walk.walk_enabled;
-            }
-
-            // Stage B: MCU-Native 2-Axis Upper-Body Vertical Stabilizer (IMU PD + Anti-Windup)
-            if walk.balance_enabled {
-                let g = self.balance_gains;
-                let pitch_err = -imu.pitch_rad;
-                let roll_err = -imu.roll_rad;
-
-                self.pitch_int = (self.pitch_int + pitch_err * dt).clamp(-0.14_f32, 0.14_f32);
-                self.roll_int = (self.roll_int + roll_err * dt).clamp(-0.14_f32, 0.14_f32);
-
-                let pitch_corr = (g.kp_pitch * pitch_err - g.kd_pitch * imu.pitch_rate_rad_s
-                    + 0.28_f32 * self.pitch_int)
-                    .clamp(-0.60_f32, 0.60_f32);
-                let roll_corr = (g.kp_roll * roll_err - g.kd_roll * imu.roll_rate_rad_s
-                    + 0.28_f32 * self.roll_int)
-                    .clamp(-0.48_f32, 0.48_f32);
-
-                let hip_share = 1.0_f32 - 0.50_f32 * g.ankle_ratio;
-                let ankle_share = 0.70_f32 * g.ankle_ratio;
-                let knee_comp = 0.16_f32 * pitch_corr.abs();
-
-                // Pitch stabilization: hip-pitch uprighting + ankle strategy + slight knee compliance
-                desired_rad[J_L_HIP_PITCH] += pitch_corr * hip_share;
-                desired_rad[J_R_HIP_PITCH] += pitch_corr * hip_share;
-                desired_rad[J_L_ANKLE_PITCH] += pitch_corr * ankle_share;
-                desired_rad[J_R_ANKLE_PITCH] += pitch_corr * ankle_share;
-                desired_rad[J_L_KNEE_PITCH] += knee_comp;
-                desired_rad[J_R_KNEE_PITCH] += knee_comp;
-
-                // Roll stabilization: hip-roll lateral counter-tilt + upper-body arm windmill assist
-                desired_rad[J_L_HIP_ROLL] += roll_corr;
-                desired_rad[J_R_HIP_ROLL] += roll_corr;
-
-                if g.arm_assist > 0.01 {
-                    let arm_roll = roll_corr * g.arm_assist * 1.15_f32;
-                    let arm_pitch = pitch_corr * g.arm_assist * 0.70_f32;
-                    desired_rad[J_L_SHOULDER_ROLL] += arm_roll;
-                    desired_rad[J_R_SHOULDER_ROLL] += arm_roll;
-                    desired_rad[J_L_SHOULDER_PITCH] -= arm_pitch;
-                    desired_rad[J_R_SHOULDER_PITCH] -= arm_pitch;
-                }
-
-                balance_telem.pitch_corr_rad = pitch_corr;
-                balance_telem.roll_corr_rad = roll_corr;
-                balance_telem.balance_active = true;
             } else {
-                self.pitch_int = 0.0;
-                self.roll_int = 0.0;
+                self.uvc.reset();
+                self.uvc_blend = 0.0;
+                balance_telem.uvc_phase = uvc_phase::IDLE;
             }
-            balance_telem.gait_phase_rad = self.gait_phase_rad;
         } else {
-            self.pitch_int = 0.0;
-            self.roll_int = 0.0;
-            self.walk_blend = 0.0;
+            self.uvc.reset();
+            self.uvc_blend = 0.0;
+            balance_telem.uvc_phase = uvc_phase::IDLE;
         }
 
         // 6. Compute torque mask & soft-stopped, slew-clamped servo targets (Safety always downstream)
@@ -560,7 +497,10 @@ impl DirectServoKernel {
             };
             torque_state_mask = self.last_host_torque_mask & valid_mask;
             let speed_scale = (self.last_host_speed_pct as f32) * 0.01_f32;
-            let base_slew = if balance_telem.balance_active || balance_telem.walk_active {
+            let base_slew = if balance_telem.balance_active
+                || balance_telem.walk_active
+                || balance_telem.uvc_phase == uvc_phase::FALL_TUCK
+            {
                 BALANCE_SLEW_RAD_PER_SEC
             } else {
                 self.base_slew_rad_per_sec
@@ -570,7 +510,6 @@ impl DirectServoKernel {
             for i in 0..self.joint_count {
                 let enabled = ((torque_state_mask >> i) & 1) == 1;
                 if !enabled {
-                    // Track measured while joint torque is off
                     self.applied_target_rad[i] = measured_rad[i];
                 } else {
                     let cal = &self.calibration[i];
@@ -740,22 +679,22 @@ mod tests {
     }
 
     #[test]
-    fn upper_body_vertical_balance_corrects_tilt_and_latches_fall_cutoff() {
+    fn uvc_balance_steps_to_catch_tilt_and_tucks_before_fall_cutoff() {
         let cal = [JointCalibration {
-            min_rad: -2.0,
-            max_rad: 2.0,
+            min_rad: -2.2,
+            max_rad: 2.2,
             ..Default::default()
-        }; 17];
-        let mut kernel = DirectServoKernel::new(17, &cal);
+        }; 21];
+        let mut kernel = DirectServoKernel::new(21, &cal);
 
         let mut fb = RawServoFeedback::default();
         fb.imu.pitch_rad = 0.22; // Leaning forward ~12.6 deg
-        fb.imu.roll_rad = -0.15;
+        fb.imu.roll_rad = -0.15; // Leaning left -> Left leg catches
 
-        let cmd = HostToMcu {
+        let mut cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Drive,
-            torque_mask: (1u32 << 17) - 1,
+            torque_mask: (1u32 << 21) - 1,
             speed_limit_pct: 100,
             walk: WalkCmd {
                 walk_enabled: false,
@@ -765,37 +704,43 @@ mod tests {
             ..Default::default()
         };
 
-        let out = kernel.step(10, 0.01, Some(&cmd), &fb);
+        let mut out = kernel.step(10, 0.01, Some(&cmd), &fb);
+        for tick in 2..=12 {
+            cmd.seq = tick;
+            out = kernel.step(tick * 10, 0.01, Some(&cmd), &fb);
+        }
         assert_eq!(out.telemetry.active_mode, ControlMode::Drive);
         assert!(out.telemetry.balance.balance_active);
-        assert!(out.telemetry.balance.pitch_corr_rad < -0.1, "must counter forward pitch");
-        assert!(out.telemetry.balance.roll_corr_rad > 0.05, "must counter negative roll");
-        assert!(out.telemetry.applied_target_rad[J_L_HIP_PITCH] < 0.0);
-        assert!(out.telemetry.applied_target_rad[J_L_HIP_ROLL] > 0.0);
+        assert_eq!(out.telemetry.balance.uvc_phase, uvc_phase::ACTIVE_CATCH_STEP);
+        assert_eq!(out.telemetry.balance.support_foot, 1, "left foot catches -roll lean");
+        assert!(out.telemetry.balance.foot_dx_m > 0.02, "foot must step forward under forward tilt");
+        assert!(out.telemetry.balance.foot_dy_m < -0.01, "left foot must step left under -roll");
 
-        // Exceed 42 deg fall cutoff -> latches TILT_FALL_CUTOFF & forces EStop with zero torque
+        // Exceed fall cutoff -> protective FallTuck then EStop with TILT_FALL_CUTOFF
         fb.imu.pitch_rad = 0.90;
-        let mut cmd2 = cmd;
-        cmd2.seq = 2;
-        let fall = kernel.step(20, 0.01, Some(&cmd2), &fb);
+        let mut fall = out;
+        for tick in 13..=25 {
+            cmd.seq = tick;
+            fall = kernel.step(tick * 10, 0.01, Some(&cmd), &fb);
+        }
         assert_eq!(fall.telemetry.active_mode, ControlMode::EStop);
         assert_eq!(fall.servo_cmd.torque_mask, 0);
         assert!(fall.telemetry.faults.contains(FaultFlags::TILT_FALL_CUTOFF));
     }
 
     #[test]
-    fn walking_oscillator_advances_phase_and_drives_alternating_legs() {
+    fn uvc_walking_alternates_legs_and_advances_phase() {
         let cal = [JointCalibration {
             min_rad: -2.2,
             max_rad: 2.2,
             ..Default::default()
-        }; 17];
-        let mut kernel = DirectServoKernel::new(17, &cal);
+        }; 21];
+        let mut kernel = DirectServoKernel::new(21, &cal);
         let fb = RawServoFeedback::default();
         let mut cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Drive,
-            torque_mask: (1u32 << 17) - 1,
+            torque_mask: (1u32 << 21) - 1,
             speed_limit_pct: 100,
             walk: WalkCmd {
                 walk_enabled: true,
@@ -807,18 +752,20 @@ mod tests {
         };
 
         let mut last = kernel.step(10, 0.01, Some(&cmd), &fb);
+        let mut max_knee_diff = 0.0_f32;
         for tick in 2..=60 {
             cmd.seq = tick;
             last = kernel.step(tick * 10, 0.01, Some(&cmd), &fb);
+            let diff = (last.telemetry.applied_target_rad[J21_L_KNEE_PITCH]
+                - last.telemetry.applied_target_rad[J21_R_KNEE_PITCH])
+                .abs();
+            max_knee_diff = max_knee_diff.max(diff);
         }
         assert!(last.telemetry.balance.walk_active);
-        assert!(last.telemetry.balance.gait_phase_rad > 0.5);
+        assert!(last.telemetry.balance.gait_phase_rad > 0.2);
         assert!(
-            (last.telemetry.applied_target_rad[J_L_KNEE_PITCH]
-                - last.telemetry.applied_target_rad[J_R_KNEE_PITCH])
-                .abs()
-                > 0.05,
-            "left and right knees must alternate during walking"
+            max_knee_diff > 0.08,
+            "left and right knees must alternate during UVC walking (max_diff={max_knee_diff})"
         );
     }
 

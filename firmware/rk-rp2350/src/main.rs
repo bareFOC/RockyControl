@@ -17,6 +17,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "imu-bno055")]
+mod imu_bno055;
 mod servo_uart;
 mod usb_cdc;
 mod usb_net;
@@ -56,8 +58,15 @@ fn init_heap() {
 }
 
 // --- RP2350 Interrupt Bindings ---
+#[cfg(not(feature = "imu-bno055"))]
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
+});
+
+#[cfg(feature = "imu-bno055")]
+bind_interrupts!(struct Irqs {
+    USBCTRL_IRQ => UsbInterruptHandler<USB>;
+    I2C0_IRQ => embassy_rp::i2c::InterruptHandler<embassy_rp::peripherals::I2C0>;
 });
 
 // --- Compile-Time Generated Copper-rs Task Graph ---
@@ -99,6 +108,10 @@ async fn main(spawner: Spawner) {
     // 2. Bind Servo Bus (Milestone 2.1: BenchLoopbackBus default; Milestone 2.2: UART0 1 Mbps)
     #[cfg(feature = "uart-servo-bus")]
     servo_uart::init_uart_servo_bus(p.UART0, p.PIN_0, p.PIN_1);
+
+    // 2b. Optional Bosch BNO055 9-Axis IMU over I2C0 (GPIO4 SDA / GPIO5 SCL @ 400 kHz)
+    #[cfg(feature = "imu-bno055")]
+    imu_bno055::spawn_bno055(&spawner, p.I2C0, p.PIN_5, p.PIN_4, Irqs);
 
     // 3. Bring up wired USB transport (CDC-ACM serial OR CDC-NCM Ethernet-over-USB)
     let usb_driver = UsbDriver::new(p.USB, Irqs);

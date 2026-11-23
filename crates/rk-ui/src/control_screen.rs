@@ -66,11 +66,11 @@ impl RockyStudioApp {
                 ))
         };
 
-        // 1. Top-Left Floating HUD: IMU Attitude, Vertical Balance & Combat Push Tests
-        let att_w = 264.0_f32.min(vp_rect.width() - 175.0).max(200.0);
+        // 1. Top-Left Floating HUD: IMU Attitude, UVC Vertical Balance & Combat Push Tests
+        let att_w = 276.0_f32.min(vp_rect.width() - 175.0).max(200.0);
         let att_area = Rect::from_min_size(
             pos2(vp_rect.left() + pad, vp_rect.top() + pad),
-            vec2(att_w, 240.0),
+            vec2(att_w, 268.0),
         );
         let mut att_ui = ui.new_child(
             UiBuilder::new()
@@ -84,33 +84,67 @@ impl RockyStudioApp {
             let pitch_deg = telem.imu.pitch_rad.to_degrees();
             let roll_deg = telem.imu.roll_rad.to_degrees();
             let fallen = telem.faults.contains(FaultFlags::TILT_FALL_CUTOFF);
-            let recovering = !fallen && (pitch_deg.abs() > 4.5 || roll_deg.abs() > 4.5);
+            let phase = telem.balance.uvc_phase;
+            let phase_label = rk_proto::uvc_phase::label(phase);
 
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("UPPER-BODY BALANCE")
+                    RichText::new("UVC BALANCE")
                         .strong()
                         .size(11.0)
                         .color(Color32::from_rgb(138, 162, 192)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (badge, col) = if fallen {
-                        ("FALLEN", Color32::from_rgb(248, 113, 113))
-                    } else if recovering {
-                        ("RECOVERING", Color32::from_rgb(251, 191, 36))
+                        ("FALL CUTOFF", Color32::from_rgb(248, 113, 113))
+                    } else if phase == rk_proto::uvc_phase::FALL_TUCK {
+                        ("TUCK", Color32::from_rgb(248, 113, 113))
+                    } else if phase == rk_proto::uvc_phase::ACTIVE_CATCH_STEP {
+                        ("STEP", Color32::from_rgb(251, 191, 36))
+                    } else if phase == rk_proto::uvc_phase::POST_STEP_SETTLE
+                        || phase == rk_proto::uvc_phase::RETURN_TO_NEUTRAL
+                        || phase == rk_proto::uvc_phase::RECOVERY_SETTLE
+                    {
+                        (phase_label, Color32::from_rgb(56, 208, 248))
+                    } else if phase == rk_proto::uvc_phase::READY_WATCH {
+                        ("READY", Color32::from_rgb(74, 222, 128))
                     } else {
-                        ("UPRIGHT", Color32::from_rgb(74, 222, 128))
+                        (phase_label, Color32::from_rgb(156, 174, 198))
                     };
                     ui.label(RichText::new(badge).strong().size(11.0).color(col));
+                    let sup_lbl = if telem.balance.support_foot == 1 {
+                        "SUP L"
+                    } else {
+                        "SUP R"
+                    };
+                    ui.label(
+                        RichText::new(sup_lbl)
+                            .monospace()
+                            .size(10.5)
+                            .color(Color32::from_rgb(138, 162, 192)),
+                    );
                 });
             });
 
             ui.add_space(4.0);
-            paint_tilt_bar(ui, "Pitch", pitch_deg, 42.0);
+            paint_tilt_bar(ui, "Pitch", pitch_deg, 38.0);
             ui.add_space(3.0);
-            paint_tilt_bar(ui, "Roll ", roll_deg, 42.0);
+            paint_tilt_bar(ui, "Roll ", roll_deg, 38.0);
 
-            ui.add_space(7.0);
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "dX {:+4.0} mm  dY {:+4.0} mm  H {:3.0} mm",
+                    telem.balance.foot_dx_m * 1000.0,
+                    telem.balance.foot_dy_m * 1000.0,
+                    telem.balance.hip_height_m * 1000.0,
+                ))
+                .monospace()
+                .size(10.5)
+                .color(Color32::from_rgb(152, 178, 204)),
+            );
+
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let bal_on = self.model.walk_cmd.balance_enabled;
                 let bal_btn = egui::Button::new(
@@ -439,9 +473,9 @@ impl RockyStudioApp {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let tune_btn = egui::Button::new(
                                 RichText::new(if self.show_quick_balance_tune {
-                                    "Hide PD"
+                                    "Hide UVC"
                                 } else {
-                                    "Tune PD"
+                                    "Tune UVC"
                                 })
                                 .size(11.0),
                             )
@@ -450,7 +484,7 @@ impl RockyStudioApp {
                             } else {
                                 Color32::from_rgb(26, 36, 52)
                             })
-                            .min_size(Vec2::new(62.0, 22.0))
+                            .min_size(Vec2::new(66.0, 22.0))
                             .corner_radius(CornerRadius::same(4));
                             if ui.add(tune_btn).clicked() {
                                 self.show_quick_balance_tune = !self.show_quick_balance_tune;
@@ -485,13 +519,13 @@ impl RockyStudioApp {
                         let mut changed = false;
                         ui.spacing_mut().slider_width = (act_w - 118.0).max(76.0);
                         changed |= ui
-                            .add(egui::Slider::new(&mut gains.kp_pitch, 0.0..=3.0).text("Kp Pitch"))
+                            .add(egui::Slider::new(&mut gains.uvc_gain_pitch, 0.0..=0.8).text("UVC Pitch"))
                             .changed();
                         changed |= ui
-                            .add(egui::Slider::new(&mut gains.kd_pitch, 0.0..=1.0).text("Kd Pitch"))
+                            .add(egui::Slider::new(&mut gains.uvc_gain_roll, 0.0..=0.8).text("UVC Roll"))
                             .changed();
                         changed |= ui
-                            .add(egui::Slider::new(&mut gains.kp_roll, 0.0..=3.0).text("Kp Roll"))
+                            .add(egui::Slider::new(&mut gains.gyro_damp_pitch, 0.0..=0.35).text("Gyro Damp"))
                             .changed();
                         changed |= ui
                             .add(egui::Slider::new(&mut gains.arm_assist, 0.0..=1.4).text("Arm Assist"))
