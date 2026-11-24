@@ -7,7 +7,7 @@ Guarantees that firmware and simulation execute the same control application cod
 ## Requirements
 
 ### Requirement: Single kernel wrapper
-The system SHALL provide exactly one wrapper around the real-time control kernel, hosted in the shared control-application crate, and both firmware and simulation SHALL call that same wrapper to execute a control tick.
+The system SHALL provide exactly one wrapper around the real-time control kernel, hosted in the shared control-application crate, and both firmware and simulation SHALL call that same wrapper to execute a control tick. All simulation callers, including MCP hosts, SHALL use the deterministic fixed-step transport path.
 
 #### Scenario: Firmware and simulation use the same wrapper
 - **WHEN** a control tick is executed in firmware and in simulation
@@ -16,6 +16,10 @@ The system SHALL provide exactly one wrapper around the real-time control kernel
 #### Scenario: No duplicate bus trait
 - **WHEN** the simulation implements its servo I/O backend
 - **THEN** it implements the same `ServoBusPort` trait used by the firmware rather than a separate equivalent trait
+
+#### Scenario: No duplicate task code
+- **WHEN** the simulation is built for WASM
+- **THEN** it does not contain a parallel copy of the control loop or scheduler
 
 ### Requirement: Deterministic host-callable control step
 The control wrapper's step function SHALL be pure with respect to global state: all inputs (commands, feedback, wire error counts, time) SHALL be explicit parameters, so it produces identical results for identical inputs on host and MCU. The control application's estimator SHALL use only deterministic, fixed-order kinematic computation (mass-weighted FK, analytic Jacobian, support-relative DCM) and fixed single-precision math.
