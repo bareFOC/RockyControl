@@ -50,6 +50,7 @@ impl RockyStudioApp {
                 fall_event_active: self.fall_event_active
                     || (telem.faults.contains(rk_proto::FaultFlags::TILT_FALL_CUTOFF)
                         && telem.imu.available),
+                world_offset: telem.world_offset(),
             },
         );
         self.apply_viewport_interaction(&interaction);
@@ -559,10 +560,23 @@ impl RockyStudioApp {
                 if rec {
                     if let Some(log) = self.transport.stop_recording() {
                         self.replay_result = Some(verify_deterministic_replay(&log));
+                        // Serialize once into app state so the Export button can
+                        // hand it to the platform saver (browser download on WASM,
+                        // atomic file write on desktop).
+                        self.copper_export_json = serde_json::to_string_pretty(&log).ok();
                     }
                 } else {
                     self.replay_result = None;
+                    self.copper_export_json = None;
                     self.transport.start_recording();
+                }
+            }
+            if let Some(json) = self.copper_export_json.clone() {
+                if ui.button("Export .copper").clicked() {
+                    match self.saver.save_file("rocky_replay.copper", "application/json", json.as_bytes()) {
+                        Ok(msg) => self.model.status_message = msg,
+                        Err(e) => self.model.status_message = format!("Replay export failed: {e}"),
+                    }
                 }
             }
             if let Some(ver) = self.replay_result {

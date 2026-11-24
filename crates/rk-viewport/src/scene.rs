@@ -32,6 +32,18 @@ pub struct ViewportFrameData {
     pub time_sec: f64,
     pub orbit: OrbitState,
     pub marker_radius: f32,
+    /// Ground-plane world translation of the robot root, derived from plant
+    /// telemetry. Applied as a root transform after the body tilt so the robot
+    /// visibly moves across the world-fixed floor grid while walking.
+    pub world_offset: [f32; 3],
+}
+
+/// Composes the world root translation *after* the tilt/body transform.
+///
+/// Shared by the renderer (root transform for every visual) and the viewport
+/// hit-testing geometry so picking stays aligned with the translated robot.
+pub(crate) fn apply_world_offset(iso: &Isometry3<f32>, offset: [f32; 3]) -> Isometry3<f32> {
+    Isometry3::translation(offset[0], offset[1], offset[2]) * iso
 }
 
 struct SolidVisualItem {
@@ -140,11 +152,19 @@ impl SceneResources {
         );
         camera.set_viewport(viewport);
 
+        // Root translation from plant telemetry. Applied outside the tilt/body transform
+        // so the whole robot walks across the world-fixed grid; the floor plate and
+        // grid meshes are deliberately left untranslated as world-space references.
+        let root = iso_to_mat4(&apply_world_offset(
+            &Isometry3::identity(),
+            frame.world_offset,
+        ));
+
         // Update solid measured transforms + current heat-tinting + selection highlight
         for item in &mut self.items {
             if let Some(iso) = frame.measured_transforms.get(&item.link_name) {
                 let world = iso * item.local_offset;
-                item.mesh.set_transformation(iso_to_mat4(&world));
+                item.mesh.set_transformation(root * iso_to_mat4(&world));
             }
 
             let mut r = item.base_rgba[0];
@@ -199,7 +219,7 @@ impl SceneResources {
             if frame.show_ghost {
                 if let Some(iso) = frame.target_transforms.get(&item.link_name) {
                     let world = iso * item.local_offset;
-                    let m = iso_to_mat4(&world);
+                    let m = root * iso_to_mat4(&world);
                     item.ghost_mesh.set_transformation(m);
                     item.ghost_wire.set_transformation(m);
                 }
@@ -245,7 +265,11 @@ impl SceneResources {
                     frame.marker_radius
                 };
                 self.joint_markers[slot].set_transformation(
-                    Mat4::from_translation(vec3(pos[0], pos[1], pos[2])) * Mat4::from_scale(r),
+                    Mat4::from_translation(vec3(
+                        pos[0] + frame.world_offset[0],
+                        pos[1] + frame.world_offset[1],
+                        pos[2] + frame.world_offset[2],
+                    )) * Mat4::from_scale(r),
                 );
                 self.joint_markers[slot].material.color = if is_sel {
                     Srgba::new(56, 224, 248, 255)
@@ -622,5 +646,18 @@ mod tests {
     fn fall_albedo_is_dominantly_red() {
         let (r, g, b) = fall_albedo_rgb();
         assert!(r > 0.8 && g < 0.1 && b < 0.1);
+    }
+
+    #[test]
+    fn world_offset_translates_the_root_after_the_body_transform() {
+        let body = Isometry3::translation(0.1, 0.0, 0.2);
+        let shifted = apply_world_offset(&body, [1.0, 0.0, 2.0]);
+        let t = shifted.translation.vector;
+        assert!((t.x - 1.1).abs() < 1e-6, "x must add after body pose");
+        assert!((t.y - 0.0).abs() < 1e-6);
+        assert!((t.z - 2.2).abs() < 1e-6, "forward z must add after body pose");
+
+        let at_origin = apply_world_offset(&Isometry3::identity(), [-0.5, 0.0, 3.0]);
+        assert_eq!(at_origin.translation.vector.as_slice(), &[-0.5, 0.0, 3.0]);
     }
 }

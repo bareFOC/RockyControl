@@ -6,6 +6,7 @@
 //! - `firmware/rk-esp32p4` (Espressif ESP32-P4 RISC-V + `esp-hal` + `embassy-usb`)
 
 pub mod config;
+pub mod control_task;
 pub mod copper;
 pub mod i3c_bus;
 pub mod imu;
@@ -18,6 +19,7 @@ pub mod status_led;
 pub mod transport;
 
 // Host+MCU single-source control application entry points.
+pub use control_task::{RobotIo, control_task, step_control_tick};
 pub use copper::{ControlTask, ControlTick, current_led_mode};
 #[cfg(feature = "std")]
 pub use replay::{

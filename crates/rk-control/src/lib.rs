@@ -779,6 +779,9 @@ impl DirectServoKernel {
                     // Filled in by the impact stage below (after torque control).
                     impact_detected: false,
                     impact_magnitude_nm: 0.0,
+                    // World-frame position/velocity are published by the plant
+                    // backend (rk-sim), not by the hardware-agnostic kernel.
+                    ..Default::default()
                 };
             } else {
                 self.uvc.reset();

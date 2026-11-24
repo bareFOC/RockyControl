@@ -47,6 +47,7 @@ impl RockyStudioApp {
                 fall_event_active: self.fall_event_active
                     || (telem.faults.contains(FaultFlags::TILT_FALL_CUTOFF)
                         && telem.imu.available),
+                world_offset: telem.world_offset(),
             },
         );
         self.apply_viewport_interaction(&interaction);
@@ -292,7 +293,7 @@ impl RockyStudioApp {
         if est_w >= 200.0 {
             let est_left = vp_rect.right() - rec_w - pad * 2.0 - est_w;
             let est_area =
-                Rect::from_min_size(pos2(est_left, vp_rect.top() + pad), vec2(est_w, 224.0));
+                Rect::from_min_size(pos2(est_left, vp_rect.top() + pad), vec2(est_w, 282.0));
             let mut est_ui = ui.new_child(
                 UiBuilder::new()
                     .max_rect(est_area)
@@ -307,6 +308,10 @@ impl RockyStudioApp {
                 let valid = est.valid_mask;
                 let com_ok = valid & estimator_valid::COM != 0;
                 let dcm_ok = valid & estimator_valid::DCM != 0;
+                let world_ok = valid & estimator_valid::WORLD != 0;
+                // An absent world channel renders as an em dash, not a misleading 0.0.
+                let world_ms = |v: f32| fmt_signed_ms(if world_ok { v } else { f32::NAN });
+                let world_m = |v: f32| fmt_signed_m(if world_ok { v } else { f32::NAN });
 
                 ui.horizontal(|ui| {
                     ui.label(
@@ -447,12 +452,43 @@ impl RockyStudioApp {
                         }),
                 );
 
+                // Achieved locomotion from the plant's world telemetry (v6 wire).
+                // Without a valid WORLD channel these rows show em dashes rather
+                // than suggesting the robot moved when no world estimate exists.
+                ui.label(
+                    RichText::new(format!(
+                        "World x/z {}/{} m · vz {} m/s",
+                        world_m(bal.world_pos_m[0]),
+                        world_m(bal.world_pos_m[2]),
+                        world_ms(bal.world_vel_m_s[2]),
+                    ))
+                    .monospace()
+                    .size(10.5)
+                    .color(if world_ok { bright } else { dim }),
+                );
+                // WalkCmd.vx is normalized [-1, 1]; the kernel's sagittal target is vx * 0.5 m/s.
+                let cmd_vx = self.model.walk_cmd.vx;
+                ui.label(
+                    RichText::new(format!(
+                        "Cmd vx {:+.2} ({:+.2} m/s) -> Ach {} m/s",
+                        cmd_vx,
+                        cmd_vx * 0.5,
+                        world_ms(bal.world_vel_m_s[2]),
+                    ))
+                    .monospace()
+                    .size(10.5)
+                    .color(if world_ok { bright } else { dim }),
+                );
+
                 let contact = match est.contact_mask & 0b11 {
                     0b01 => "R",
                     0b10 => "L",
                     0b11 => "R+L",
                     _ => "—",
                 };
+                let left = if est.contact_mask & 0b10 != 0 { "ON" } else { "--" };
+                let right = if est.contact_mask & 0b01 != 0 { "ON" } else { "--" };
+                let ctrl_hz = self.transport.stats().packet_rate_hz;
                 let mut channels = String::new();
                 if valid & estimator_valid::COM != 0 {
                     channels.push('C');
@@ -473,11 +509,16 @@ impl RockyStudioApp {
                     channels.push('—');
                 }
                 ui.label(
-                    RichText::new(format!("Contact {contact:<3} · Valid {channels}"))
-                        .monospace()
-                        .size(10.0)
-                        .color(Color32::from_rgb(126, 148, 174)),
-                );
+                    RichText::new(format!(
+                        "Contact L:{left} R:{right} ({contact}) · {ctrl_hz:.0} Hz"
+                    ))
+                    .monospace()
+                    .size(10.0)
+                    .color(Color32::from_rgb(126, 148, 174)),
+                )
+                .on_hover_text(format!(
+                    "Achieved control tick rate: {ctrl_hz:.1} Hz · estimator channels: {channels}"
+                ));
             });
             self.viewport_hud_rects[4] = est_resp.response.rect.expand(3.0);
         }
@@ -1031,6 +1072,15 @@ fn fmt_signed_ms(v: f32) -> String {
     }
 }
 
+/// Signed metres formatter for world displacement rows (invalid -> em dash).
+fn fmt_signed_m(v: f32) -> String {
+    if v.is_finite() {
+        format!("{:+5.2}", v)
+    } else {
+        "    —".to_string()
+    }
+}
+
 /// Thin gait-phase progress bar with a mid-cycle support-swap tick.
 fn paint_gait_phase_bar(ui: &mut egui::Ui, phase_frac: f32, support_foot: u8) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 8.0), Sense::hover());
@@ -1066,7 +1116,7 @@ fn paint_gait_phase_bar(ui: &mut egui::Ui, phase_frac: f32, support_foot: u8) {
 
 #[cfg(test)]
 mod gait_hud_tests {
-    use super::{fmt_signed_mm, fmt_signed_ms};
+    use super::{fmt_signed_m, fmt_signed_mm, fmt_signed_ms};
 
     #[test]
     fn estimator_rows_format_finite_and_invalid_channels() {
@@ -1076,5 +1126,8 @@ mod gait_hud_tests {
         assert_eq!(fmt_signed_ms(0.08), "+0.08");
         assert_eq!(fmt_signed_ms(-1.5), "-1.50");
         assert_eq!(fmt_signed_ms(f32::INFINITY), "    —");
+        assert_eq!(fmt_signed_m(1.75), "+1.75");
+        assert_eq!(fmt_signed_m(-0.2), "-0.20");
+        assert_eq!(fmt_signed_m(f32::NAN), "    —");
     }
 }

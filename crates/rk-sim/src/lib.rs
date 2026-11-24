@@ -4,8 +4,16 @@
 //! or `std::time::Instant` assumptions. Records `.copper` deterministic replay logs and
 //! verifies exact output parity under replay.
 
-use rk_control::{JointCalibration, RawServoCommand, RawServoFeedback};
+use core::ops::{Deref, DerefMut};
+
+use embassy_time::{Duration, Instant, Ticker};
+use rk_control::{
+    JointCalibration, RawServoCommand, RawServoFeedback, com_fk::compute_state,
+    uvc::LegGeometry,
+};
+use rk_fw_core::control_task::{RobotIo, step_control_tick};
 use rk_fw_core::copper::{ControlTask, ControlTick};
+use rk_harness::DeterministicHarness;
 pub use rk_fw_core::replay::{
     CopperReplayLog, ReplayVerification, verify_deterministic_replay,
 };
@@ -13,11 +21,14 @@ use rk_fw_core::servo_bus::ServoBusPort;
 use rk_fw_core::transport::{CobsStreamFramer, HostLinkMailbox, encode_telemetry_frame};
 use rk_proto::{
     HostToMcu, JointCommandMode, MAX_COBS_FRAME_BYTES, MAX_JOINTS, MAX_MODEL_COBS_FRAME_BYTES,
-    McuToHost, ModelFormat, ModelInfo, ModelRequest, ModelResponse, RunningConfig, decode_mcu_cobs,
-    decode_model_req_cobs, decode_model_resp_cobs, encode_cobs, encode_model_req_cobs,
-    encode_model_resp_cobs,
+    McuToHost, ModelFormat, ModelInfo, ModelRequest, ModelResponse, RunningConfig, WalkCmd,
+    decode_mcu_cobs, decode_model_req_cobs, decode_model_resp_cobs, encode_cobs,
+    encode_model_req_cobs, encode_model_resp_cobs, estimator_valid,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+
+use rk_fw_core::config::CONTROL_PERIOD_MS;
 
 const DEFAULT_MCU_FLASH_URDF: &[u8] =
     include_bytes!("../../../assets/sample_humanoid/rocky_mk1.urdf");
@@ -35,6 +46,44 @@ const RUNNING_MIN_THRUST_N: f32 = -120.0;
 const RUNNING_FLIGHT_DEBOUNCE_S: f32 = 0.012;
 /// Nominal torque used to translate commanded N·m into reported motor current.
 const RUNNING_NOMINAL_TORQUE_NM: f32 = 1.8;
+
+// --- Ground-plane (world) locomotion plant constants ------------------------
+/// Vertical distance pelvis root -> hip-pitch pivot from `JOINT_KINEMATICS`
+/// (`l_hip_yaw.origin.y + l_hip_roll.origin.y + l_thigh.origin.y`).
+const PELVIS_TO_HIP_PITCH_M: f32 = 0.12;
+/// The printed foot sole sits slightly below the ankle-roll link origin.
+const SOLE_BELOW_ANKLE_M: f32 = 0.018;
+/// Foot clearance below which the sole is considered planted (metres).
+const CONTACT_TOLERANCE_M: f32 = 0.006;
+/// LIPM capture-velocity tracking gain (1/s) for the world CoM.
+const WORLD_VEL_TRACK_GAIN: f32 = 6.0;
+/// Capture-point gain used when placing the next stance foot.
+const WORLD_LANDING_GAIN: f32 = 0.55;
+/// CoM acceleration ceiling (m/s²).
+const WORLD_MAX_ACCEL: f32 = 6.0;
+/// Metres per unit of `WalkCmd.vx`/`vy` (matches the UVC capture law's `v_des`).
+const WALK_SPEED_SCALE: f32 = 0.5;
+/// Effectiveness of the contact CoP moment on torso tilt (lumped inertia).
+const CONTACT_MOMENT_GAIN: f32 = 0.35;
+
+/// Per-foot ground contact state in the world/ground frame.
+///
+/// `point_m` is `[x, z]` (lateral-right, forward). The plant pins this point
+/// while the foot is in stance; its motion relative to the FK foot origin is
+/// reported as `slip_m_s`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FootContact {
+    /// True while the sole is inside the ground contact tolerance.
+    pub contact: bool,
+    /// Planted world point `[x, z]` in metres.
+    pub point_m: [f32; 2],
+    /// Normal ground reaction force in Newtons (>= 0, bounded).
+    pub grf_n: f32,
+    /// Penetration depth below the ground plane in metres (>= 0).
+    pub penetration_m: f32,
+    /// Tangential slip speed of the sole in m/s (0 while perfectly pinned).
+    pub slip_m_s: f32,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SimFaultInjection {
@@ -123,6 +172,28 @@ pub struct SimulatedServoPlant {
     running_ground_reaction_n: f32,
     /// Vertical thrust converted from joint torque commands in the most recent step (N).
     running_thrust_n: f32,
+    // --- Ground-plane world state (locomotion-physics) ----------------------
+    /// Latest streamed walk command (ground velocity target + cadence).
+    walk_cmd: WalkCmd,
+    /// World-frame CoM position `[x, y, z]` in metres (`x` right, `y` up, `z` forward).
+    world_com_pos_m: [f32; 3],
+    /// World-frame CoM velocity `[vx, vy, vz]` in m/s.
+    world_com_vel_m_s: [f32; 3],
+    /// Forward CoM position at construction/reset, for displacement reporting.
+    world_start_z_m: f32,
+    /// Right (index 0) and left (index 1) sole contact state.
+    foot_contacts: [FootContact; 2],
+    /// Total normal ground reaction from the most recent world step (N).
+    world_grf_n: f32,
+    /// Support-foot swaps observed while walking (0 = Right, 1 = Left).
+    contact_swaps: u32,
+    /// Number of world steps each sole spent in contact (right, left).
+    contact_ticks: [u32; 2],
+    /// Previous support foot, for landing detection.
+    last_support_foot: u8,
+    /// CoP offset `[x, z]` relative to CoM from the latest contact step (m).
+    /// Drives the torso tilt through ground-reaction moments instead of a scripted sway.
+    contact_cop_offset_m: [f32; 2],
 }
 
 /// Body-frame gravity consistent with the kinematics tilt rotation.
@@ -140,6 +211,32 @@ fn gravity_from_tilt(pitch_rad: f32, roll_rad: f32) -> [f32; 3] {
     let sr = roll_rad.sin();
     let cr = roll_rad.cos();
     [-y1 * sr, y1 * cr, z1]
+}
+
+/// Shared stance spring used by both the vertical hop integrator and the
+/// per-foot walking contact model. Keeps one source of truth for ground
+/// compliance: a touchdown/stiffness ramp interpolates between the soft
+/// touchdown stiffness and the nominal stance stiffness.
+fn stance_spring_grf(
+    compression_m: f32,
+    compression_rate_m_s: f32,
+    cfg: &RunningConfig,
+    ramp: f32,
+) -> f32 {
+    let k = cfg.landing_stiffness_touchdown_n_m
+        + (cfg.landing_stiffness_nominal_n_m - cfg.landing_stiffness_touchdown_n_m)
+            * ramp.clamp(0.0_f32, 1.0_f32);
+    (k * compression_m + cfg.landing_damping_n_s_m * compression_rate_m_s).max(0.0_f32)
+}
+
+/// Initial world CoM position from the shared mass-weighted FK and leg geometry.
+fn initial_world_com(initial_raw_pose: &[f32; MAX_JOINTS]) -> [f32; 3] {
+    let fk = compute_state(initial_raw_pose, &[0.0_f32; MAX_JOINTS]);
+    [
+        fk.com[0],
+        LegGeometry::rocky_mk1().nominal_height + PELVIS_TO_HIP_PITCH_M + fk.com[1],
+        fk.com[2],
+    ]
 }
 
 impl SimulatedServoPlant {
@@ -184,6 +281,16 @@ impl SimulatedServoPlant {
             running_apex_height_m: RunningConfig::default().leg_rest_length_m,
             running_ground_reaction_n: 0.0,
             running_thrust_n: 0.0,
+            walk_cmd: WalkCmd::default(),
+            world_com_pos_m: initial_world_com(&initial_raw_pose),
+            world_com_vel_m_s: [0.0; 3],
+            world_start_z_m: initial_world_com(&initial_raw_pose)[2],
+            foot_contacts: [FootContact::default(); 2],
+            world_grf_n: 0.0,
+            contact_swaps: 0,
+            contact_ticks: [0; 2],
+            last_support_foot: 0,
+            contact_cop_offset_m: [0.0; 2],
         }
     }
 
@@ -235,6 +342,15 @@ impl SimulatedServoPlant {
         self.recovery_start_roll = 0.0;
         self.recovery_start_yaw = 0.0;
         self.reset_running_dynamics();
+        self.world_com_pos_m = initial_world_com(&self.raw_angle_rad);
+        self.world_start_z_m = self.world_com_pos_m[2];
+        self.world_com_vel_m_s = [0.0; 3];
+        self.foot_contacts = [FootContact::default(); 2];
+        self.world_grf_n = 0.0;
+        self.contact_swaps = 0;
+        self.contact_ticks = [0; 2];
+        self.last_support_foot = 0;
+        self.contact_cop_offset_m = [0.0; 2];
     }
 
     /// Updates active get-up recovery progress (`Some(0.0..=1.0)`) so simulated ground
@@ -257,6 +373,61 @@ impl SimulatedServoPlant {
 
     pub fn set_balance_telemetry(&mut self, bal: rk_proto::BalanceTelemetry) {
         self.last_balance = bal;
+    }
+
+    // --- Ground-plane world state API ---------------------------------------
+
+    /// Installs the latest streamed walk command. Called by the shared
+    /// [`RobotIo::take_cmd`] path so both the synchronous and Embassy harness
+    /// backends drive the same world physics.
+    pub fn set_walk_cmd(&mut self, walk: WalkCmd) {
+        self.walk_cmd = walk;
+    }
+
+    /// World-frame CoM position `[x, y, z]` in metres (`x` right, `z` forward).
+    pub fn world_position_m(&self) -> [f32; 3] {
+        self.world_com_pos_m
+    }
+
+    /// World-frame CoM velocity `[vx, vy, vz]` in m/s.
+    pub fn world_velocity_m_s(&self) -> [f32; 3] {
+        self.world_com_vel_m_s
+    }
+
+    /// Forward ground displacement from the initial pose (metres).
+    pub fn forward_displacement_m(&self) -> f32 {
+        self.world_com_pos_m[2] - self.world_start_z_m
+    }
+
+    /// Right (`false`) and left (`true`) sole contact state.
+    pub fn foot_contact(&self, left: bool) -> FootContact {
+        self.foot_contacts[if left { 1 } else { 0 }]
+    }
+
+    /// Both sole contact states, indexed `[right, left]`.
+    pub fn foot_contacts(&self) -> &[FootContact; 2] {
+        &self.foot_contacts
+    }
+
+    /// Contact bitmask (`bit 0 = Right`, `bit 1 = Left`) matching the wire convention.
+    pub fn contact_mask(&self) -> u8 {
+        (if self.foot_contacts[0].contact { 1 } else { 0 })
+            | (if self.foot_contacts[1].contact { 2 } else { 0 })
+    }
+
+    /// Number of support-foot swaps observed while walking.
+    pub fn contact_swaps(&self) -> u32 {
+        self.contact_swaps
+    }
+
+    /// Number of world steps each sole spent in contact (`[right, left]`).
+    pub fn contact_ticks(&self) -> [u32; 2] {
+        self.contact_ticks
+    }
+
+    /// Total normal ground reaction in Newtons from the latest world step.
+    pub fn ground_reaction_total_n(&self) -> f32 {
+        self.world_grf_n
     }
 
     // --- Torque-capable running plant API -----------------------------------
@@ -413,11 +584,13 @@ impl SimulatedServoPlant {
             // Compression rate is positive while the leg shortens, negative while extending.
             let compression_rate = -self.running_com_vel_z_m_s;
             self.running_landing_ramp = (self.running_landing_ramp + dt / ramp_s).min(1.0);
-            let k = cfg.landing_stiffness_touchdown_n_m
-                + (cfg.landing_stiffness_nominal_n_m - cfg.landing_stiffness_touchdown_n_m)
-                    * self.running_landing_ramp;
-            let d = cfg.landing_damping_n_s_m;
-            ground = (k * compression + d * compression_rate).max(0.0);
+            // Same stance spring the walking contacts use.
+            ground = stance_spring_grf(
+                compression,
+                compression_rate,
+                &cfg,
+                self.running_landing_ramp,
+            );
             self.running_peak_landing_force_n = self.running_peak_landing_force_n.max(ground);
         } else {
             self.running_landing_ramp = 0.0;
@@ -455,6 +628,179 @@ impl SimulatedServoPlant {
             self.running_apex_height_m = self.running_com_height_m;
         }
         self.running_prev_in_flight = self.running_in_flight;
+    }
+
+    /// Ground-plane LIPM + per-foot contact physics.
+    ///
+    /// The CoM/foot kinematics come from the shared `com_fk` mass table and
+    /// `LegGeometry::rocky_mk1()` (one source of truth with the controller).
+    /// Stance soles are pinned to a planted world point; the CoM evolves as an
+    /// inverted pendulum about the GRF-weighted CoP with a commanded-velocity
+    /// tracking term that represents the leg swing. All math is fixed-dt `f32`.
+    fn step_world_dynamics(&mut self, dt: f32, legs_energized: bool) {
+        if !legs_energized || self.recovery_progress.is_some() {
+            // Torque off / get-up recovery: no locomotion plant. Bleed the
+            // previous velocity deterministically and drop all contacts.
+            let decay = (1.0_f32 - 8.0_f32 * dt).max(0.0_f32);
+            self.world_com_vel_m_s[0] *= decay;
+            self.world_com_vel_m_s[2] *= decay;
+            self.world_grf_n = 0.0;
+            self.foot_contacts = [FootContact::default(); 2];
+            self.contact_cop_offset_m = [0.0; 2];
+            return;
+        }
+
+        let geom = LegGeometry::rocky_mk1();
+        let fk = compute_state(&self.raw_angle_rad, &self.velocity_rad_s);
+        let hip_h = if self.last_balance.hip_height_m.is_finite()
+            && self.last_balance.hip_height_m > 0.2_f32
+        {
+            self.last_balance
+                .hip_height_m
+                .clamp(geom.min_height, geom.nominal_height)
+        } else {
+            geom.nominal_height
+        };
+        // Pelvis root is `hip_h` above the hip pivot plus the fixed URDF chain
+        // offset from `JOINT_KINEMATICS` (pelvis -> hip-pitch pivot).
+        let pelvis_y = hip_h + PELVIS_TO_HIP_PITCH_M;
+        let pelvis_x = self.world_com_pos_m[0] - fk.com[0];
+        let pelvis_z = self.world_com_pos_m[2] - fk.com[2];
+        let pelvis_vx = self.world_com_vel_m_s[0] - fk.com_vel[0];
+        let pelvis_vz = self.world_com_vel_m_s[2] - fk.com_vel[2];
+
+        let mass = self.running_cfg.mass_kg.clamp(0.2_f32, 10.0_f32);
+        let body_weight = mass * RUNNING_G_M_S2;
+        let fk_feet = [
+            (fk.right_foot, fk.right_foot_vel),
+            (fk.left_foot, fk.left_foot_vel),
+        ];
+
+        // 1. Sole contact detection from shared FK foot heights.
+        let mut contacts = [FootContact::default(); 2];
+        for foot in 0..2 {
+            let (p, pv) = fk_feet[foot];
+            let clearance = pelvis_y + p[1] - SOLE_BELOW_ANKLE_M;
+            let penetration = (-clearance).max(0.0_f32);
+            let contact = clearance <= CONTACT_TOLERANCE_M;
+            let world_point = [pelvis_x + p[0], pelvis_z + p[2]];
+            let grf = if contact {
+                // Generalised stance spring: same touchdown/nominal compliance
+                // as the running hop, driven here by sole penetration.
+                stance_spring_grf(penetration, (-pv[1]).max(0.0_f32), &self.running_cfg, 1.0)
+                    + 0.5_f32 * body_weight
+            } else {
+                0.0_f32
+            };
+            let mut c = FootContact {
+                contact,
+                point_m: if self.foot_contacts[foot].contact {
+                    self.foot_contacts[foot].point_m
+                } else {
+                    world_point
+                },
+                grf_n: grf.min(4.0_f32 * body_weight),
+                penetration_m: penetration,
+                slip_m_s: 0.0_f32,
+            };
+            if contact {
+                let fvx = pelvis_vx + pv[0];
+                let fvz = pelvis_vz + pv[2];
+                c.slip_m_s = (fvx * fvx + fvz * fvz).sqrt().min(2.0_f32);
+            }
+            contacts[foot] = c;
+        }
+
+        // 2. Landing: the controller's support-foot swap marks the instant the
+        //    swing sole becomes the new stance sole. Place it at the capture
+        //    point ahead of the CoM, bounded by the shared swing-foot reach.
+        let walking = self.walk_cmd.walk_enabled
+            && (self.walk_cmd.vx.abs() + self.walk_cmd.vy.abs() + self.walk_cmd.yaw_rate.abs())
+                > 0.04_f32;
+        let support = (self.last_balance.support_foot & 1) as usize;
+        if walking && support != self.last_support_foot as usize {
+            self.last_support_foot = support as u8;
+            self.contact_swaps = self.contact_swaps.saturating_add(1);
+            let h = self.world_com_pos_m[1].clamp(0.25_f32, 1.0_f32);
+            let omega = (RUNNING_G_M_S2 / h).sqrt();
+            let v_des_x = self.walk_cmd.vy * WALK_SPEED_SCALE;
+            let v_des_z = self.walk_cmd.vx * WALK_SPEED_SCALE;
+            let foot_dx = self.last_balance.foot_dx_m.clamp(-geom.max_dx, geom.max_dx);
+            let land_x = (self.world_com_vel_m_s[0]
+                + WORLD_LANDING_GAIN * (v_des_x - self.world_com_vel_m_s[0]))
+                / omega;
+            let land_z = foot_dx
+                + (self.world_com_vel_m_s[2]
+                    + WORLD_LANDING_GAIN * (v_des_z - self.world_com_vel_m_s[2]))
+                    / omega;
+            contacts[support].point_m = [
+                self.world_com_pos_m[0] + land_x.clamp(-geom.max_swing_dx, geom.max_swing_dx),
+                self.world_com_pos_m[2] + land_z.clamp(-geom.max_swing_dx, geom.max_swing_dx),
+            ];
+            contacts[support].contact = true;
+        }
+
+        // 3. GRF-weighted CoP (the support point of the LIPM). Airborne -> CoM,
+        //    so no phantom ground moment is applied.
+        let grf_sum = contacts[0].grf_n + contacts[1].grf_n;
+        let cop = if grf_sum > 1.0e-3_f32 {
+            [
+                (contacts[0].point_m[0] * contacts[0].grf_n
+                    + contacts[1].point_m[0] * contacts[1].grf_n)
+                    / grf_sum,
+                (contacts[0].point_m[1] * contacts[0].grf_n
+                    + contacts[1].point_m[1] * contacts[1].grf_n)
+                    / grf_sum,
+            ]
+        } else {
+            [self.world_com_pos_m[0], self.world_com_pos_m[2]]
+        };
+        self.contact_cop_offset_m = [
+            cop[0] - self.world_com_pos_m[0],
+            cop[1] - self.world_com_pos_m[2],
+        ];
+        self.world_grf_n = grf_sum.min(4.0_f32 * body_weight);
+
+        // 4. Semi-implicit LIPM: gravity topples the CoM about the support CoP;
+        //    the tracking term represents the commanded leg swing pushing the
+        //    body toward the streamed ground velocity.
+        let h = self.world_com_pos_m[1].clamp(0.25_f32, 1.0_f32);
+        let omega2 = RUNNING_G_M_S2 / h;
+        let v_des_x = self.walk_cmd.vy * WALK_SPEED_SCALE;
+        let v_des_z = self.walk_cmd.vx * WALK_SPEED_SCALE;
+        let mut ax = omega2 * (self.world_com_pos_m[0] - cop[0])
+            + WORLD_VEL_TRACK_GAIN * (v_des_x - self.world_com_vel_m_s[0]);
+        let mut az = omega2 * (self.world_com_pos_m[2] - cop[1])
+            + WORLD_VEL_TRACK_GAIN * (v_des_z - self.world_com_vel_m_s[2]);
+        ax = ax.clamp(-WORLD_MAX_ACCEL, WORLD_MAX_ACCEL);
+        az = az.clamp(-WORLD_MAX_ACCEL, WORLD_MAX_ACCEL);
+        self.world_com_vel_m_s[0] =
+            (self.world_com_vel_m_s[0] + ax * dt).clamp(-1.5_f32, 1.5_f32);
+        self.world_com_vel_m_s[2] =
+            (self.world_com_vel_m_s[2] + az * dt).clamp(-1.5_f32, 1.5_f32);
+        if walking && v_des_z > 0.01_f32 && self.world_com_vel_m_s[2] < 0.0_f32 {
+            self.world_com_vel_m_s[2] = 0.0_f32;
+        }
+        self.world_com_pos_m[0] += self.world_com_vel_m_s[0] * dt;
+        self.world_com_pos_m[2] += self.world_com_vel_m_s[2] * dt;
+        self.world_com_pos_m[1] = pelvis_y + fk.com[1];
+
+        // 5. Slip is the residual sole velocity after the CoM step (a pinned
+        //    foot would see zero). Recomputed from the integrated world state.
+        for foot in 0..2 {
+            if contacts[foot].contact {
+                let (_, pv) = fk_feet[foot];
+                let fvx = self.world_com_vel_m_s[0] - fk.com_vel[0] + pv[0];
+                let fvz = self.world_com_vel_m_s[2] - fk.com_vel[2] + pv[2];
+                contacts[foot].slip_m_s = (fvx * fvx + fvz * fvz).sqrt().min(2.0_f32);
+            }
+        }
+        self.foot_contacts = contacts;
+        for foot in 0..2 {
+            if contacts[foot].contact {
+                self.contact_ticks[foot] = self.contact_ticks[foot].saturating_add(1);
+            }
+        }
     }
 
     pub fn step_plant(&mut self, dt_sec: f32) -> RawServoFeedback {
@@ -552,6 +898,10 @@ impl SimulatedServoPlant {
         let legs_energized = (self.last_cmd.torque_mask & legs_mask) != 0 && self.joint_count >= 17;
         let leg_stalled = (9..leg_end).any(|idx| self.faults.stalled_joints[idx]);
 
+        // Ground-plane world physics runs before the tilt integrator so the
+        // contact CoP can drive torso attitude through a physical moment.
+        self.step_world_dynamics(dt, legs_energized);
+
         if legs_energized && self.recovery_progress.is_some() {
             // Ground push-off contact dynamics during active get-up recovery:
             // stays near fallen pose during Fallen Tuck (0..0.12), lifts smoothly through
@@ -612,19 +962,21 @@ impl SimulatedServoPlant {
                 clamped * 11.5_f32
             };
 
-            let walk_sway_pitch = if self.last_balance.walk_active {
-                (self.last_balance.gait_phase_rad * 2.0_f32).cos() * 0.45_f32
-            } else {
-                0.0_f32
-            };
-            let walk_sway_roll = if self.last_balance.walk_active {
-                self.last_balance.gait_phase_rad.sin() * 0.65_f32
-            } else {
-                0.0_f32
-            };
+            // Contact-driven torso moment: `tau = r x F` about the CoM from
+            // the ground-reaction CoP. This replaces the old scripted gait
+            // sway — tilt now only changes when the contacts/CoP change.
+            // The gain accounts for the lumped (distributed) body inertia.
+            let h_com = self.last_balance.hip_height_m.clamp(0.42_f32, 0.72_f32);
+            let mass = self.running_cfg.mass_kg.clamp(0.2_f32, 10.0_f32);
+            let inertia = mass * h_com * h_com;
+            let cop_pitch_moment = CONTACT_MOMENT_GAIN * self.world_grf_n
+                * self.contact_cop_offset_m[1]
+                / inertia;
+            let cop_roll_moment = -CONTACT_MOMENT_GAIN * self.world_grf_n
+                * self.contact_cop_offset_m[0]
+                / inertia;
 
             // UVC catch-step shifts Center of Pressure `(act_foot_dx, act_foot_dy)` under leaning torso
-            let h_com = self.last_balance.hip_height_m.clamp(0.42_f32, 0.72_f32);
             let k_cop_pitch = 26.0_f32;
             let k_cop_roll = 24.0_f32;
             let cop_restore_pitch = -(self.act_foot_dx / h_com) * k_cop_pitch;
@@ -640,13 +992,13 @@ impl SimulatedServoPlant {
                 + cop_restore_pitch
                 + k_ankle_pitch * self.act_pitch_corr
                 - damping * self.pitch_rate_rad_s
-                + walk_sway_pitch;
+                + cop_pitch_moment;
             let alpha_roll = k_grav * self.torso_roll_rad.sin()
                 - passive_foot(self.torso_roll_rad)
                 + cop_restore_roll
                 + k_ankle_roll * self.act_roll_corr
                 - damping * self.roll_rate_rad_s
-                + walk_sway_roll;
+                + cop_roll_moment;
 
             self.pitch_rate_rad_s = (self.pitch_rate_rad_s + alpha_pitch * dt).clamp(-8.0, 8.0);
             self.roll_rate_rad_s = (self.roll_rate_rad_s + alpha_roll * dt).clamp(-8.0, 8.0);
@@ -739,10 +1091,13 @@ impl ServoBusPort for SimulatedServoPlant {
     }
 }
 
-/// End-to-end simulation runner wiring the shared `rk-fw-core` COBS transport + control task
-/// -> `SimulatedServoPlant` plus an onboard simulated MCU flash model store using the shared
-/// `FlashModelStore`.
-pub struct CopperSimRunner {
+/// All state owned by the simulated robot's [`RobotIo`] implementation.
+///
+/// This is the single source of truth for both the deterministic Embassy harness
+/// path and the synchronous compatibility path. The public [`CopperSimRunner`]
+/// dereferences to it, so existing field access (`runner.plant`, ...) and methods
+/// keep working unchanged.
+pub struct SimRobotIo {
     pub task: ControlTask,
     /// Shared streaming COBS framer used for host -> MCU command decoding.
     pub host_framer: CobsStreamFramer,
@@ -756,9 +1111,20 @@ pub struct CopperSimRunner {
     max_recorded_ticks: usize,
     mcu_model_info: ModelInfo,
     mcu_model_blob: Vec<u8>,
+    // --- RobotIo backend state ---
+    /// Lazily-created Embassy ticker driven by the harness mock clock.
+    ticker: Option<Ticker>,
+    /// `true` in harness mode: `now_ms()` reads the mock clock instead of uptime.
+    use_mock_clock: bool,
+    /// `Some(dt)` only on the synchronous compatibility path (variable dt tests).
+    dt_override: Option<f32>,
+    /// Deterministically queued host commands for the harness path.
+    pending_cmds: VecDeque<HostToMcu>,
+    /// Latest telemetry decoded on the host side of the simulated wire.
+    last_host_rx: Option<McuToHost>,
 }
 
-impl CopperSimRunner {
+impl SimRobotIo {
     pub fn new(
         joint_count: usize,
         initial_cal: &[JointCalibration],
@@ -779,6 +1145,11 @@ impl CopperSimRunner {
             max_recorded_ticks: 2400,
             mcu_model_info,
             mcu_model_blob,
+            ticker: None,
+            use_mock_clock: false,
+            dt_override: None,
+            pending_cmds: VecDeque::new(),
+            last_host_rx: None,
         }
     }
 
@@ -884,75 +1255,46 @@ impl CopperSimRunner {
         std::fs::write(path, bytes)
     }
 
-    /// Executes one full Copper DAG cycle including real COBS encode/decode in both directions.
+    /// Synchronous compatibility path: one variable-dt simulation tick.
+    ///
+    /// This is the legacy `CopperSimRunner::tick()` entry point used by current
+    /// tests and by the UI transport. It does **not** duplicate any kernel logic:
+    /// after preparing the simulated wire it calls the same [`step_control_tick`]
+    /// body that the deterministic Embassy harness task runs. Only the time source
+    /// differs (accumulated `uptime_ms_f` + caller-supplied `dt_sec` here, mock
+    /// clock + fixed `CONTROL_DT_SEC` in harness mode).
     pub fn tick(&mut self, dt_sec: f32, host_pkt: &HostToMcu) -> McuToHost {
         let dt = dt_sec.clamp(0.002_f32, 0.05_f32);
         // Forward the streamed running gate/gains to the torque-capable plant.
         self.plant.set_running_config(host_pkt.walk.running);
         self.uptime_ms_f += (dt as f64) * 1000.0;
-        let now_ms = self.uptime_ms_f.round() as u32;
+        self.use_mock_clock = false;
+        self.dt_override = Some(dt);
 
-        // 1. Read simulated servo feedback
-        let feedback = self.plant.read_feedback(dt);
-
-        // 2. Encode HostToMcu over COBS and decode on MCU bridge (unless heartbeat dropped)
-        let rx_cmd = if self.plant.faults().drop_heartbeat {
-            None
-        } else {
+        // Encode HostToMcu over COBS and decode on the MCU bridge (unless heartbeat
+        // was dropped). The decoded command is queued in the shared mailbox so
+        // `RobotIo::take_cmd()` sees exactly what the hardware path would see.
+        if !self.plant.faults().drop_heartbeat {
             let mut wire = [0u8; MAX_COBS_FRAME_BYTES];
             match encode_cobs(host_pkt, &mut wire) {
                 Ok(encoded) => {
                     let len = encoded.len();
-                    self.decode_rx(&mut wire[..len])
-                }
-                Err(_) => {
-                    self.host_decode_errors += 1;
-                    None
-                }
-            }
-        };
-
-        // 3. Forward shared transport wire-error counts and execute the shared control task.
-        let (rx_crc_errors, rx_version_mismatches) = self.wire_error_counts();
-        let (step_out, tick_record) = self.task.step_recorded(
-            now_ms,
-            dt,
-            rx_cmd.as_ref(),
-            &feedback,
-            (rx_crc_errors, rx_version_mismatches),
-        );
-
-        // 4. Write servo command & MCU balance telemetry to simulated servo/LIPM plant
-        self.plant.write_command(&step_out.servo_cmd);
-        self.plant.set_balance_telemetry(step_out.telemetry.balance);
-
-        if self.recording {
-            if let Some(log) = self.recorded_log.as_mut() {
-                if log.ticks.len() < self.max_recorded_ticks {
-                    // Shared ControlTask already produces the replay-compatible ControlTick.
-                    log.ticks.push(tick_record);
-                }
-            }
-        }
-
-        // 5. Encode McuToHost over COBS and decode on host side
-        let mut mcu_wire = [0u8; MAX_COBS_FRAME_BYTES];
-        match self.encode_tx(&step_out.telemetry, &mut mcu_wire) {
-            Ok(encoded) => {
-                let len = encoded.len();
-                match decode_mcu_cobs(&mut mcu_wire[..len]) {
-                    Ok(decoded) => decoded,
-                    Err(_) => {
-                        self.host_decode_errors += 1;
-                        step_out.telemetry
+                    if let Some(decoded) = self.decode_rx(&mut wire[..len]) {
+                        self.host_mailbox.push_rx_cmd(decoded);
                     }
                 }
-            }
-            Err(_) => {
-                self.host_decode_errors += 1;
-                step_out.telemetry
+                Err(_) => self.host_decode_errors += 1,
             }
         }
+
+        // Take the runner's ControlTask out so the whole IO can be borrowed by the
+        // shared step function without aliasing the task borrow.
+        let placeholder = ControlTask::new(1, &[JointCalibration::default(); MAX_JOINTS]);
+        let mut task = core::mem::replace(&mut self.task, placeholder);
+        step_control_tick(self, &mut task);
+        self.task = task;
+
+        self.last_host_rx.take().unwrap_or_default()
     }
 
     /// Injects a combat shove angular velocity impulse into the simulated torso.
@@ -995,10 +1337,240 @@ impl CopperSimRunner {
     }
 }
 
+impl RobotIo for SimRobotIo {
+    async fn wait_tick(&mut self) {
+        if self.ticker.is_none() {
+            // Created on first poll (at mock time zero) so the first harness step
+            // fires exactly one control tick.
+            self.ticker = Some(Ticker::every(Duration::from_millis(CONTROL_PERIOD_MS)));
+        }
+        self.ticker.as_mut().expect("ticker").next().await;
+    }
+
+    fn now_ms(&self) -> u32 {
+        if self.use_mock_clock {
+            Instant::now().as_millis() as u32
+        } else {
+            // Synchronous compatibility path: caller-driven uptime, unchanged
+            // from the original `tick()` implementation.
+            self.uptime_ms_f.round() as u32
+        }
+    }
+
+    fn dt_sec(&self) -> f32 {
+        self.dt_override.unwrap_or(rk_fw_core::config::CONTROL_DT_SEC)
+    }
+
+    fn joint_count(&self) -> usize {
+        self.task.kernel().joint_count()
+    }
+
+    fn calibration(&self) -> [JointCalibration; MAX_JOINTS] {
+        let mut cal = [JointCalibration::default(); MAX_JOINTS];
+        let source = self.task.kernel().calibration();
+        let n = source.len().min(MAX_JOINTS);
+        cal[..n].copy_from_slice(&source[..n]);
+        cal
+    }
+
+    fn take_cmd(&mut self) -> Option<HostToMcu> {
+        let cmd = self
+            .pending_cmds
+            .pop_front()
+            .or_else(|| self.host_mailbox.take_rx_cmd())?;
+        // The plant needs the streamed walk target (ground velocity) and the
+        // running gate on the same tick the kernel sees them.
+        self.plant.set_walk_cmd(cmd.walk);
+        self.plant.set_running_config(cmd.walk.running);
+        Some(cmd)
+    }
+
+    fn wire_error_counts(&self) -> (u16, u16) {
+        self.host_mailbox.wire_error_counts()
+    }
+
+    fn read_feedback(&mut self, dt_sec: f32) -> RawServoFeedback {
+        self.plant.read_feedback(dt_sec)
+    }
+
+    fn write_command(&mut self, cmd: &RawServoCommand) {
+        self.plant.write_command(cmd);
+    }
+
+    fn publish_telemetry(&mut self, telem: McuToHost) {
+        // Feed the simulated balance plant exactly as the old runner did, then
+        // round-trip telemetry through the shared COBS helpers.
+        self.plant.set_balance_telemetry(telem.balance);
+        let mut mcu_wire = [0u8; MAX_COBS_FRAME_BYTES];
+        let mut decoded = match self.encode_tx(&telem, &mut mcu_wire) {
+            Ok(encoded) => {
+                let len = encoded.len();
+                decode_mcu_cobs(&mut mcu_wire[..len]).unwrap_or_else(|_| {
+                    self.host_decode_errors += 1;
+                    telem
+                })
+            }
+            Err(_) => {
+                self.host_decode_errors += 1;
+                telem
+            }
+        };
+        // Publish the plant's world-frame state alongside the MCU's own
+        // support-relative estimate. Hardware leaves the WORLD channel clear;
+        // the viewport/HUD use these fields to show achieved locomotion.
+        decoded.balance.world_pos_m = self.plant.world_position_m();
+        decoded.balance.world_vel_m_s = self.plant.world_velocity_m_s();
+        decoded.estimator.valid_mask |= estimator_valid::WORLD;
+        decoded.estimator.contact_mask = self.plant.contact_mask();
+        decoded.estimator.grf_left_n = self.plant.foot_contact(false).grf_n;
+        decoded.estimator.grf_right_n = self.plant.foot_contact(true).grf_n;
+        decoded.estimator.valid_mask |= estimator_valid::GRF;
+        self.last_host_rx = Some(decoded);
+    }
+
+    fn record_tick(&mut self, tick: &ControlTick) {
+        if self.recording {
+            if let Some(log) = self.recorded_log.as_mut() {
+                if log.ticks.len() < self.max_recorded_ticks {
+                    log.ticks.push(*tick);
+                }
+            }
+        }
+    }
+}
+
+/// Future type spawned into the deterministic harness executor. A boxed future
+/// is used instead of `#[embassy_executor::task]` because an infinite `#[task]`
+/// never releases its static pool slot: the next harness run would panic with
+/// `SpawnError::Busy`. A fresh `raw::TaskStorage` per run is reclaimed below.
+type HarnessFuture = core::pin::Pin<Box<dyn core::future::Future<Output = ()> + 'static>>;
+
+/// Public simulation runner. All methods and fields (most notably `plant`) are
+/// reached by auto-deref to [`SimRobotIo`], preserving the historic API used by
+/// `rk-link`, the UI and existing tests.
+pub struct CopperSimRunner(pub SimRobotIo);
+
+impl Deref for CopperSimRunner {
+    type Target = SimRobotIo;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for CopperSimRunner {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl CopperSimRunner {
+    pub fn new(
+        joint_count: usize,
+        initial_cal: &[JointCalibration],
+        initial_raw_pose: [f32; MAX_JOINTS],
+    ) -> Self {
+        Self(SimRobotIo::new(joint_count, initial_cal, initial_raw_pose))
+    }
+
+    /// Drives the **shared async control task** through `rk-harness`'s
+    /// deterministic Embassy executor for exactly `steps` 5 ms ticks.
+    ///
+    /// `host_cmds` are queued in order (one per tick, `None` afterwards so the
+    /// deadman watchdog behaves as on hardware). Returns the updated runner and
+    /// the last telemetry frame decoded on the simulated host side.
+    /// Reset the global deterministic clock. Only for tests / fresh sessions;
+    /// the interactive app must NOT call this between frames.
+    pub fn reset_mock_clock(&self) {
+        embassy_time::MockDriver::get().reset();
+    }
+
+    pub fn run_harness(mut self, steps: usize, host_cmds: &[HostToMcu]) -> (Self, McuToHost) {
+        self.run_harness_impl(steps, host_cmds, true)
+    }
+
+    /// Like [`Self::run_harness`] but does NOT reset the global mock clock —
+    /// used by the interactive app so simulated time advances continuously
+    /// across frames instead of restarting at 0 every frame.
+    pub fn run_harness_continuous(mut self, steps: usize, host_cmds: &[HostToMcu]) -> (Self, McuToHost) {
+        self.run_harness_impl(steps, host_cmds, false)
+    }
+
+    fn run_harness_impl(
+        mut self,
+        steps: usize,
+        host_cmds: &[HostToMcu],
+        reset_clock: bool,
+    ) -> (Self, McuToHost) {
+        self.io_mut().pending_cmds.extend(host_cmds.iter().copied());
+        self.io_mut().use_mock_clock = true;
+        self.io_mut().dt_override = None;
+        self.io_mut().last_host_rx = None;
+        self.io_mut().ticker = None;
+
+        let mut harness = DeterministicHarness::new();
+        if reset_clock {
+            harness.reset_clock();
+        }
+
+        // SAFETY: `boxed` and `storage` stay alive until the harness (and the
+        // task it owns) is dropped below. The task is polled only synchronously
+        // by `step_n`, so it never accesses the IO or storage after reclamation.
+        let boxed = Box::into_raw(Box::new(self));
+        let io: &'static mut SimRobotIo = unsafe { &mut (*boxed).0 };
+        let storage: &'static embassy_executor::raw::TaskStorage<HarnessFuture> =
+            Box::leak(Box::new(embassy_executor::raw::TaskStorage::new()));
+        let token = storage
+            .spawn(move || Box::pin(rk_fw_core::control_task::control_task(io)))
+            .expect("fresh harness task storage must be spawnable");
+        harness.spawner().spawn(token);
+        harness.step_n(steps);
+        drop(harness);
+        drop(unsafe { Box::from_raw(storage as *const _ as *mut embassy_executor::raw::TaskStorage<HarnessFuture>) });
+        let mut runner = unsafe { *Box::from_raw(boxed) };
+        let telem = runner.io_mut().last_host_rx.take().unwrap_or_default();
+        (runner, telem)
+    }
+
+    fn io_mut(&mut self) -> &mut SimRobotIo {
+        &mut self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rk_proto::{ControlMode, FaultFlags, WalkCmd};
+
+    /// The deterministic harness must drive the *shared* async control task, and
+    /// replay recording must survive through `RobotIo::record_tick`.
+    #[test]
+    fn harness_drives_shared_control_task_and_records_replay() {
+        let cal = [JointCalibration::default(); MAX_JOINTS];
+        let mut sim = CopperSimRunner::new(6, &cal, [0.0; MAX_JOINTS]);
+        sim.start_recording();
+        let cmds = vec![
+            HostToMcu {
+                seq: 1,
+                mode: ControlMode::Teach,
+                ..Default::default()
+            };
+            4
+        ];
+
+        let (mut sim, last) = sim.run_harness(4, &cmds);
+        assert_eq!(last.active_mode, ControlMode::Teach);
+
+        let log = sim.stop_recording().expect("harness ticks recorded");
+        assert_eq!(log.ticks.len(), 4);
+        assert_eq!(log.ticks[0].now_ms, 5);
+        assert_eq!(log.ticks[3].now_ms, 20);
+        for tick in &log.ticks {
+            assert_eq!(tick.dt_sec, rk_fw_core::config::CONTROL_DT_SEC);
+        }
+        let check = verify_deterministic_replay(&log);
+        assert!(check.exact_match);
+        assert_eq!(check.matched_ticks, 4);
+    }
 
     #[test]
     fn copper_sim_end_to_end_watchdog_and_deterministic_replay() {
@@ -1490,5 +2062,73 @@ mod tests {
             "default position-servo plant must still track targets when running is off"
         );
         assert!((plant.com_height_m() - cfg.leg_rest_length_m).abs() < 1e-6);
+    }
+
+    /// Group 4: the full shared control path must actually translate the plant
+    /// forward when walking is commanded, with alternating contacts and tilt
+    /// that stays below the fall cutoff.
+    #[test]
+    fn end_to_end_walking_translates_with_alternating_contacts() {
+        let cal = [JointCalibration {
+            min_rad: -2.2,
+            max_rad: 2.2,
+            ..Default::default()
+        }; 21];
+        let sim = CopperSimRunner::new(21, &cal, [0.0; MAX_JOINTS]);
+        let mut cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: (1u32 << 21) - 1,
+            speed_limit_pct: 100,
+            walk: WalkCmd {
+                walk_enabled: true,
+                balance_enabled: true,
+                vx: 0.5,
+                cadence_hz: 1.55,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cmds: Vec<HostToMcu> = (1..=800)
+            .map(|i| {
+                cmd.seq = i;
+                cmd
+            })
+            .collect();
+
+        // 800 fixed 5 ms ticks = 4 s of deterministic simulated time.
+        let (sim, last) = sim.run_harness(800, &cmds);
+        assert_eq!(last.active_mode, ControlMode::Drive, "walking must stay in Drive");
+        assert!(
+            sim.plant.forward_displacement_m() > 0.10_f32,
+            "vx>0 must produce real forward displacement, got {:.3} m",
+            sim.plant.forward_displacement_m()
+        );
+        assert!(
+            sim.plant.contact_swaps() >= 6,
+            "contacts must alternate across the 4 s walk, got {} swaps",
+            sim.plant.contact_swaps()
+        );
+        let ticks = sim.plant.contact_ticks();
+        assert!(
+            ticks[0] > 0 && ticks[1] > 0,
+            "both soles must carry ground reaction during the walk, got {:?}",
+            ticks
+        );
+        let cutoff = rk_proto::BalanceGains::default().fall_cutoff_rad;
+        assert!(
+            last.imu.pitch_rad.abs() < cutoff && last.imu.roll_rad.abs() < cutoff,
+            "tilt must stay below fall cutoff: pitch={:.3} roll={:.3}",
+            last.imu.pitch_rad,
+            last.imu.roll_rad
+        );
+        assert!(!last.faults.contains(FaultFlags::TILT_FALL_CUTOFF));
+
+        // World state is published on the wire for the viewport/HUD.
+        assert_ne!(last.estimator.valid_mask & estimator_valid::WORLD, 0);
+        assert!(
+            (last.balance.world_pos_m[2] - sim.plant.world_position_m()[2]).abs() < 1e-6_f32
+        );
+        assert!(last.balance.world_vel_m_s[2] > 0.0_f32, "achieved speed must be forward");
     }
 }

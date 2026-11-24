@@ -26,7 +26,7 @@ use three_d::{ScissorBox, Viewport};
 
 pub use camera::{CAMERA_FOV_DEG, CameraPreset, OrbitState};
 pub use scene::ViewportFrameData;
-use scene::SceneResources;
+use scene::{SceneResources, apply_world_offset};
 use view_cube::{ViewCubeState, interact_view_cube, paint_view_cube};
 
 static NEXT_VIEWPORT_ID: AtomicU64 = AtomicU64::new(1);
@@ -98,6 +98,10 @@ pub struct ViewportOptions {
     pub imu_roll_rad: f32,
     /// True while a fall event is active; drives the pulsing red fall highlight.
     pub fall_event_active: bool,
+    /// Ground-plane world translation `[x, y, z]` of the robot root from plant
+    /// telemetry. Applied after the body tilt; `y` is normally zero so the
+    /// robot's CoM height does not lift it off the floor.
+    pub world_offset: [f32; 3],
 }
 
 impl ViewportOptions {
@@ -109,6 +113,12 @@ impl ViewportOptions {
         } else {
             (0.0, 0.0)
         }
+    }
+
+    /// Finite-only world offset: a non-finite telemetry sample must never
+    /// teleport the robot or corrupt the camera target.
+    pub fn effective_world_offset(self) -> [f32; 3] {
+        self.world_offset.map(|v| if v.is_finite() { v } else { 0.0 })
     }
 }
 
@@ -125,6 +135,7 @@ impl Default for ViewportOptions {
             imu_pitch_rad: 0.0,
             imu_roll_rad: 0.0,
             fall_event_active: false,
+            world_offset: [0.0; 3],
         }
     }
 }
@@ -277,10 +288,19 @@ impl HumanoidViewport {
         };
         let cube_consumed = vc_frame.as_ref().is_some_and(|f| f.consumed);
 
-        // Always fit the robot's bounding sphere cleanly inside the current viewport aspect ratio
+        let world_offset = opts.effective_world_offset();
+
+        // Always fit the robot's bounding sphere cleanly inside the current viewport aspect ratio.
+        // The camera follows the plant world position so the walking robot stays framed
+        // while the floor grid remains a fixed world-space motion reference.
         let aspect = (rect.width() / rect.height().max(1.0)).max(0.2);
+        let rig_center = rig.bounds_center();
         self.orbit.fit_to_bounds(
-            rig.bounds_center(),
+            [
+                rig_center[0] + world_offset[0],
+                rig_center[1] + world_offset[1],
+                rig_center[2] + world_offset[2],
+            ],
             rig.bounds_radius(),
             aspect,
             CAMERA_FOV_DEG,
@@ -296,6 +316,12 @@ impl HumanoidViewport {
         } else {
             HashMap::new()
         };
+        // Hit-testing geometry must follow the same root translation the renderer
+        // applies, otherwise dragging a walking robot would grab empty space.
+        let world_transforms: HashMap<String, Isometry3<f32>> = measured_transforms
+            .iter()
+            .map(|(name, iso)| (name.clone(), apply_world_offset(iso, world_offset)))
+            .collect();
 
         let marker_radius = (rig.bounds_radius() * 0.024).clamp(0.012, 0.034);
         let pick_scale = self.pick_radius_scale.clamp(0.9, 2.0);
@@ -307,10 +333,12 @@ impl HumanoidViewport {
         for j in &rig.joints {
             if let Some(iso) = measured_transforms.get(&j.child_link) {
                 let t = iso.translation.vector;
+                // Marker positions stay in body space; scene.rs adds the root offset.
                 joint_positions.push((j.index, [t.x, t.y, t.z]));
+                let wt = apply_world_offset(iso, world_offset).translation.vector;
                 self.joint_pick_spheres.push((
                     j.index,
-                    Point3::new(t.x, t.y, t.z),
+                    Point3::new(wt.x, wt.y, wt.z),
                     (marker_radius * 1.9 * pick_scale).max(0.028),
                 ));
             }
@@ -319,7 +347,7 @@ impl HumanoidViewport {
         // Update exact oriented link pick volumes for direct robot hit-testing vs empty-space orbit
         self.pick_bounds.clear();
         for vis in &rig.visuals {
-            if let Some(iso) = measured_transforms.get(&vis.link_name) {
+            if let Some(iso) = world_transforms.get(&vis.link_name) {
                 let world = iso * vis.local_offset;
                 let volume = match vis.shape {
                     VisualShape::Box(s) => PickVolume::BoxHalf([
@@ -398,7 +426,7 @@ impl HumanoidViewport {
                                     });
                                 }
                             } else if let Some((pivot, axis)) =
-                                rig.joint_world_pivot_and_axis(hit_joint, &measured_transforms)
+                                rig.joint_world_pivot_and_axis(hit_joint, &world_transforms)
                             {
                                 let (ray_o, ray_d) = self.pointer_ray(ptr, rect);
                                 let start_dir = intersect_ray_plane(ray_o, ray_d, pivot, axis)
@@ -530,10 +558,16 @@ impl HumanoidViewport {
                                 if let Some(world_target) =
                                     intersect_ray_plane(ray_o, ray_d, *plane_point, *plane_normal)
                                 {
+                                    // The IK solver works in un-translated body space.
+                                    let body_target = Point3::new(
+                                        world_target.x - world_offset[0],
+                                        world_target.y - world_offset[1],
+                                        world_target.z - world_offset[2],
+                                    );
                                     if let Some(solved) = rig.solve_limb_ik_with_yaw(
                                         link_name,
                                         target_rad,
-                                        world_target,
+                                        body_target,
                                         eff_pitch_rad,
                                         eff_roll_rad,
                                         eff_yaw_rad,
@@ -595,6 +629,7 @@ impl HumanoidViewport {
             time_sec: ui.ctx().input(|i| i.time),
             orbit: self.orbit.clone(),
             marker_radius,
+            world_offset,
         };
 
         let viewport_id = self.viewport_id;
@@ -694,7 +729,7 @@ impl HumanoidViewport {
                 &overlay_painter,
                 rect,
                 rig,
-                &measured_transforms,
+                &world_transforms,
                 measured_rad,
                 target_rad,
                 calibration,

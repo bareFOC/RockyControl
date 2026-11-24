@@ -8,5 +8,8 @@ license.workspace = true
 rk-proto.workspace = true
 rk-control.workspace = true
 rk-fw-core.workspace = true
+rk-harness.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+embassy-executor = { version = "0.10.0", default-features = false }
+embassy-time = { version = "0.5.1", features = ["mock-driver", "generic-queue-8"] }

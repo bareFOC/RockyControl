@@ -41,15 +41,14 @@ use embassy_rp::peripherals::{USB, WATCHDOG};
 use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbInterruptHandler};
 use embassy_rp::watchdog::Watchdog;
 use embassy_time::{Duration, Instant, Ticker};
-use rk_control::JointCalibration;
-use rk_fw_core::config::{
-    CONTROL_DT_SEC, CONTROL_PERIOD_MS, DEFAULT_JOINT_COUNT, HW_WATCHDOG_TIMEOUT_MS,
-};
-use rk_fw_core::copper::{ControlTask, current_led_mode};
+use rk_control::{RawServoCommand, RawServoFeedback};
+use rk_fw_core::config::{CONTROL_PERIOD_MS, HW_WATCHDOG_TIMEOUT_MS};
+use rk_fw_core::control_task::{RobotIo, control_task as shared_control_task};
+use rk_fw_core::copper::current_led_mode;
 use rk_fw_core::imu::IMU_SLOT;
 use rk_fw_core::servo_bus::SERVO_BUS_SLOT;
 use rk_fw_core::transport::HOST_LINK_MAILBOX;
-use rk_proto::MAX_JOINTS;
+use rk_proto::{HostToMcu, McuToHost};
 use panic_probe as _;
 
 // The high-rate LSM6DSV (SPI1) and legacy BNO055 (I2C0) IMUs are mutually
@@ -84,63 +83,95 @@ compile_error!(
 #[cfg(not(any(feature = "usb-cdc", feature = "usb-net")))]
 compile_error!("Enable one wired transport feature: `usb-cdc` or `usb-net`.");
 
-/// Deterministic 200 Hz control loop: reads the latest host command and servo/IMU
-/// feedback snapshot, steps `ControlTask`, publishes the servo command and host
-/// telemetry, drives the safety LED, and feeds the hardware watchdog only after a
-/// clean iteration.
-#[embassy_executor::task]
-async fn control_task(mut led: Output<'static>, watchdog: Peri<'static, WATCHDOG>) -> ! {
-    let mut ticker = Ticker::every(Duration::from_millis(CONTROL_PERIOD_MS));
+/// Board I/O adapter for the shared, runtime-agnostic control task.
+///
+/// All timing comes from Embassy (`Ticker` + `Instant`); all data comes from the
+/// existing global mailboxes and servo-bus hooks. The shared kernel is constructed
+/// by `rk_fw_core::control_task::control_task` with the crate-default 21 joints and
+/// identity calibration (the historical board configuration).
+struct HardwareRobotIo {
+    ticker: Ticker,
+    led: Output<'static>,
+    watchdog: Watchdog,
+    wd_timeout: Duration,
+}
 
-    // Identity calibration: board-specific zero offsets/inversions are normally
-    // loaded from the flash model store at bring-up; default to unity here.
-    let calibration = [JointCalibration::default(); MAX_JOINTS];
-    let mut control = ControlTask::new(DEFAULT_JOINT_COUNT, &calibration);
+impl RobotIo for HardwareRobotIo {
+    async fn wait_tick(&mut self) {
+        self.ticker.next().await;
+    }
 
-    let mut hw_watchdog = Watchdog::new(watchdog);
-    let wd_timeout = Duration::from_millis(HW_WATCHDOG_TIMEOUT_MS);
-    hw_watchdog.start(wd_timeout);
+    fn now_ms(&self) -> u32 {
+        Instant::now().as_millis() as u32
+    }
 
-    info!("Embassy control runtime started @ 200 Hz (5 ms period) in Teach mode");
+    fn take_cmd(&mut self) -> Option<HostToMcu> {
+        // Latest-wins host command; wire errors are read explicitly below and
+        // passed into the pure control step (no hidden global mailbox read).
+        HOST_LINK_MAILBOX.take_rx_cmd()
+    }
 
-    loop {
-        ticker.next().await;
+    fn wire_error_counts(&self) -> (u16, u16) {
+        HOST_LINK_MAILBOX.wire_error_counts()
+    }
 
-        let now_ms = Instant::now().as_millis() as u32;
-
-        // Latest-wins host command. Read the transport wire error counters explicitly
-        // and pass them into the pure control step (no hidden global mailbox read).
-        let cmd = HOST_LINK_MAILBOX.take_rx_cmd();
-        let wire_errors = HOST_LINK_MAILBOX.wire_error_counts();
-
+    fn read_feedback(&mut self, dt_sec: f32) -> RawServoFeedback {
         // Servo feedback from the active bus. Merge the hardware IMU snapshot into
         // the feedback exactly as the old `ServoBusBridge` did (the I3C adapter also
         // does this internally, so re-merging is idempotent for that bus).
-        let mut fb = SERVO_BUS_SLOT.read_feedback(CONTROL_DT_SEC);
+        let mut fb = SERVO_BUS_SLOT.read_feedback(dt_sec);
         if let Some(hw_imu) = IMU_SLOT.latest() {
             fb.imu = hw_imu;
             fb.imu_source_mask = IMU_SLOT.latest_source_mask();
         }
+        fb
+    }
 
-        let step = control.step(now_ms, CONTROL_DT_SEC, cmd.as_ref(), &fb, wire_errors);
+    fn write_command(&mut self, cmd: &RawServoCommand) {
+        SERVO_BUS_SLOT.write_command(cmd);
+    }
 
-        // Fan the atomic step output out to the servo bus (write phase) and the
-        // host link (telemetry TX mailbox).
-        SERVO_BUS_SLOT.write_command(&step.servo_cmd);
-        HOST_LINK_MAILBOX.publish_tx_telem(step.telemetry);
+    fn publish_telemetry(&mut self, telem: McuToHost) {
+        HOST_LINK_MAILBOX.publish_tx_telem(telem);
+    }
 
+    fn post_tick(&mut self, now_ms: u32) {
         // Physical safety mode LED.
         let led_mode = current_led_mode();
         if led_mode.is_lit(now_ms) {
-            led.set_high();
+            self.led.set_high();
         } else {
-            led.set_low();
+            self.led.set_low();
         }
 
         // Feed hardware watchdog only after a clean control cycle. A panic or
         // stall before this point leaves the watchdog to force a safe reset.
-        hw_watchdog.feed(wd_timeout);
+        self.watchdog.feed(self.wd_timeout);
     }
+}
+
+/// Thin board wrapper around the shared 200 Hz control loop.
+///
+/// The control logic (kernel stepping, dt, tick fan-out) lives exclusively in
+/// `rk_fw_core::control_task::control_task`, so firmware and simulation execute
+/// the exact same code path. This task only supplies the board I/O adapter and
+/// starts the watchdog.
+#[embassy_executor::task]
+async fn control_task(led: Output<'static>, watchdog: Peri<'static, WATCHDOG>) {
+    let wd_timeout = Duration::from_millis(HW_WATCHDOG_TIMEOUT_MS);
+    let mut hw_watchdog = Watchdog::new(watchdog);
+    hw_watchdog.start(wd_timeout);
+
+    let io = HardwareRobotIo {
+        ticker: Ticker::every(Duration::from_millis(CONTROL_PERIOD_MS)),
+        led,
+        watchdog: hw_watchdog,
+        wd_timeout,
+    };
+
+    info!("Embassy control runtime started @ 200 Hz (5 ms period) in Teach mode");
+
+    shared_control_task(io).await;
 }
 
 #[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]

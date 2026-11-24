@@ -725,6 +725,7 @@ impl RockyStudioApp {
                     fall_event_active: self.fall_event_active
                         || (telem.faults.contains(FaultFlags::TILT_FALL_CUTOFF)
                             && telem.imu.available),
+                    world_offset: telem.world_offset(),
                 };
                 let _ = self.viewport.show(
                     &mut child,

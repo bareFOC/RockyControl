@@ -40,6 +40,14 @@ use web_time::Instant;
 
 const TELEMETRY_HISTORY_LEN: usize = 180;
 const CMD_ESTOP: &str = "safety.estop";
+
+/// Fixed control period of the shared Embassy task (5 ms / 200 Hz).
+const CONTROL_STEP_SEC: f32 = rk_fw_core::config::CONTROL_DT_SEC;
+/// Bounded catch-up: at most this many fixed ticks are executed in one frame.
+const MAX_CONTROL_STEPS_PER_FRAME: usize = 4;
+/// Upper bound on buffered frame time (~10 ticks); excess is dropped so a long
+/// stall (tab backgrounded, debugger pause) cannot trigger a catch-up spiral.
+const MAX_CONTROL_ACCUM_SEC: f32 = 0.05;
 /// Sustained low-angular-rate settle dwell required after a fall before recovery starts.
 const RECOVERY_STABLE_DWELL_SEC: f32 = 0.45;
 /// Maximum pitch/roll angular rate (rad/s) considered settled on the floor or upright.
@@ -209,6 +217,12 @@ pub struct RockyStudioApp {
     theme_applied: bool,
     last_frame: Instant,
     pub(crate) last_dt_sec: f32,
+    /// Unconsumed real frame time awaiting conversion to fixed 5 ms control ticks.
+    sim_control_accum_sec: f32,
+    /// Achieved control ticks per wall second, reported by the sim transport.
+    pub(crate) control_rate_hz: f32,
+    /// True when the bounded catch-up cap dropped ticks in the latest frame.
+    pub(crate) sim_catchup_cap_hit: bool,
     sim_time_sec: f64,
     pub(crate) history: VecDeque<TelemetryPoint>,
     gilrs: Option<gilrs::Gilrs>,
@@ -221,6 +235,8 @@ pub struct RockyStudioApp {
     pub(crate) pad_vy: f32,
     pub(crate) pad_yaw: f32,
     pub(crate) replay_result: Option<ReplayVerification>,
+    /// Serialized stopped replay log, ready for platform export (download on WASM).
+    pub(crate) copper_export_json: Option<String>,
     calibration_import_buf: String,
     pub(crate) show_import_dialog: bool,
     pub(crate) paste_urdf_buf: String,
@@ -287,6 +303,9 @@ impl RockyStudioApp {
             theme_applied: false,
             last_frame: Instant::now(),
             last_dt_sec: 0.016,
+            sim_control_accum_sec: 0.0,
+            control_rate_hz: 200.0,
+            sim_catchup_cap_hit: false,
             sim_time_sec: 0.0,
             history: VecDeque::with_capacity(TELEMETRY_HISTORY_LEN + 4),
             gilrs,
@@ -299,6 +318,7 @@ impl RockyStudioApp {
             pad_vy: 0.0,
             pad_yaw: 0.0,
             replay_result: None,
+            copper_export_json: None,
             calibration_import_buf: String::new(),
             show_import_dialog: false,
             paste_urdf_buf: String::new(),
@@ -342,12 +362,15 @@ impl RockyStudioApp {
                 }
                 self.transport = Box::new(sim);
                 self.connected = true;
+                self.sim_control_accum_sec = 0.0;
+                self.sim_catchup_cap_hit = false;
                 self.query_mcu_model_info();
-                // Prime one telemetry frame so Dashboard stats immediately populate
+                // Prime one fixed telemetry frame so Dashboard stats immediately populate
                 let pkt = self.model.build_next_host_packet(0.01);
-                if let Some(telem) = self.transport.step_exchange(0.01, &pkt) {
+                if let Some(telem) = self.transport.step_fixed(1, &pkt, CONTROL_STEP_SEC) {
                     self.model.ingest_telemetry(telem);
                 }
+                self.control_rate_hz = self.transport.stats().packet_rate_hz;
                 self.viewport.fit_to_rig(&self.model.rig);
                 self.model.status_message =
                     "Connected to Simulated Rocky MCU Twin in safe Teach mode.".to_string();
@@ -620,7 +643,8 @@ impl RockyStudioApp {
 
         // 3. Advance real-time control loop, keyboard WASD, gamepad, and MCU pull only while connected
         let now = Instant::now();
-        let dt_sec = now.duration_since(self.last_frame).as_secs_f32().clamp(0.004, 0.05);
+        let raw_dt_sec = now.duration_since(self.last_frame).as_secs_f32();
+        let dt_sec = raw_dt_sec.clamp(0.004, 0.05);
         self.last_frame = now;
         self.last_dt_sec = dt_sec;
 
@@ -629,14 +653,34 @@ impl RockyStudioApp {
             self.poll_gamepad();
             self.update_walk_command_from_inputs(&ctx, typing);
 
+            // Fixed-step accumulator: convert real frame time into whole 5 ms
+            // control ticks, run at most MAX_CONTROL_STEPS_PER_FRAME of them,
+            // and keep the remainder for the next frame. The cap means a slow
+            // frame slows simulated time rather than corrupting determinism.
+            // Use the unclamped (but upper-bounded) frame time here: clamping a
+            // very fast frame up to 4 ms would drive the sim faster than real time.
+            self.sim_control_accum_sec = (self.sim_control_accum_sec
+                + raw_dt_sec.min(MAX_CONTROL_ACCUM_SEC))
+            .min(MAX_CONTROL_ACCUM_SEC);
+            let available_steps = (self.sim_control_accum_sec / CONTROL_STEP_SEC) as usize;
+            let steps = available_steps.min(MAX_CONTROL_STEPS_PER_FRAME);
+            self.sim_control_accum_sec -= steps as f32 * CONTROL_STEP_SEC;
+            self.sim_catchup_cap_hit = available_steps > steps;
+
             self.sim_time_sec += dt_sec as f64;
+            // Host command/UI state is sampled exactly once per rendered frame;
+            // the transport repeats it across the fixed ticks of this frame.
             let host_pkt = self.model.build_next_host_packet(dt_sec);
-            if let Some(telem) = self.transport.step_exchange(dt_sec, &host_pkt) {
-                self.model.ingest_telemetry(telem);
-                if self.model.is_estop_active() {
-                    self.mcp.on_estop_disarm();
+            if steps > 0 {
+                if let Some(telem) = self.transport.step_fixed(steps, &host_pkt, dt_sec) {
+                    self.model.ingest_telemetry(telem);
+                    if self.model.is_estop_active() {
+                        self.mcp.on_estop_disarm();
+                    }
                 }
             }
+            // Achieved control rate (ticks/wall-second), not render FPS.
+            self.control_rate_hz = self.transport.stats().packet_rate_hz;
             // Advance the consent-gated, multi-frame fall recovery sequence only after
             // fresh telemetry has been ingested so every safety gate is observed.
             self.update_fall_watcher(dt_sec);
@@ -659,6 +703,8 @@ impl RockyStudioApp {
                 self.history.pop_front();
             }
         } else {
+            self.sim_control_accum_sec = 0.0;
+            self.sim_catchup_cap_hit = false;
             self.sim_time_sec += dt_sec as f64;
             self.active_screen = AppScreen::Dashboard;
         }
@@ -697,6 +743,25 @@ impl RockyStudioApp {
                             .size(11.5)
                             .color(Color32::from_rgb(168, 184, 205)),
                     );
+                    // Honest control-rate indicator: achieved fixed ticks per
+                    // second, with an explicit warning when catch-up is capped.
+                    if self.connected && viewport_size.x >= 560.0 {
+                        let shortfall = self.sim_catchup_cap_hit || self.control_rate_hz < 190.0;
+                        let color = if shortfall {
+                            Color32::from_rgb(251, 191, 36)
+                        } else {
+                            Color32::from_rgb(74, 222, 128)
+                        };
+                        let text = if self.sim_catchup_cap_hit {
+                            format!(
+                                "CTRL {:.0} Hz  ·  CATCH-UP CAP (frames < 200 Hz)",
+                                self.control_rate_hz
+                            )
+                        } else {
+                            format!("CTRL {:.0} Hz", self.control_rate_hz)
+                        };
+                        ui.label(RichText::new(text).size(11.0).color(color));
+                    }
                     if viewport_size.x >= 720.0 {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let screen_tag = match self.active_screen {

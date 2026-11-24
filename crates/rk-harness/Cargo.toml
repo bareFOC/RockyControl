@@ -1,0 +1,16 @@
+[package]
+name = "rk-harness"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Deterministic Embassy executor harness for native and WASM simulation"
+
+[dependencies]
+# No platform feature on purpose: the harness drives the raw executor by hand.
+embassy-executor = { version = "0.10.0", default-features = false }
+# mock-driver forces tick-hz-1_000_000 (5 ms == 5000 ticks). Kept in this
+# host/WASM-only crate; the MCU firmware workspace has its own time driver.
+embassy-time = { version = "0.5.1", features = ["mock-driver", "generic-queue-8"] }
+# Provides the critical-section impl on both native and wasm32-unknown-unknown.
+critical-section = { version = "1.2", features = ["std"] }
+static_cell = "2"

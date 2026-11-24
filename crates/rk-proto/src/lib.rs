@@ -19,7 +19,9 @@ pub const MAX_COBS_FRAME_BYTES: usize = 1024;
 /// running telemetry fields on [`BalanceTelemetry`].
 /// v5 adds the combat impact flag/magnitude on [`BalanceTelemetry`] and the
 /// matching `estimator_valid::IMPACT` validity bit.
-pub const PROTOCOL_VERSION: u16 = 5;
+/// v6 adds the plant-derived world-frame position/velocity on [`BalanceTelemetry`]
+/// and the matching `estimator_valid::WORLD` validity bit (viewport + gait HUD).
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MODEL_CHUNK_BYTES: usize = 256;
 pub const MAX_MODEL_NAME_BYTES: usize = 32;
 pub const MAX_MODEL_COBS_FRAME_BYTES: usize = 384;
@@ -74,6 +76,11 @@ pub mod estimator_valid {
     /// bit is set. Published on both hardware paths (momentum observer on
     /// torque-capable builds, current-spike heuristic on v1).
     pub const IMPACT: u32 = 1 << 7;
+    /// Plant-derived world-frame locomotion channels (`BalanceTelemetry::world_pos_m`,
+    /// `BalanceTelemetry::world_vel_m_s`) are meaningful only when this bit is set.
+    /// Hardware that has no world estimate leaves it clear; the viewport then keeps
+    /// the robot at the origin instead of snapping to an unmeasured position.
+    pub const WORLD: u32 = 1 << 8;
 }
 
 #[repr(u8)]
@@ -518,6 +525,14 @@ pub struct BalanceTelemetry {
     /// current jump divided by the configured mA-per-N·m factor (pseudo-torque).
     /// Valid only when `EstimatorTelemetry.valid_mask & estimator_valid::IMPACT != 0`.
     pub impact_magnitude_nm: f32,
+    /// Plant-derived CoM position in the ground frame `[x, y, z]` in metres
+    /// (`x` = lateral/right, `y` = height, `z` = forward). This is a *world*
+    /// position, unlike `EstimatorTelemetry::com_pos_m` which is support-relative.
+    /// Valid only when `valid_mask & estimator_valid::WORLD != 0`.
+    pub world_pos_m: [f32; 3],
+    /// Plant-derived CoM velocity in the ground frame `[vx, vy, vz]` in m/s.
+    /// Valid only when `valid_mask & estimator_valid::WORLD != 0`.
+    pub world_vel_m_s: [f32; 3],
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
@@ -672,6 +687,23 @@ impl Default for McuToHost {
             rx_version_mismatches: 0,
             i3c_timeout_count: 0,
         }
+    }
+}
+
+impl McuToHost {
+    /// Ground-plane root translation `[x, y, z]` for the 3D viewport.
+    ///
+    /// `BalanceTelemetry::world_pos_m` is a CoM position whose `y` includes the
+    /// nominal CoM height; translating the rendered rig by that value would lift
+    /// it off the floor. Only the ground-plane `x`/`z` components are used.
+    /// Returns zeros until the producer sets `estimator_valid::WORLD`, so
+    /// hardware without a world estimate keeps the robot at the origin.
+    pub fn world_offset(&self) -> [f32; 3] {
+        if self.estimator.valid_mask & estimator_valid::WORLD == 0 {
+            return [0.0; 3];
+        }
+        let p = self.balance.world_pos_m;
+        [p[0], 0.0, p[2]]
     }
 }
 
@@ -1134,6 +1166,8 @@ pub fn decode_mcu_cobs(buf: &mut [u8]) -> Result<McuToHost, CodecError> {
         || !est.foot_margin_m.is_finite()
         || !est.grf_left_n.is_finite()
         || !est.grf_right_n.is_finite()
+        || pkt.balance.world_pos_m.iter().any(|v| !v.is_finite())
+        || pkt.balance.world_vel_m_s.iter().any(|v| !v.is_finite())
     {
         return Err(CodecError::NonFiniteFloat);
     }
@@ -1256,6 +1290,8 @@ mod tests {
                 running_com_height_m: 0.0,
                 impact_detected: false,
                 impact_magnitude_nm: 0.0,
+                world_pos_m: [0.02, 0.24, 1.10],
+                world_vel_m_s: [0.0, 0.0, 0.18],
             },
             estimator: EstimatorTelemetry {
                 com_pos_m: [0.004, 0.245, 0.011],
@@ -1367,7 +1403,7 @@ mod tests {
 
     #[test]
     fn running_config_wire_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 5, "impact telemetry requires wire v5");
+        assert!(PROTOCOL_VERSION >= 6, "world telemetry requires wire v6+");
 
         let mut running = RunningConfig::default();
         assert!(running.all_finite());
@@ -1479,7 +1515,7 @@ mod tests {
 
     #[test]
     fn impact_telemetry_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 5, "impact telemetry requires wire v5");
+        assert!(PROTOCOL_VERSION >= 6, "world telemetry requires wire v6+");
         let mut pkt = McuToHost::default();
         pkt.balance.impact_detected = true;
         pkt.balance.impact_magnitude_nm = 0.275;
@@ -1500,6 +1536,53 @@ mod tests {
         bad.balance.impact_magnitude_nm = f32::NAN;
         let len = encode_cobs(&bad, &mut wire)
             .expect("encode bad impact telem")
+            .len();
+        assert_eq!(
+            decode_mcu_cobs(&mut wire[..len]).unwrap_err(),
+            CodecError::NonFiniteFloat
+        );
+    }
+
+    #[test]
+    fn world_telemetry_round_trip_and_viewport_offset() {
+        assert_eq!(PROTOCOL_VERSION, 6, "world telemetry requires wire v6");
+
+        let mut pkt = McuToHost::default();
+        // Without the validity bit the viewport must not move, even if a stale
+        // non-zero position is present on the wire.
+        pkt.balance.world_pos_m = [0.12, 0.25, 1.75];
+        assert_eq!(pkt.world_offset(), [0.0; 3], "invalid WORLD channel is ignored");
+
+        pkt.balance.world_pos_m = [0.12, 0.25, 1.75];
+        pkt.balance.world_vel_m_s = [0.01, 0.0, 0.22];
+        pkt.estimator.valid_mask |= estimator_valid::WORLD;
+
+        let mut wire = [0u8; MAX_COBS_FRAME_BYTES];
+        let len = encode_cobs(&pkt, &mut wire)
+            .expect("encode world telem")
+            .len();
+        assert!(len < MAX_COBS_FRAME_BYTES);
+        let decoded = decode_mcu_cobs(&mut wire[..len]).expect("decode world telem");
+        assert_eq!(decoded, pkt);
+        assert!((decoded.balance.world_pos_m[2] - 1.75).abs() < 1e-6);
+        assert!((decoded.balance.world_vel_m_s[2] - 0.22).abs() < 1e-6);
+        // Ground-plane offset only: the CoM height must not lift the rendered rig.
+        assert_eq!(decoded.world_offset(), [0.12, 0.0, 1.75]);
+
+        let mut bad = pkt;
+        bad.balance.world_pos_m[1] = f32::NAN;
+        let len = encode_cobs(&bad, &mut wire)
+            .expect("encode bad world telem")
+            .len();
+        assert_eq!(
+            decode_mcu_cobs(&mut wire[..len]).unwrap_err(),
+            CodecError::NonFiniteFloat
+        );
+
+        let mut bad_vel = pkt;
+        bad_vel.balance.world_vel_m_s[0] = f32::INFINITY;
+        let len = encode_cobs(&bad_vel, &mut wire)
+            .expect("encode bad world vel")
             .len();
         assert_eq!(
             decode_mcu_cobs(&mut wire[..len]).unwrap_err(),
