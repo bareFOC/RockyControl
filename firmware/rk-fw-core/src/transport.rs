@@ -23,6 +23,8 @@ pub struct CobsStreamFramer {
     overflowed: bool,
     pub rx_ok: u32,
     pub rx_err: u32,
+    pub rx_crc_errors: u16,
+    pub rx_version_mismatches: u16,
 }
 
 impl Default for CobsStreamFramer {
@@ -39,11 +41,28 @@ impl CobsStreamFramer {
             overflowed: false,
             rx_ok: 0,
             rx_err: 0,
+            rx_crc_errors: 0,
+            rx_version_mismatches: 0,
         }
     }
 
     /// Feeds raw bytes from USB CDC-ACM. Calls `on_packet` for every complete, valid `HostToMcu`.
+    /// Silently drops malformed/CRC-corrupted frames and increments diagnostics counters.
     pub fn push_bytes<F: FnMut(HostToMcu)>(&mut self, chunk: &[u8], mut on_packet: F) {
+        self.push_bytes_with_error(chunk, |pkt| on_packet(pkt), |_| {});
+    }
+
+    /// Feeds raw bytes from USB CDC-ACM with an error callback so transport tasks can forward
+    /// `CodecError::CrcMismatch` / `VersionMismatch` into [`HOST_LINK_MAILBOX`].
+    pub fn push_bytes_with_error<F, E>(
+        &mut self,
+        chunk: &[u8],
+        mut on_packet: F,
+        mut on_error: E,
+    ) where
+        F: FnMut(HostToMcu),
+        E: FnMut(CodecError),
+    {
         for &byte in chunk {
             if byte == 0x00 {
                 if self.overflowed {
@@ -51,6 +70,7 @@ impl CobsStreamFramer {
                     self.overflowed = false;
                     self.len = 0;
                     self.rx_err = self.rx_err.saturating_add(1);
+                    on_error(CodecError::DecodeFailed);
                     continue;
                 }
                 if self.len == 0 {
@@ -65,12 +85,24 @@ impl CobsStreamFramer {
                             self.rx_ok = self.rx_ok.saturating_add(1);
                             on_packet(pkt);
                         }
-                        Err(_) => {
+                        Err(err) => {
                             self.rx_err = self.rx_err.saturating_add(1);
+                            match err {
+                                CodecError::CrcMismatch => {
+                                    self.rx_crc_errors = self.rx_crc_errors.saturating_add(1);
+                                }
+                                CodecError::VersionMismatch => {
+                                    self.rx_version_mismatches =
+                                        self.rx_version_mismatches.saturating_add(1);
+                                }
+                                _ => {}
+                            }
+                            on_error(err);
                         }
                     }
                 } else {
                     self.rx_err = self.rx_err.saturating_add(1);
+                    on_error(CodecError::DecodeFailed);
                 }
                 self.len = 0;
             } else if !self.overflowed {
@@ -111,6 +143,8 @@ struct MailboxInner {
     rx_packets: u32,
     tx_packets: u32,
     rx_errors: u32,
+    rx_crc_errors: u16,
+    rx_version_mismatches: u16,
 }
 
 impl MailboxInner {
@@ -121,6 +155,8 @@ impl MailboxInner {
             rx_packets: 0,
             tx_packets: 0,
             rx_errors: 0,
+            rx_crc_errors: 0,
+            rx_version_mismatches: 0,
         }
     }
 }
@@ -152,12 +188,34 @@ impl HostLinkMailbox {
         });
     }
 
-    /// Records a malformed frame error from the transport layer.
+    /// Records a generic malformed frame error from the transport layer.
     pub fn record_rx_error(&self) {
+        self.record_rx_codec_error(CodecError::DecodeFailed);
+    }
+
+    /// Records a typed wire codec error (CRC-32 mismatch, version mismatch, or framing error).
+    pub fn record_rx_codec_error(&self, err: CodecError) {
         critical_section::with(|cs| {
             let mut m = self.inner.borrow_ref_mut(cs);
             m.rx_errors = m.rx_errors.saturating_add(1);
+            match err {
+                CodecError::CrcMismatch => {
+                    m.rx_crc_errors = m.rx_crc_errors.saturating_add(1);
+                }
+                CodecError::VersionMismatch => {
+                    m.rx_version_mismatches = m.rx_version_mismatches.saturating_add(1);
+                }
+                _ => {}
+            }
         });
+    }
+
+    /// Returns `(rx_crc_errors, rx_version_mismatches)` for `DirectServoKernel` telemetry.
+    pub fn wire_error_counts(&self) -> (u16, u16) {
+        critical_section::with(|cs| {
+            let m = self.inner.borrow_ref(cs);
+            (m.rx_crc_errors, m.rx_version_mismatches)
+        })
     }
 
     /// Called by `copper-rs` `HostLinkBridge::receive` once per control tick.

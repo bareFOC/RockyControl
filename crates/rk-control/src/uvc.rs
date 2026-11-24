@@ -14,6 +14,8 @@ use core::f32::consts::PI;
 use libm::{acosf, asinf, atan2f, cosf, sinf, sqrtf};
 use rk_proto::{BalanceGains, ImuState, WalkCmd, classify_fall, fall_orientation, uvc_phase};
 
+use crate::estimator::DcmSwingHint;
+
 /// Reference tick duration of ai2001 `main.c` (`10 ms` = 100 Hz).
 const REF_TICK_SEC: f32 = 0.010_f32;
 /// Duration of protective servo tuck pose before torque drop (`40 ms`).
@@ -322,6 +324,21 @@ impl UvcController {
         self.phase
     }
 
+    /// Foot contact bitmask (`bit 0 = Right stance`, `bit 1 = Left stance`) for air-gating CoM velocity.
+    pub const fn contact_mask(&self) -> u8 {
+        match self.phase {
+            UvcPhase::FallTuck => 0b00,
+            UvcPhase::ActiveCatchStep | UvcPhase::ReturnToNeutral => {
+                if self.support_foot == 0 {
+                    0b01
+                } else {
+                    0b10
+                }
+            }
+            _ => 0b11,
+        }
+    }
+
     /// Resets UVC state cleanly on `Teach`, `EStop`, or `ClearFaults`.
     pub fn reset(&mut self) {
         self.phase = UvcPhase::Idle;
@@ -343,13 +360,28 @@ impl UvcController {
         self.initialized = false;
     }
 
-    /// Executes one deterministic `#![no_std]` UVC control cycle.
+    /// Executes one deterministic `#![no_std]` UVC control cycle without external DCM modulation.
     pub fn step(
         &mut self,
         dt: f32,
         imu: ImuState,
         walk: WalkCmd,
         gains: BalanceGains,
+    ) -> UvcStepOutput {
+        self.step_with_dcm(dt, imu, walk, gains, DcmSwingHint::default())
+    }
+
+    /// Executes one deterministic `#![no_std]` UVC control cycle with P1a strict DOF partitioning:
+    /// - Stance torso verticality -> UVC I-only (`dxi`/`dyi` spherical integration).
+    /// - High-frequency vibration damping -> decoupled ankle rate-gyro P-term.
+    /// - Capturability / stepping -> `dcm` modulates swing-foot landing (`dxis`/`dyis`) ONLY.
+    pub fn step_with_dcm(
+        &mut self,
+        dt: f32,
+        imu: ImuState,
+        walk: WalkCmd,
+        gains: BalanceGains,
+        dcm: DcmSwingHint,
     ) -> UvcStepOutput {
         let dt = dt.clamp(0.0005_f32, 0.05_f32);
         let tick_scale = dt / REF_TICK_SEC;
@@ -420,8 +452,9 @@ impl UvcController {
         let yaw_cmd = walk.yaw_rate.clamp(-1.0_f32, 1.0_f32);
         let walk_vel_mag = sqrtf(vx * vx + vy * vy + yaw_cmd * yaw_cmd);
         let wants_walk = walk.walk_enabled && walk_vel_mag > 0.04_f32;
+        let dcm_step_trigger = walk.balance_enabled && dcm.margin_breached;
         let tilt_trigger = walk.balance_enabled
-            && (roll_eff.abs() > 0.001_f32 || pitch_eff.abs() > 0.004_f32);
+            && (roll_eff.abs() > 0.001_f32 || pitch_eff.abs() > 0.004_f32 || dcm_step_trigger);
 
         let step_h_scale = walk.step_height.clamp(0.1_f32, 1.0_f32);
         let cadence = walk.cadence_hz.clamp(0.6_f32, 2.8_f32);
@@ -515,17 +548,9 @@ impl UvcController {
                     PI + progress * PI
                 };
 
-                // Core ai2001 geometric spherical UVC projection with Capture-Point rate lead
+                // Core ai2001 geometric spherical UVC projection (strictly I-only on stance torso)
                 if walk.balance_enabled {
-                    self.integrate_uvc_spherical(
-                        pitch_eff,
-                        roll_eff,
-                        imu.pitch_rate_rad_s,
-                        imu.roll_rate_rad_s,
-                        gains,
-                        tick_scale,
-                        dt,
-                    );
+                    self.integrate_uvc_spherical(pitch_eff, roll_eff, gains, tick_scale, dt);
                 }
 
                 // Superpose commanded walking stride (`WalkCmd`) onto UVC foot landing target
@@ -540,9 +565,13 @@ impl UvcController {
                         .clamp(0.0_f32, self.geom.max_dy);
                 }
 
-                // Mirror swing foot (`uvcSub()`) with anti-collision guard
-                self.dxis = (-self.dxi).clamp(-self.geom.max_swing_dx, self.geom.max_swing_dx);
-                self.dyis = self.dyi.clamp(0.0_f32, self.geom.max_swing_dy);
+                // Mirror swing foot (`uvcSub()`) + Kinematic DCM swing-foot placement modulation ONLY
+                // (never double-drives the stance hip integrator `dxi`/`dyi`).
+                let swing_lat_sign = if self.support_foot == 0 { -1.0_f32 } else { 1.0_f32 };
+                let dcm_swing_y = (dcm.swing_dy_m * swing_lat_sign).max(0.0_f32);
+                self.dxis = (-self.dxi + dcm.swing_dx_m)
+                    .clamp(-self.geom.max_swing_dx, self.geom.max_swing_dx);
+                self.dyis = (self.dyi + dcm_swing_y).clamp(0.0_f32, self.geom.max_swing_dy);
                 let anti_collide = self.dyi + self.dyis;
                 if anti_collide < 0.0_f32 {
                     self.dyis -= anti_collide;
@@ -685,16 +714,12 @@ impl UvcController {
             )
         };
 
-        // 6. Direct ankle gyro rate damping + micro-stance compliance (always active when balance_enabled)
+        // 6. Decoupled ankle rate-gyro P-term damping (strictly isolated from stance hip UVC I-term)
         let mut pitch_corr = 0.0_f32;
         let mut roll_corr = 0.0_f32;
         if walk.balance_enabled {
-            let damp_p = (-gains.gyro_damp_pitch * imu.pitch_rate_rad_s
-                - 0.22_f32 * raw_pitch)
-                .clamp(-0.35_f32, 0.35_f32);
-            let damp_r = (-gains.gyro_damp_roll * imu.roll_rate_rad_s
-                - 0.22_f32 * raw_roll)
-                .clamp(-0.30_f32, 0.30_f32);
+            let damp_p = (-gains.gyro_damp_pitch * imu.pitch_rate_rad_s).clamp(-0.35_f32, 0.35_f32);
+            let damp_r = (-gains.gyro_damp_roll * imu.roll_rate_rad_s).clamp(-0.30_f32, 0.30_f32);
 
             left_leg.ankle_pitch += damp_p;
             right_leg.ankle_pitch += damp_p;
@@ -745,15 +770,13 @@ impl UvcController {
         self.phase_elapsed_sec = 0.0;
     }
 
-    /// Core ai2001 spherical-projection UVC integration (`uvc()` in `main.c`) enhanced with
-    /// Capture-Point rate lead (`theta + k * theta_dot`) for deadbeat settling without overshoot.
-    #[allow(clippy::too_many_arguments)]
+    /// Core ai2001 spherical-projection UVC integration (`uvc()` in `main.c`) — strictly I-only
+    /// on stance torso tilt (`pitch_eff`, `roll_eff`) with anti-windup bleed so it never fights
+    /// the decoupled ankle rate-gyro P-term or DCM swing-foot placement.
     fn integrate_uvc_spherical(
         &mut self,
         pitch_eff: f32,
         roll_eff: f32,
-        pitch_rate: f32,
-        roll_rate: f32,
         gains: BalanceGains,
         tick_scale: f32,
         dt: f32,
@@ -761,24 +784,20 @@ impl UvcController {
         let g_p = gains.uvc_gain_pitch.clamp(0.0_f32, 1.5_f32);
         let g_r = gains.uvc_gain_roll.clamp(0.0_f32, 1.5_f32);
 
-        // Centering bleed prevents integrator windup and creates a smooth Capture-Point lag
-        let bleed = (1.0_f32 - 5.0_f32 * dt).clamp(0.70_f32, 1.0_f32);
+        // Anti-windup centering bleed prevents stance integrator runaway
+        let bleed = (1.0_f32 - 4.5_f32 * dt).clamp(0.70_f32, 1.0_f32);
         self.dxi *= bleed;
         self.dyi *= bleed;
 
-        // Capture-Point lead: arrests torso angular momentum without sagittal overshoot
-        let pitch_lead = pitch_eff + 0.30_f32 * pitch_rate;
-        let roll_lead = roll_eff + 0.26_f32 * roll_rate;
-
         // Positive roll_t grows `dyi` outward on the active support foot
         let signed_roll = if self.support_foot == 0 {
-            roll_lead
+            roll_eff
         } else {
-            -roll_lead
+            -roll_eff
         };
-        // Normalized to 10 ms ai2001 tick so BalanceGains::default() (0.25) gives deadbeat CoP tracking
-        let roll_t = (g_r * 0.22_f32 * signed_roll * tick_scale).clamp(-0.14_f32, 0.14_f32);
-        let pitch_t = (g_p * 0.22_f32 * pitch_lead * tick_scale).clamp(-0.14_f32, 0.14_f32);
+        // Strictly I-only attitude projection normalized to 10 ms ai2001 tick
+        let roll_t = (g_r * 0.28_f32 * signed_roll * tick_scale).clamp(-0.14_f32, 0.14_f32);
+        let pitch_t = (g_p * 0.28_f32 * pitch_eff * tick_scale).clamp(-0.14_f32, 0.14_f32);
 
         // Lateral spherical projection: rotate (dyi - sway, auto_h) by roll_t
         let h_safe = self.auto_h.max(self.geom.min_height);

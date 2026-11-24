@@ -24,6 +24,7 @@ struct ImuSnapshot {
     registered: bool,
     state: ImuState,
     health: ImuHealth,
+    source_mask: u32,
     sample_count: u32,
     last_update_ms: u32,
 }
@@ -49,6 +50,7 @@ impl ImuSlot {
                     gravity: [0.0, -9.81, 0.0],
                 },
                 health: ImuHealth::Uninitialized,
+                source_mask: 0,
                 sample_count: 0,
                 last_update_ms: 0,
             })),
@@ -57,6 +59,23 @@ impl ImuSlot {
 
     /// Marks a hardware IMU driver as attached and updates its latest sample.
     pub fn publish(&self, state: ImuState, health: ImuHealth, now_ms: u32) {
+        self.publish_with_source(
+            state,
+            health,
+            rk_proto::estimator_valid::LSM6DSV_OK,
+            now_ms,
+        );
+    }
+
+    /// Publishes an IMU sample tagged with its explicit hardware source bitmask
+    /// (`estimator_valid::LSM6DSV_OK` or `estimator_valid::BNO055_OK`).
+    pub fn publish_with_source(
+        &self,
+        state: ImuState,
+        health: ImuHealth,
+        source_mask: u32,
+        now_ms: u32,
+    ) {
         critical_section::with(|cs| {
             let mut slot = self.inner.borrow_ref_mut(cs);
             slot.registered = true;
@@ -70,6 +89,7 @@ impl ImuSlot {
                 && state.gravity.iter().all(|v| v.is_finite())
             {
                 slot.state = state;
+                slot.source_mask = source_mask;
                 slot.sample_count = slot.sample_count.saturating_add(1);
                 slot.last_update_ms = now_ms;
             }
@@ -94,6 +114,17 @@ impl ImuSlot {
                 Some(slot.state)
             } else {
                 None
+            }
+        })
+    }
+
+    pub fn latest_source_mask(&self) -> u32 {
+        critical_section::with(|cs| {
+            let slot = self.inner.borrow_ref(cs);
+            if slot.registered && slot.sample_count > 0 {
+                slot.source_mask
+            } else {
+                0
             }
         })
     }

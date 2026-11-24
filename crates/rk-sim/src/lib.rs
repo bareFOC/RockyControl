@@ -111,6 +111,7 @@ impl SimulatedServoPlant {
             last_cmd: RawServoCommand {
                 torque_mask: 0,
                 raw_target_rad: initial_raw_pose,
+                ..Default::default()
             },
             faults: SimFaultInjection::default(),
             torso_pitch_rad: 0.0,
@@ -218,10 +219,14 @@ impl SimulatedServoPlant {
 
                 if stalled {
                     self.velocity_rad_s[i] = 0.0;
-                    let spike = (2350.0_f32 + err.abs() * 900.0_f32).min(3400.0_f32) as u16;
+                    let torque_scale = (self.last_cmd.torque_nm[i].abs() / 1.8_f32).clamp(0.10, 1.0);
+                    let spike =
+                        ((2350.0_f32 + err.abs() * 900.0_f32) * torque_scale).min(3400.0_f32) as u16;
                     self.current_ma[i] = spike;
                 } else {
-                    let rate = 2.6_f32 + self.faults.servo_lag_factor * 42.0_f32;
+                    // Honor per-joint torque_nm saturation limit (software compliance & ukemi relaxation)
+                    let torque_scale = (self.last_cmd.torque_nm[i].abs() / 1.8_f32).clamp(0.08, 1.0);
+                    let rate = (2.6_f32 + self.faults.servo_lag_factor * 42.0_f32) * torque_scale;
                     let alpha = 1.0_f32 - (-rate * dt).exp();
                     let next_pos = pos + err * alpha;
                     let vel = (next_pos - pos) / dt;
@@ -229,8 +234,9 @@ impl SimulatedServoPlant {
                     self.velocity_rad_s[i] = vel;
                     self.virtual_hand_rad[i] = next_pos;
 
-                    let load = (95.0_f32 + err.abs() * 1450.0_f32 + vel.abs() * 160.0_f32)
-                        .min(2800.0_f32) as u16;
+                    let max_ma = (2800.0_f32 * torque_scale).max(260.0_f32);
+                    let load = (95.0_f32 + (err.abs() * 1450.0_f32 + vel.abs() * 160.0_f32) * torque_scale)
+                        .min(max_ma) as u16;
                     self.current_ma[i] = load;
                 }
             } else {
@@ -417,6 +423,7 @@ impl SimulatedServoPlant {
 
         RawServoFeedback {
             raw_angle_rad: self.raw_angle_rad,
+            velocity_rad_s: self.velocity_rad_s,
             current_ma: self.current_ma,
             temp_c,
             bus_voltage_mv,
@@ -434,6 +441,12 @@ impl SimulatedServoPlant {
                     yaw_rate_rad_s: self.roll_rate_rad_s * 0.06_f32,
                     gravity: gravity_from_tilt(self.torso_pitch_rad, self.torso_roll_rad),
                 }
+            },
+            i3c_timeout_count: if self.faults.servo_bus_error { 1 } else { 0 },
+            imu_source_mask: if self.faults.imu_disconnected {
+                0
+            } else {
+                rk_proto::estimator_valid::LSM6DSV_OK
             },
         }
     }
@@ -633,7 +646,11 @@ impl CopperSimRunner {
             }
         };
 
-        // 3. Execute real #![no_std] DirectServoTask
+        // 3. Forward bridge wire drop stats and execute real #![no_std] DirectServoTask
+        self.task.kernel_mut().set_wire_error_counts(
+            self.host_bridge.rx_crc_errors,
+            self.host_bridge.rx_version_mismatches,
+        );
         let (step_out, tick_record) = self.task.process(now_ms, dt, rx_cmd.as_ref(), &feedback);
 
         // 4. Write servo command & MCU balance telemetry to simulated servo/LIPM plant
@@ -687,8 +704,25 @@ impl CopperSimRunner {
         self.plant.set_recovery_progress(progress);
     }
 
-    /// Injects a malformed COBS byte stream to exercise silent drop + error counter increment.
+    /// Injects a valid COBS frame with a flipped payload bit to exercise pre-COBS CRC-32 drop counting.
     pub fn inject_corrupted_frame(&mut self) {
+        let mut wire = [0u8; MAX_COBS_FRAME_BYTES];
+        if let Ok(encoded) = encode_cobs(&HostToMcu::default(), &mut wire) {
+            let len = encoded.len();
+            if len > 8 {
+                let idx = len / 2;
+                wire[idx] ^= 0x01;
+                if wire[idx] == 0 {
+                    wire[idx] = 0x02;
+                }
+                let _ = self.host_bridge.decode_rx(&mut wire[..len]);
+                self.task.kernel_mut().set_wire_error_counts(
+                    self.host_bridge.rx_crc_errors,
+                    self.host_bridge.rx_version_mismatches,
+                );
+                return;
+            }
+        }
         let mut garbage = [0x05_u8, 0xFF, 0x00, 0x12, 0x00];
         let _ = self.host_bridge.decode_rx(&mut garbage);
     }
@@ -966,6 +1000,58 @@ mod tests {
             "recovery progress must lift torso upright (pitch={}, roll={})",
             last.imu.pitch_rad,
             last.imu.roll_rad
+        );
+    }
+
+    #[test]
+    fn compliance_scale_and_crc_injection_propagate_end_to_end() {
+        let cal = [JointCalibration {
+            min_rad: -2.2,
+            max_rad: 2.2,
+            ..Default::default()
+        }; 6];
+        let mut sim_stiff = CopperSimRunner::new(6, &cal, [0.0; MAX_JOINTS]);
+        let mut sim_soft = CopperSimRunner::new(6, &cal, [0.0; MAX_JOINTS]);
+
+        let mut soft_gains = rk_proto::BalanceGains::default();
+        soft_gains.compliance_scale = 0.25;
+        let init_soft = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Teach,
+            config: rk_proto::ConfigCmd::SetBalanceGains(soft_gains),
+            ..Default::default()
+        };
+        let _ = sim_soft.tick(0.01, &init_soft);
+
+        let mut cmd = HostToMcu {
+            seq: 2,
+            mode: ControlMode::Drive,
+            torque_mask: 0b11_1111,
+            speed_limit_pct: 100,
+            ..Default::default()
+        };
+        cmd.target_rad[0] = 1.0;
+
+        let mut stiff_peak_ma = 0u16;
+        let mut soft_peak_ma = 0u16;
+        for step in 2..=30 {
+            cmd.seq = step;
+            let t_stiff = sim_stiff.tick(0.01, &cmd);
+            let t_soft = sim_soft.tick(0.01, &cmd);
+            stiff_peak_ma = stiff_peak_ma.max(t_stiff.current_ma[0]);
+            soft_peak_ma = soft_peak_ma.max(t_soft.current_ma[0]);
+        }
+        assert!(
+            soft_peak_ma < stiff_peak_ma,
+            "25% compliance scale must reduce peak servo current ({soft_peak_ma} vs {stiff_peak_ma} mA)"
+        );
+
+        sim_soft.inject_corrupted_frame();
+        cmd.seq = 31;
+        let after_corrupt = sim_soft.tick(0.01, &cmd);
+        assert!(
+            after_corrupt.rx_crc_errors >= 1,
+            "injected bit-flip must increment rx_crc_errors in telemetry"
         );
     }
 }

@@ -697,6 +697,7 @@ impl KinematicRig {
                 inverted: false,
                 min_rad: j.default_min_rad,
                 max_rad: j.default_max_rad,
+                ..Default::default()
             })
             .collect()
     }

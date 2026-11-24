@@ -29,7 +29,9 @@ pub trait ServoBusPort: Send {
 pub struct BenchLoopbackBus {
     joint_count: usize,
     raw_rad: [f32; MAX_JOINTS],
+    velocity_rad_s: [f32; MAX_JOINTS],
     target_rad: [f32; MAX_JOINTS],
+    torque_nm: [f32; MAX_JOINTS],
     torque_mask: u32,
     current_ma: [u16; MAX_JOINTS],
     temp_c: [f32; MAX_JOINTS],
@@ -47,7 +49,9 @@ impl BenchLoopbackBus {
         Self {
             joint_count,
             raw_rad: [0.0_f32; MAX_JOINTS],
+            velocity_rad_s: [0.0_f32; MAX_JOINTS],
             target_rad: [0.0_f32; MAX_JOINTS],
+            torque_nm: [1.8_f32; MAX_JOINTS],
             torque_mask: 0,
             current_ma: [80u16; MAX_JOINTS],
             temp_c: [28.0_f32; MAX_JOINTS],
@@ -59,19 +63,24 @@ impl BenchLoopbackBus {
 impl ServoBusPort for BenchLoopbackBus {
     fn read_feedback(&mut self, dt_sec: f32) -> RawServoFeedback {
         let dt = dt_sec.clamp(0.001_f32, 0.05_f32);
-        let alpha = (dt * 18.0_f32).clamp(0.0_f32, 1.0_f32);
         let mut total_ma: u32 = 0;
 
         for i in 0..self.joint_count.min(MAX_JOINTS) {
             let energized = (self.torque_mask & (1u32 << i)) != 0;
             if energized {
+                let torque_scale = (self.torque_nm[i].abs() / 1.8_f32).clamp(0.08_f32, 1.0_f32);
+                let alpha = (dt * 18.0_f32 * torque_scale).clamp(0.0_f32, 1.0_f32);
                 let err = self.target_rad[i] - self.raw_rad[i];
-                self.raw_rad[i] += err * alpha;
-                let draw = (160.0_f32 + err.abs() * 1150.0_f32).clamp(120.0_f32, 1850.0_f32);
+                let delta = err * alpha;
+                self.raw_rad[i] += delta;
+                self.velocity_rad_s[i] = delta / dt;
+                let draw =
+                    (160.0_f32 + err.abs() * 1150.0_f32 * torque_scale).clamp(120.0_f32, 1850.0_f32);
                 self.current_ma[i] = draw as u16;
                 self.temp_c[i] = (self.temp_c[i] + (draw * 0.00025_f32) * dt).min(68.0_f32);
             } else {
                 // Torque OFF: hold current angle, idle quiescent current, cool toward ambient
+                self.velocity_rad_s[i] = 0.0;
                 self.current_ma[i] = 45;
                 self.temp_c[i] = (self.temp_c[i] - 0.15_f32 * dt).max(26.0_f32);
             }
@@ -89,17 +98,21 @@ impl ServoBusPort for BenchLoopbackBus {
 
         RawServoFeedback {
             raw_angle_rad: self.raw_rad,
+            velocity_rad_s: self.velocity_rad_s,
             current_ma: self.current_ma,
             temp_c: temp_u8,
             bus_voltage_mv,
             bus_error: self.bus_fault,
             imu: rk_proto::ImuState::default(),
+            i3c_timeout_count: 0,
+            imu_source_mask: 0,
         }
     }
 
     fn write_command(&mut self, cmd: &RawServoCommand) {
         self.torque_mask = cmd.torque_mask;
         self.target_rad = cmd.raw_target_rad;
+        self.torque_nm = cmd.torque_nm;
     }
 }
 

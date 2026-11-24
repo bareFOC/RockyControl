@@ -9,13 +9,58 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_JOINTS: usize = 24;
 pub const WATCHDOG_TIMEOUT_MS: u32 = 100;
-pub const MAX_COBS_FRAME_BYTES: usize = 512;
+/// Hardened P1a COBS wire ceiling (1024 B): carries 24-joint velocity, torque limits,
+/// estimator telemetry, protocol version, and pre-COBS IEEE CRC-32 with headroom.
+pub const MAX_COBS_FRAME_BYTES: usize = 1024;
+/// Compile-time wire protocol version checked on every decoded HostToMcu / McuToHost frame.
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MODEL_CHUNK_BYTES: usize = 256;
 pub const MAX_MODEL_NAME_BYTES: usize = 32;
 pub const MAX_MODEL_COBS_FRAME_BYTES: usize = 384;
 pub const MODEL_SCHEMA_VERSION: u8 = 1;
 pub const RATED_CURRENT_MA: u16 = 2000;
 pub const HEAT_TINT_THRESHOLD_MA: u16 = 1400; // 70% of rated current
+
+/// Per-joint actuation mode sent in `HostToMcu` and forwarded to `RawServoCommand`.
+///
+/// Contract:
+/// - In `Position` and `Velocity` modes (v1 N20 custom current loop), `torque_limit_nm[i]`
+///   acts as the per-joint current/torque saturation limit in `[0.0, max_torque_nm]` for
+///   software impact compliance and ukemi relaxation.
+/// - In `Torque` mode (v2 BLDC SimpleFOC), `torque_limit_nm[i]` is the commanded torque.
+#[repr(u8)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum JointCommandMode {
+    #[default]
+    Position = 0,
+    Velocity = 1,
+    Torque = 2,
+}
+
+impl JointCommandMode {
+    pub const fn to_wire(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_wire(code: u8) -> Self {
+        match code {
+            1 => Self::Velocity,
+            2 => Self::Torque,
+            _ => Self::Position,
+        }
+    }
+}
+
+/// Bitmask flags for `EstimatorTelemetry.valid_mask` so disabled v1 channels (`GRF`,
+/// `MOMENTUM`) are never confused with physical `0.0` readings (e.g. free-fall).
+pub mod estimator_valid {
+    pub const COM: u32 = 1 << 0;
+    pub const DCM: u32 = 1 << 1;
+    pub const GRF: u32 = 1 << 2;
+    pub const MOMENTUM: u32 = 1 << 3;
+    pub const LSM6DSV_OK: u32 = 1 << 4;
+    pub const BNO055_OK: u32 = 1 << 5;
+}
 
 #[repr(u8)]
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -249,7 +294,7 @@ impl Default for WalkCmd {
     }
 }
 
-/// MCU-resident UVC (Upper Body Vertical Control) gains, deadband & safety cutoff.
+/// MCU-resident UVC (Upper Body Vertical Control), kinematic DCM, 7 cm foot margin & ukemi gains.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct BalanceGains {
     /// UVC sagittal tilt integration gain per 10 ms reference tick (ai2001 default `0.25`).
@@ -258,14 +303,26 @@ pub struct BalanceGains {
     pub uvc_gain_roll: f32,
     /// Radial IMU tilt deadband in radians before triggering catch-step (ai2001 default `0.033` rad ~ 1.9 deg).
     pub tilt_deadband_rad: f32,
-    /// Direct ankle-pitch gyro rate damping gain (`rad / (rad/s)`).
+    /// Direct ankle-pitch gyro rate damping gain (`rad / (rad/s)`, decoupled from UVC hip integrator).
     pub gyro_damp_pitch: f32,
-    /// Direct ankle-roll gyro rate damping gain (`rad / (rad/s)`).
+    /// Direct ankle-roll gyro rate damping gain (`rad / (rad/s)`, decoupled from UVC hip integrator).
     pub gyro_damp_roll: f32,
     /// Upper-body arm counter-spread gain proportional to lateral step offset (`[0.0, 1.5]`).
     pub arm_assist: f32,
     /// Protective fall-tuck & torque cutoff threshold in radians (default ~37 deg = `0.65` rad).
     pub fall_cutoff_rad: f32,
+    /// Kinematic DCM swing-foot landing modulation gain (acts strictly on swing foot, never stance hip).
+    pub dcm_step_gain: f32,
+    /// Physical printed foot half-length in meters (7.0 cm total foot -> `0.035` m half-length).
+    pub foot_half_length_m: f32,
+    /// Usable sagittal ankle/CoP authority margin in meters (~80% of 3.5 cm = `0.028` m = ±2.8 cm).
+    pub foot_margin_m: f32,
+    /// Ukemi pre-fall torque relaxation threshold in radians (default ~32 deg = `0.56` rad < `fall_cutoff_rad`).
+    pub ukemi_tilt_rad: f32,
+    /// Ukemi compliant torque ceiling scale in `[0.05, 0.50]` applied when tilt exceeds `ukemi_tilt_rad`.
+    pub ukemi_torque_scale: f32,
+    /// Global software current/torque saturation scale in `[0.10, 1.0]` for v1 N20 impact compliance.
+    pub compliance_scale: f32,
 }
 
 impl Default for BalanceGains {
@@ -278,6 +335,12 @@ impl Default for BalanceGains {
             gyro_damp_roll: 0.10,
             arm_assist: 0.65,
             fall_cutoff_rad: 0.65,
+            dcm_step_gain: 0.65,
+            foot_half_length_m: 0.035,
+            foot_margin_m: 0.028,
+            ukemi_tilt_rad: 0.56,
+            ukemi_torque_scale: 0.15,
+            compliance_scale: 1.0,
         }
     }
 }
@@ -372,13 +435,66 @@ pub enum ConfigCmd {
     ClearFaults,
 }
 
+/// On-MCU kinematic & dynamic state estimator telemetry (`f32`, `#![no_std]`).
+///
+/// Always inspect `valid_mask` (`estimator_valid::*`) before consuming any field so
+/// disabled v1 channels (`GRF`, `MOMENTUM`) are never confused with physical `0.0` readings.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct EstimatorTelemetry {
+    /// Estimated Center of Mass position `[x, y, z]` in meters (robot body/ground frame).
+    pub com_pos_m: [f32; 3],
+    /// EMA-filtered, air-gated CoM velocity `[vx, vy, vz]` in m/s.
+    pub com_vel_m_s: [f32; 3],
+    /// Capture Point / Divergent Component of Motion `[xi_x, xi_z]` in meters (lateral, sagittal).
+    pub dcm_xy_m: [f32; 2],
+    /// Estimated Zero Moment Point / desired CoP `[zmp_x, zmp_z]` in meters.
+    pub zmp_xy_m: [f32; 2],
+    /// Signed remaining margin to the encoded foot support boundary in meters (`< 0` => capture step).
+    pub foot_margin_m: f32,
+    /// v2-only left foot normal GRF in Newtons (valid only when `valid_mask & GRF != 0`).
+    pub grf_left_n: f32,
+    /// v2-only right foot normal GRF in Newtons (valid only when `valid_mask & GRF != 0`).
+    pub grf_right_n: f32,
+    /// Bit 0 = Right foot stance, Bit 1 = Left foot stance.
+    pub contact_mask: u8,
+    /// True while pre-fall *ukemi* torque relaxation is actively softening joint ceilings.
+    pub ukemi_active: bool,
+    /// Explicit channel validity bitmask (`estimator_valid::*`).
+    pub valid_mask: u32,
+}
+
+impl Default for EstimatorTelemetry {
+    fn default() -> Self {
+        Self {
+            com_pos_m: [0.0, 0.25, 0.0],
+            com_vel_m_s: [0.0; 3],
+            dcm_xy_m: [0.0; 2],
+            zmp_xy_m: [0.0; 2],
+            foot_margin_m: 0.028,
+            grf_left_n: 0.0,
+            grf_right_n: 0.0,
+            contact_mask: 0b11,
+            ukemi_active: false,
+            valid_mask: 0,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct HostToMcu {
+    pub protocol_version: u16,
     pub seq: u32,
     pub mode: ControlMode,
     pub torque_mask: u32,
     pub speed_limit_pct: u8,
     pub target_rad: [f32; MAX_JOINTS],
+    /// Per-joint `JointCommandMode` wire code (`0=Position`, `1=Velocity`, `2=Torque`).
+    pub command_mode: [u8; MAX_JOINTS],
+    /// Per-joint target velocity in `rad/s` (used in `Velocity` mode or feedforward damping).
+    pub velocity_rad_s: [f32; MAX_JOINTS],
+    /// Per-joint torque/current saturation limit in `N·m` (`Position`/`Velocity` modes)
+    /// or direct torque command (`Torque` mode). Clamped per joint on the MCU.
+    pub torque_limit_nm: [f32; MAX_JOINTS],
     pub walk: WalkCmd,
     pub config: ConfigCmd,
 }
@@ -386,11 +502,15 @@ pub struct HostToMcu {
 impl Default for HostToMcu {
     fn default() -> Self {
         Self {
+            protocol_version: PROTOCOL_VERSION,
             seq: 0,
             mode: ControlMode::Teach,
             torque_mask: 0,
             speed_limit_pct: 55,
             target_rad: [0.0_f32; MAX_JOINTS],
+            command_mode: [JointCommandMode::Position as u8; MAX_JOINTS],
+            velocity_rad_s: [0.0_f32; MAX_JOINTS],
+            torque_limit_nm: [1.8_f32; MAX_JOINTS],
             walk: WalkCmd::default(),
             config: ConfigCmd::None,
         }
@@ -399,6 +519,7 @@ impl Default for HostToMcu {
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct McuToHost {
+    pub protocol_version: u16,
     pub seq_ack: u32,
     pub uptime_ms: u32,
     pub active_mode: ControlMode,
@@ -406,16 +527,26 @@ pub struct McuToHost {
     pub torque_state_mask: u32,
     pub measured_rad: [f32; MAX_JOINTS],
     pub applied_target_rad: [f32; MAX_JOINTS],
+    /// Per-joint measured angular velocity in `rad/s` (from SimpleFOC / servo readback).
+    pub velocity_rad_s: [f32; MAX_JOINTS],
     pub current_ma: [u16; MAX_JOINTS],
     pub temp_c: [u8; MAX_JOINTS],
     pub bus_voltage_mv: u16,
     pub imu: ImuState,
     pub balance: BalanceTelemetry,
+    pub estimator: EstimatorTelemetry,
+    /// Cumulative MCU wire frames dropped due to pre-COBS CRC-32 mismatch.
+    pub rx_crc_errors: u16,
+    /// Cumulative MCU wire frames dropped due to `protocol_version` mismatch.
+    pub rx_version_mismatches: u16,
+    /// Cumulative per-joint I3C servo bus timeout events.
+    pub i3c_timeout_count: u16,
 }
 
 impl Default for McuToHost {
     fn default() -> Self {
         Self {
+            protocol_version: PROTOCOL_VERSION,
             seq_ack: 0,
             uptime_ms: 0,
             active_mode: ControlMode::Teach,
@@ -423,11 +554,16 @@ impl Default for McuToHost {
             torque_state_mask: 0,
             measured_rad: [0.0_f32; MAX_JOINTS],
             applied_target_rad: [0.0_f32; MAX_JOINTS],
+            velocity_rad_s: [0.0_f32; MAX_JOINTS],
             current_ma: [0_u16; MAX_JOINTS],
             temp_c: [28_u8; MAX_JOINTS],
             bus_voltage_mv: 12_400,
             imu: ImuState::default(),
             balance: BalanceTelemetry::default(),
+            estimator: EstimatorTelemetry::default(),
+            rx_crc_errors: 0,
+            rx_version_mismatches: 0,
+            i3c_timeout_count: 0,
         }
     }
 }
@@ -669,33 +805,149 @@ pub enum ModelResponse {
 pub enum CodecError {
     EncodeFailed,
     DecodeFailed,
+    CrcMismatch,
+    VersionMismatch,
     NonFiniteFloat,
 }
 
-/// Zero-allocation `postcard` + COBS encode into a caller-supplied buffer.
-/// Output is terminated by a single `0x00` delimiter byte.
+/// Pure `#![no_std]` COBS encoder writing `src` into `dst` with a trailing `0x00` delimiter.
+fn cobs_encode_delimited<'a>(src: &[u8], dst: &'a mut [u8]) -> Result<&'a [u8], CodecError> {
+    if dst.len() < 2 {
+        return Err(CodecError::EncodeFailed);
+    }
+    let mut code_idx = 0usize;
+    let mut write_idx = 1usize;
+    let mut code: u8 = 1;
+
+    for &b in src {
+        if b == 0 {
+            dst[code_idx] = code;
+            code_idx = write_idx;
+            write_idx += 1;
+            code = 1;
+            if write_idx > dst.len() {
+                return Err(CodecError::EncodeFailed);
+            }
+        } else {
+            if write_idx >= dst.len() {
+                return Err(CodecError::EncodeFailed);
+            }
+            dst[write_idx] = b;
+            write_idx += 1;
+            code += 1;
+            if code == 0xFF {
+                dst[code_idx] = code;
+                code_idx = write_idx;
+                write_idx += 1;
+                code = 1;
+                if write_idx > dst.len() {
+                    return Err(CodecError::EncodeFailed);
+                }
+            }
+        }
+    }
+    if write_idx >= dst.len() {
+        return Err(CodecError::EncodeFailed);
+    }
+    dst[code_idx] = code;
+    dst[write_idx] = 0x00;
+    Ok(&dst[..=write_idx])
+}
+
+/// Pure `#![no_std]` in-place COBS decoder returning `(decoded_len, consumed_len)`.
+fn cobs_decode_in_place(buf: &mut [u8]) -> Result<(usize, usize), CodecError> {
+    if buf.is_empty() {
+        return Err(CodecError::DecodeFailed);
+    }
+    let frame_end = buf.iter().position(|&b| b == 0x00).unwrap_or(buf.len());
+    let consumed = if frame_end < buf.len() {
+        frame_end + 1
+    } else {
+        frame_end
+    };
+    if frame_end == 0 {
+        return Err(CodecError::DecodeFailed);
+    }
+
+    let mut read_idx = 0usize;
+    let mut write_idx = 0usize;
+    while read_idx < frame_end {
+        let code = buf[read_idx] as usize;
+        if code == 0 {
+            return Err(CodecError::DecodeFailed);
+        }
+        read_idx += 1;
+        let copy_len = code - 1;
+        if read_idx + copy_len > frame_end {
+            return Err(CodecError::DecodeFailed);
+        }
+        for _ in 0..copy_len {
+            buf[write_idx] = buf[read_idx];
+            write_idx += 1;
+            read_idx += 1;
+        }
+        if code < 0xFF && read_idx < frame_end {
+            buf[write_idx] = 0x00;
+            write_idx += 1;
+        }
+    }
+    Ok((write_idx, consumed))
+}
+
+/// Zero-allocation `postcard` + pre-COBS IEEE CRC-32 + COBS encode into a caller-supplied buffer.
+///
+/// Raw framing layout before COBS: `[postcard_payload..., crc32_le_4B]`, terminated on the wire
+/// by a single `0x00` COBS delimiter byte.
 pub fn encode_cobs<'a, T: Serialize>(
     value: &T,
     buf: &'a mut [u8],
 ) -> Result<&'a [u8], CodecError> {
-    postcard::to_slice_cobs(value, buf)
-        .map(|slice| &*slice)
-        .map_err(|_| CodecError::EncodeFailed)
+    let mut raw = [0u8; MAX_COBS_FRAME_BYTES];
+    let payload_len = {
+        let max_payload = MAX_COBS_FRAME_BYTES.saturating_sub(12);
+        let used = postcard::to_slice(value, &mut raw[..max_payload])
+            .map_err(|_| CodecError::EncodeFailed)?;
+        used.len()
+    };
+    let checksum = crc32(&raw[..payload_len]);
+    raw[payload_len..payload_len + 4].copy_from_slice(&checksum.to_le_bytes());
+    cobs_encode_delimited(&raw[..payload_len + 4], buf)
 }
 
-/// Zero-allocation `postcard` + COBS decode from a mutable frame slice (returns parsed value and remainder).
-/// Never panics on malformed or corrupted frames.
+/// Zero-allocation COBS decode + IEEE CRC-32 check + `postcard` deserialize.
+/// Never panics on malformed, truncated, or bit-flipped frames.
 pub fn decode_cobs<'a, T: Deserialize<'a>>(
     buf: &'a mut [u8],
 ) -> Result<(T, &'a [u8]), CodecError> {
-    postcard::take_from_bytes_cobs(buf)
-        .map(|(val, rest)| (val, &*rest))
-        .map_err(|_| CodecError::DecodeFailed)
+    let (dec_len, consumed) = cobs_decode_in_place(buf)?;
+    if dec_len < 4 {
+        return Err(CodecError::DecodeFailed);
+    }
+    let payload_len = dec_len - 4;
+    let (decoded_slice, rest) = buf.split_at(consumed);
+    let payload = &decoded_slice[..payload_len];
+    let expected_crc = u32::from_le_bytes([
+        decoded_slice[payload_len],
+        decoded_slice[payload_len + 1],
+        decoded_slice[payload_len + 2],
+        decoded_slice[payload_len + 3],
+    ]);
+    if crc32(payload) != expected_crc {
+        return Err(CodecError::CrcMismatch);
+    }
+    let val = postcard::from_bytes::<T>(payload).map_err(|_| CodecError::DecodeFailed)?;
+    Ok((val, rest))
 }
 
-/// Validates that a `HostToMcu` payload contains only finite single-precision floats.
+/// Validates `protocol_version` and ensures a `HostToMcu` payload contains only finite floats.
 pub fn validate_host_packet(pkt: &HostToMcu) -> Result<(), CodecError> {
-    if pkt.target_rad.iter().any(|v| !v.is_finite()) {
+    if pkt.protocol_version != PROTOCOL_VERSION {
+        return Err(CodecError::VersionMismatch);
+    }
+    if pkt.target_rad.iter().any(|v| !v.is_finite())
+        || pkt.velocity_rad_s.iter().any(|v| !v.is_finite())
+        || pkt.torque_limit_nm.iter().any(|v| !v.is_finite())
+    {
         return Err(CodecError::NonFiniteFloat);
     }
     let w = &pkt.walk;
@@ -724,7 +976,13 @@ pub fn validate_host_packet(pkt: &HostToMcu) -> Result<(), CodecError> {
                 || !g.gyro_damp_pitch.is_finite()
                 || !g.gyro_damp_roll.is_finite()
                 || !g.arm_assist.is_finite()
-                || !g.fall_cutoff_rad.is_finite() =>
+                || !g.fall_cutoff_rad.is_finite()
+                || !g.dcm_step_gain.is_finite()
+                || !g.foot_half_length_m.is_finite()
+                || !g.foot_margin_m.is_finite()
+                || !g.ukemi_tilt_rad.is_finite()
+                || !g.ukemi_torque_scale.is_finite()
+                || !g.compliance_scale.is_finite() =>
         {
             return Err(CodecError::NonFiniteFloat);
         }
@@ -733,18 +991,23 @@ pub fn validate_host_packet(pkt: &HostToMcu) -> Result<(), CodecError> {
     Ok(())
 }
 
-/// Decodes a `HostToMcu` frame and rejects NaN/Inf floats.
+/// Decodes a `HostToMcu` frame, verifies pre-COBS CRC-32 and `protocol_version`, and rejects NaN/Inf.
 pub fn decode_host_cobs(buf: &mut [u8]) -> Result<HostToMcu, CodecError> {
     let (pkt, _) = decode_cobs::<HostToMcu>(buf)?;
     validate_host_packet(&pkt)?;
     Ok(pkt)
 }
 
-/// Decodes an `McuToHost` frame and rejects NaN/Inf floats.
+/// Decodes an `McuToHost` frame, verifies pre-COBS CRC-32 and `protocol_version`, and rejects NaN/Inf.
 pub fn decode_mcu_cobs(buf: &mut [u8]) -> Result<McuToHost, CodecError> {
     let (pkt, _) = decode_cobs::<McuToHost>(buf)?;
+    if pkt.protocol_version != PROTOCOL_VERSION {
+        return Err(CodecError::VersionMismatch);
+    }
+    let est = &pkt.estimator;
     if pkt.measured_rad.iter().any(|v| !v.is_finite())
         || pkt.applied_target_rad.iter().any(|v| !v.is_finite())
+        || pkt.velocity_rad_s.iter().any(|v| !v.is_finite())
         || !pkt.imu.pitch_rad.is_finite()
         || !pkt.imu.roll_rad.is_finite()
         || !pkt.imu.yaw_rad.is_finite()
@@ -758,6 +1021,13 @@ pub fn decode_mcu_cobs(buf: &mut [u8]) -> Result<McuToHost, CodecError> {
         || !pkt.balance.foot_dx_m.is_finite()
         || !pkt.balance.foot_dy_m.is_finite()
         || !pkt.balance.hip_height_m.is_finite()
+        || est.com_pos_m.iter().any(|v| !v.is_finite())
+        || est.com_vel_m_s.iter().any(|v| !v.is_finite())
+        || est.dcm_xy_m.iter().any(|v| !v.is_finite())
+        || est.zmp_xy_m.iter().any(|v| !v.is_finite())
+        || !est.foot_margin_m.is_finite()
+        || !est.grf_left_n.is_finite()
+        || !est.grf_right_n.is_finite()
     {
         return Err(CodecError::NonFiniteFloat);
     }
@@ -799,11 +1069,15 @@ mod tests {
     #[test]
     fn host_to_mcu_cobs_round_trip() {
         let mut pkt = HostToMcu {
+            protocol_version: PROTOCOL_VERSION,
             seq: 42,
             mode: ControlMode::Drive,
             torque_mask: 0x0001_FFFF,
             speed_limit_pct: 60,
             target_rad: [0.0; MAX_JOINTS],
+            command_mode: [JointCommandMode::Position as u8; MAX_JOINTS],
+            velocity_rad_s: [0.0; MAX_JOINTS],
+            torque_limit_nm: [1.5; MAX_JOINTS],
             walk: WalkCmd {
                 walk_enabled: true,
                 balance_enabled: true,
@@ -818,6 +1092,9 @@ mod tests {
         };
         pkt.target_rad[0] = 0.25;
         pkt.target_rad[5] = -1.75;
+        pkt.command_mode[11] = JointCommandMode::Velocity as u8;
+        pkt.velocity_rad_s[11] = 1.2;
+        pkt.torque_limit_nm[11] = 0.9;
 
         let mut wire = [0u8; MAX_COBS_FRAME_BYTES];
         let encoded = encode_cobs(&pkt, &mut wire).expect("encode host");
@@ -832,6 +1109,7 @@ mod tests {
     #[test]
     fn mcu_to_host_cobs_round_trip() {
         let mut pkt = McuToHost {
+            protocol_version: PROTOCOL_VERSION,
             seq_ack: 99,
             uptime_ms: 12_345,
             active_mode: ControlMode::Drive,
@@ -861,10 +1139,28 @@ mod tests {
                 hip_height_m: 0.61,
                 fall_orientation: fall_orientation::PRONE,
             },
+            estimator: EstimatorTelemetry {
+                com_pos_m: [0.004, 0.245, 0.011],
+                com_vel_m_s: [0.02, 0.0, 0.08],
+                dcm_xy_m: [0.007, 0.024],
+                zmp_xy_m: [0.003, 0.012],
+                foot_margin_m: 0.004,
+                grf_left_n: 0.0,
+                grf_right_n: 0.0,
+                contact_mask: 0b11,
+                ukemi_active: false,
+                valid_mask: estimator_valid::COM
+                    | estimator_valid::DCM
+                    | estimator_valid::LSM6DSV_OK,
+            },
+            rx_crc_errors: 2,
+            rx_version_mismatches: 1,
+            i3c_timeout_count: 3,
             ..Default::default()
         };
         pkt.measured_rad[3] = -0.88;
         pkt.applied_target_rad[3] = -0.92;
+        pkt.velocity_rad_s[3] = 1.45;
         pkt.current_ma[3] = 2150;
         pkt.temp_c[3] = 51;
 
@@ -875,6 +1171,52 @@ mod tests {
 
         let decoded = decode_mcu_cobs(&mut wire[..len]).expect("decode mcu");
         assert_eq!(decoded, pkt);
+    }
+
+    #[test]
+    fn cobs_crc_bit_flip_and_version_mismatch_are_rejected() {
+        let pkt = HostToMcu {
+            seq: 7,
+            mode: ControlMode::Drive,
+            ..Default::default()
+        };
+        let mut wire = [0u8; MAX_COBS_FRAME_BYTES];
+        let len = encode_cobs(&pkt, &mut wire).expect("encode").len();
+
+        // Flip a single bit inside the encoded COBS payload -> must fail with CrcMismatch.
+        let mut corrupted = wire;
+        corrupted[len / 2] ^= 0x01;
+        // Keep flipped byte non-zero so COBS framing stays valid and CRC catches it.
+        if corrupted[len / 2] == 0 {
+            corrupted[len / 2] = 0x02;
+        }
+        let err = decode_host_cobs(&mut corrupted[..len]).unwrap_err();
+        assert!(
+            matches!(err, CodecError::CrcMismatch | CodecError::DecodeFailed),
+            "expected CRC or decode rejection, got {:?}",
+            err
+        );
+
+        // Wrong protocol_version -> must fail with VersionMismatch.
+        let bad_ver = HostToMcu {
+            protocol_version: PROTOCOL_VERSION.wrapping_add(1),
+            ..Default::default()
+        };
+        let len2 = encode_cobs(&bad_ver, &mut wire).expect("encode bad ver").len();
+        assert_eq!(
+            decode_host_cobs(&mut wire[..len2]).unwrap_err(),
+            CodecError::VersionMismatch
+        );
+
+        let bad_mcu = McuToHost {
+            protocol_version: PROTOCOL_VERSION.wrapping_add(1),
+            ..Default::default()
+        };
+        let len3 = encode_cobs(&bad_mcu, &mut wire).expect("encode bad mcu").len();
+        assert_eq!(
+            decode_mcu_cobs(&mut wire[..len3]).unwrap_err(),
+            CodecError::VersionMismatch
+        );
     }
 
     #[test]

@@ -12,13 +12,16 @@
 //!
 //! Strictly single-precision `f32` everywhere for RP2350 Cortex-M33 FPU numeric parity.
 
+pub mod estimator;
 pub mod uvc;
 
 use core::f32::consts::{FRAC_PI_2, PI, TAU};
 
+pub use estimator::{DcmSwingHint, KinematicEstimator};
 use rk_proto::{
     BalanceGains, BalanceTelemetry, ConfigCmd, ControlMode, FaultFlags, HostToMcu, ImuState,
-    MAX_JOINTS, McuToHost, WATCHDOG_TIMEOUT_MS, WalkCmd, classify_fall, fall_orientation, uvc_phase,
+    JointCommandMode, MAX_JOINTS, McuToHost, PROTOCOL_VERSION, WATCHDOG_TIMEOUT_MS, WalkCmd,
+    classify_fall, fall_orientation, uvc_phase,
 };
 use serde::{Deserialize, Serialize};
 pub use uvc::{LegGeometry, LegIkAngles, UvcController, UvcPhase, UvcStepOutput, solve_leg_ik};
@@ -90,12 +93,19 @@ pub fn cos_f32(x: f32) -> f32 {
     sin_f32(x + FRAC_PI_2)
 }
 
+pub const DEFAULT_MAX_TORQUE_NM: f32 = 1.8;
+pub const DEFAULT_MAX_VELOCITY_RAD_S: f32 = 8.0;
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct JointCalibration {
     pub zero_offset_rad: f32,
     pub inverted: bool,
     pub min_rad: f32,
     pub max_rad: f32,
+    /// Per-joint physical peak torque/current limit ceiling in N·m (enforced downstream).
+    pub max_torque_nm: f32,
+    /// Per-joint physical peak angular velocity ceiling in rad/s (enforced downstream).
+    pub max_velocity_rad_s: f32,
 }
 
 impl Default for JointCalibration {
@@ -105,6 +115,8 @@ impl Default for JointCalibration {
             inverted: false,
             min_rad: -1.57,
             max_rad: 1.57,
+            max_torque_nm: DEFAULT_MAX_TORQUE_NM,
+            max_velocity_rad_s: DEFAULT_MAX_VELOCITY_RAD_S,
         }
     }
 }
@@ -112,22 +124,30 @@ impl Default for JointCalibration {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct RawServoFeedback {
     pub raw_angle_rad: [f32; MAX_JOINTS],
+    pub velocity_rad_s: [f32; MAX_JOINTS],
     pub current_ma: [u16; MAX_JOINTS],
     pub temp_c: [u8; MAX_JOINTS],
     pub bus_voltage_mv: u16,
     pub bus_error: bool,
     pub imu: ImuState,
+    /// Cumulative I3C servo bus timeout count reported by the bus driver.
+    pub i3c_timeout_count: u16,
+    /// Active IMU source validity flags (`estimator_valid::LSM6DSV_OK` / `BNO055_OK`).
+    pub imu_source_mask: u32,
 }
 
 impl Default for RawServoFeedback {
     fn default() -> Self {
         Self {
             raw_angle_rad: [0.0; MAX_JOINTS],
+            velocity_rad_s: [0.0; MAX_JOINTS],
             current_ma: [0; MAX_JOINTS],
             temp_c: [28; MAX_JOINTS],
             bus_voltage_mv: 12_400,
             bus_error: false,
             imu: ImuState::default(),
+            i3c_timeout_count: 0,
+            imu_source_mask: rk_proto::estimator_valid::LSM6DSV_OK,
         }
     }
 }
@@ -136,6 +156,9 @@ impl Default for RawServoFeedback {
 pub struct RawServoCommand {
     pub torque_mask: u32,
     pub raw_target_rad: [f32; MAX_JOINTS],
+    pub command_mode: [u8; MAX_JOINTS],
+    pub raw_velocity_rad_s: [f32; MAX_JOINTS],
+    pub torque_nm: [f32; MAX_JOINTS],
 }
 
 impl Default for RawServoCommand {
@@ -143,6 +166,9 @@ impl Default for RawServoCommand {
         Self {
             torque_mask: 0,
             raw_target_rad: [0.0; MAX_JOINTS],
+            command_mode: [JointCommandMode::Position as u8; MAX_JOINTS],
+            raw_velocity_rad_s: [0.0; MAX_JOINTS],
+            torque_nm: [DEFAULT_MAX_TORQUE_NM; MAX_JOINTS],
         }
     }
 }
@@ -177,17 +203,24 @@ pub struct DirectServoKernel {
     last_host_speed_pct: u8,
     last_host_torque_mask: u32,
     last_host_target_rad: [f32; MAX_JOINTS],
+    last_host_command_mode: [u8; MAX_JOINTS],
+    last_host_velocity_rad_s: [f32; MAX_JOINTS],
+    last_host_torque_limit_nm: [f32; MAX_JOINTS],
     applied_target_rad: [f32; MAX_JOINTS],
     initialized_targets: bool,
     flash_commit_count: u32,
-    // MCU-native geometric UVC balance & walking controller
+    // MCU-native geometric UVC balance, kinematic DCM estimator & walking controller
     balance_gains: BalanceGains,
     last_walk_cmd: WalkCmd,
     uvc: UvcController,
+    estimator: KinematicEstimator,
     uvc_blend: f32,
     /// Orientation captured at the most recent `TILT_FALL_CUTOFF` latch
     /// (`fall_orientation::*` wire code). Persists while the fault is latched.
     fall_orientation: u8,
+    /// Cumulative MCU wire drop counters forwarded into `McuToHost`.
+    rx_crc_errors: u16,
+    rx_version_mismatches: u16,
 }
 
 impl DirectServoKernel {
@@ -208,15 +241,34 @@ impl DirectServoKernel {
             last_host_speed_pct: 55,
             last_host_torque_mask: 0,
             last_host_target_rad: [0.0; MAX_JOINTS],
+            last_host_command_mode: [JointCommandMode::Position as u8; MAX_JOINTS],
+            last_host_velocity_rad_s: [0.0; MAX_JOINTS],
+            last_host_torque_limit_nm: [DEFAULT_MAX_TORQUE_NM; MAX_JOINTS],
             applied_target_rad: [0.0; MAX_JOINTS],
             initialized_targets: false,
             flash_commit_count: 0,
             balance_gains: BalanceGains::default(),
             last_walk_cmd: WalkCmd::default(),
             uvc: UvcController::new(LegGeometry::rocky_mk1()),
+            estimator: KinematicEstimator::new(),
             uvc_blend: 0.0,
             fall_orientation: fall_orientation::UNKNOWN,
+            rx_crc_errors: 0,
+            rx_version_mismatches: 0,
         }
+    }
+
+    pub fn record_rx_crc_error(&mut self) {
+        self.rx_crc_errors = self.rx_crc_errors.saturating_add(1);
+    }
+
+    pub fn record_rx_version_mismatch(&mut self) {
+        self.rx_version_mismatches = self.rx_version_mismatches.saturating_add(1);
+    }
+
+    pub fn set_wire_error_counts(&mut self, rx_crc_errors: u16, rx_version_mismatches: u16) {
+        self.rx_crc_errors = rx_crc_errors;
+        self.rx_version_mismatches = rx_version_mismatches;
     }
 
     pub fn joint_count(&self) -> usize {
@@ -318,7 +370,15 @@ impl DirectServoKernel {
                         && g.gyro_damp_roll.is_finite()
                         && g.arm_assist.is_finite()
                         && g.fall_cutoff_rad.is_finite()
+                        && g.dcm_step_gain.is_finite()
+                        && g.foot_half_length_m.is_finite()
+                        && g.foot_margin_m.is_finite()
+                        && g.ukemi_tilt_rad.is_finite()
+                        && g.ukemi_torque_scale.is_finite()
+                        && g.compliance_scale.is_finite()
                     {
+                        let foot_half = g.foot_half_length_m.clamp(0.015, 0.12);
+                        let fall_cutoff = g.fall_cutoff_rad.clamp(0.30, 1.35);
                         self.balance_gains = BalanceGains {
                             uvc_gain_pitch: g.uvc_gain_pitch.clamp(0.0, 1.5),
                             uvc_gain_roll: g.uvc_gain_roll.clamp(0.0, 1.5),
@@ -326,7 +386,15 @@ impl DirectServoKernel {
                             gyro_damp_pitch: g.gyro_damp_pitch.clamp(0.0, 0.5),
                             gyro_damp_roll: g.gyro_damp_roll.clamp(0.0, 0.5),
                             arm_assist: g.arm_assist.clamp(0.0, 1.5),
-                            fall_cutoff_rad: g.fall_cutoff_rad.clamp(0.30, 1.35),
+                            fall_cutoff_rad: fall_cutoff,
+                            dcm_step_gain: g.dcm_step_gain.clamp(0.0, 1.5),
+                            foot_half_length_m: foot_half,
+                            foot_margin_m: g.foot_margin_m.clamp(0.010, foot_half),
+                            ukemi_tilt_rad: g
+                                .ukemi_tilt_rad
+                                .clamp(0.25, (fall_cutoff - 0.03).max(0.25)),
+                            ukemi_torque_scale: g.ukemi_torque_scale.clamp(0.05, 0.50),
+                            compliance_scale: g.compliance_scale.clamp(0.10, 1.0),
                         };
                     }
                 }
@@ -340,6 +408,7 @@ impl DirectServoKernel {
                     self.applied_target_rad = measured_rad;
                     self.last_host_target_rad = measured_rad;
                     self.uvc.reset();
+                    self.estimator.reset();
                     self.uvc_blend = 0.0;
                     self.fall_orientation = fall_orientation::UNKNOWN;
                     cleared_faults_this_tick = true;
@@ -352,6 +421,14 @@ impl DirectServoKernel {
             for i in 0..self.joint_count {
                 if cmd.target_rad[i].is_finite() {
                     self.last_host_target_rad[i] = cmd.target_rad[i];
+                }
+                self.last_host_command_mode[i] =
+                    JointCommandMode::from_wire(cmd.command_mode[i]).to_wire();
+                if cmd.velocity_rad_s[i].is_finite() {
+                    self.last_host_velocity_rad_s[i] = cmd.velocity_rad_s[i];
+                }
+                if cmd.torque_limit_nm[i].is_finite() {
+                    self.last_host_torque_limit_nm[i] = cmd.torque_limit_nm[i];
                 }
             }
 
@@ -394,8 +471,26 @@ impl DirectServoKernel {
             }
         }
 
-        // 5. Compute MCU-native UVC upper-body balance + locomotion overlay
+        // 5. Run Kinematic CoM / DCM / ZMP Estimator & evaluate Ukemi pre-fall relaxation
         let imu = feedback.imu;
+        let max_tilt = imu.pitch_rad.abs().max(imu.roll_rad.abs());
+        let ukemi_active = self.active_mode == ControlMode::Drive
+            && max_tilt >= self.balance_gains.ukemi_tilt_rad
+            && max_tilt < self.balance_gains.fall_cutoff_rad;
+
+        let (estimator_telem, dcm_hint) = self.estimator.step(
+            dt,
+            self.joint_count,
+            &measured_rad,
+            imu,
+            self.uvc.geometry().nominal_height,
+            self.uvc.contact_mask(),
+            feedback.imu_source_mask,
+            ukemi_active,
+            self.balance_gains,
+        );
+
+        // 5b. Compute MCU-native UVC upper-body balance + locomotion overlay
         let mut desired_rad = self.last_host_target_rad;
         let mut balance_telem = BalanceTelemetry {
             hip_height_m: self.uvc.geometry().nominal_height,
@@ -408,11 +503,12 @@ impl DirectServoKernel {
         if self.active_mode == ControlMode::Drive && humanoid_legs_available {
             let walk = self.last_walk_cmd;
             let uvc_engaged = walk.balance_enabled || walk.walk_enabled;
-            let tilt_exceeded = imu.pitch_rad.abs() >= self.balance_gains.fall_cutoff_rad
-                || imu.roll_rad.abs() >= self.balance_gains.fall_cutoff_rad;
+            let tilt_exceeded = max_tilt >= self.balance_gains.fall_cutoff_rad;
 
             if uvc_engaged || tilt_exceeded || self.uvc.phase() == UvcPhase::FallTuck {
-                let uvc_out = self.uvc.step(dt, imu, walk, self.balance_gains);
+                let uvc_out =
+                    self.uvc
+                        .step_with_dcm(dt, imu, walk, self.balance_gains, dcm_hint);
 
                 if uvc_out.fall_cutoff_ready {
                     // Protective tuck complete -> drop torque & latch TILT_FALL_CUTOFF
@@ -501,9 +597,22 @@ impl DirectServoKernel {
 
         balance_telem.fall_orientation = self.fall_orientation;
 
-        // 6. Compute torque mask & soft-stopped, slew-clamped servo targets (Safety always downstream)
+        // 6. Compute torque mask, soft-stopped slew-clamped targets, and explicit physical
+        //    torque / velocity ceilings (Safety ALWAYS downstream of balance & host commands).
         let mut torque_state_mask: u32 = 0;
         let mut raw_target_rad = [0.0_f32; MAX_JOINTS];
+        let mut cmd_mode_out = [JointCommandMode::Position as u8; MAX_JOINTS];
+        let mut raw_vel_out = [0.0_f32; MAX_JOINTS];
+        let mut torque_nm_out = [0.0_f32; MAX_JOINTS];
+        let mut measured_vel_rad_s = [0.0_f32; MAX_JOINTS];
+        for i in 0..self.joint_count {
+            let sign = if self.calibration[i].inverted {
+                -1.0_f32
+            } else {
+                1.0_f32
+            };
+            measured_vel_rad_s[i] = sign * feedback.velocity_rad_s[i];
+        }
 
         if self.active_mode == ControlMode::Drive {
             let valid_mask = if self.joint_count >= 32 {
@@ -522,13 +631,26 @@ impl DirectServoKernel {
                 self.base_slew_rad_per_sec
             };
             let max_delta = base_slew * speed_scale * dt;
+            let compliance = self.balance_gains.compliance_scale.clamp(0.10_f32, 1.0_f32);
+            let ukemi_scale = self
+                .balance_gains
+                .ukemi_torque_scale
+                .clamp(0.05_f32, 0.50_f32);
 
             for i in 0..self.joint_count {
+                let cal = &self.calibration[i];
                 let enabled = ((torque_state_mask >> i) & 1) == 1;
+                let sign = if cal.inverted { -1.0_f32 } else { 1.0_f32 };
+                let max_t = cal.max_torque_nm.max(0.05_f32);
+                let max_v = cal.max_velocity_rad_s.max(0.5_f32);
+                let mode = JointCommandMode::from_wire(self.last_host_command_mode[i]);
+                cmd_mode_out[i] = mode.to_wire();
+
                 if !enabled {
                     self.applied_target_rad[i] = measured_rad[i];
+                    raw_vel_out[i] = 0.0;
+                    torque_nm_out[i] = 0.0;
                 } else {
-                    let cal = &self.calibration[i];
                     let mut desired = desired_rad[i];
                     if desired < cal.min_rad {
                         desired = cal.min_rad;
@@ -547,6 +669,27 @@ impl DirectServoKernel {
                     } else {
                         self.applied_target_rad[i] = desired;
                     }
+
+                    // Enforce explicit per-joint velocity clamp
+                    let req_vel = self.last_host_velocity_rad_s[i];
+                    let clamped_vel = req_vel.clamp(-max_v, max_v);
+                    raw_vel_out[i] = sign * clamped_vel;
+
+                    // Enforce explicit per-joint torque/current ceiling + software compliance + ukemi
+                    let effective_ceiling = if ukemi_active {
+                        (max_t * ukemi_scale).min(max_t * compliance)
+                    } else {
+                        max_t * compliance
+                    };
+                    let req_t = self.last_host_torque_limit_nm[i];
+                    torque_nm_out[i] = match mode {
+                        JointCommandMode::Position | JointCommandMode::Velocity => {
+                            req_t.clamp(0.0_f32, effective_ceiling)
+                        }
+                        JointCommandMode::Torque => {
+                            sign * req_t.clamp(-effective_ceiling, effective_ceiling)
+                        }
+                    };
                 }
                 raw_target_rad[i] =
                     calibrated_to_raw(self.applied_target_rad[i], &self.calibration[i]);
@@ -556,10 +699,13 @@ impl DirectServoKernel {
             for i in 0..self.joint_count {
                 self.applied_target_rad[i] = measured_rad[i];
                 raw_target_rad[i] = calibrated_to_raw(measured_rad[i], &self.calibration[i]);
+                raw_vel_out[i] = 0.0;
+                torque_nm_out[i] = 0.0;
             }
         }
 
         let telemetry = McuToHost {
+            protocol_version: PROTOCOL_VERSION,
             seq_ack: self.last_valid_seq,
             uptime_ms: now_ms,
             active_mode: self.active_mode,
@@ -567,17 +713,25 @@ impl DirectServoKernel {
             torque_state_mask,
             measured_rad,
             applied_target_rad: self.applied_target_rad,
+            velocity_rad_s: measured_vel_rad_s,
             current_ma: feedback.current_ma,
             temp_c: feedback.temp_c,
             bus_voltage_mv: feedback.bus_voltage_mv,
             imu,
             balance: balance_telem,
+            estimator: estimator_telem,
+            rx_crc_errors: self.rx_crc_errors,
+            rx_version_mismatches: self.rx_version_mismatches,
+            i3c_timeout_count: feedback.i3c_timeout_count,
         };
 
         KernelStepOutput {
             servo_cmd: RawServoCommand {
                 torque_mask: torque_state_mask,
                 raw_target_rad,
+                command_mode: cmd_mode_out,
+                raw_velocity_rad_s: raw_vel_out,
+                torque_nm: torque_nm_out,
             },
             telemetry,
         }
@@ -843,10 +997,149 @@ mod tests {
             inverted: true,
             min_rad: -1.0,
             max_rad: 1.0,
+            ..Default::default()
         };
         let raw = 0.85_f32;
         let cal_val = raw_to_calibrated(raw, &cal);
         assert!((cal_val - (-0.50_f32)).abs() < 1e-6);
         assert!((calibrated_to_raw(cal_val, &cal) - raw).abs() < 1e-6);
+    }
+
+    #[test]
+    fn kinematic_dcm_triggers_step_outside_2_8cm_margin() {
+        let cal = [JointCalibration {
+            min_rad: -2.2,
+            max_rad: 2.2,
+            ..Default::default()
+        }; 21];
+        let mut kernel = DirectServoKernel::new(21, &cal);
+        let mut cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: (1u32 << 21) - 1,
+            speed_limit_pct: 100,
+            walk: WalkCmd {
+                balance_enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Quiet upright stance -> DCM inside ±2.8 cm foot margin
+        let mut fb = RawServoFeedback::default();
+        let quiet = kernel.step(5, 0.005, Some(&cmd), &fb);
+        assert!(
+            quiet.telemetry.estimator.foot_margin_m > 0.020,
+            "upright margin must be near +0.028 m, got {}",
+            quiet.telemetry.estimator.foot_margin_m
+        );
+
+        // Apply forward pitch velocity impulse while angle is still small (inside static deadband)
+        // -> Capture Point xi = c + c_dot / omega leaves ±2.8 cm and triggers ActiveCatchStep.
+        fb.imu.pitch_rad = 0.025;
+        fb.imu.pitch_rate_rad_s = 1.6;
+        let mut pushed = quiet;
+        for tick in 2..=12 {
+            cmd.seq = tick;
+            pushed = kernel.step(tick * 5, 0.005, Some(&cmd), &fb);
+        }
+        assert!(
+            pushed.telemetry.estimator.foot_margin_m < 0.0,
+            "DCM must leave ±2.8 cm margin under forward velocity impulse (margin={})",
+            pushed.telemetry.estimator.foot_margin_m
+        );
+        assert_eq!(
+            pushed.telemetry.balance.uvc_phase,
+            uvc_phase::ACTIVE_CATCH_STEP,
+            "DCM breach must trigger ActiveCatchStep"
+        );
+    }
+
+    #[test]
+    fn ukemi_drops_torque_ceiling_before_fall_cutoff() {
+        let cal = [JointCalibration {
+            min_rad: -2.2,
+            max_rad: 2.2,
+            max_torque_nm: 1.8,
+            ..Default::default()
+        }; 21];
+        let mut kernel = DirectServoKernel::new(21, &cal);
+        let mut cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: (1u32 << 21) - 1,
+            torque_limit_nm: [1.8; MAX_JOINTS],
+            walk: WalkCmd {
+                balance_enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Nominal stance -> full torque ceiling (1.8 N·m)
+        let mut fb = RawServoFeedback::default();
+        let nom = kernel.step(10, 0.01, Some(&cmd), &fb);
+        assert!(!nom.telemetry.estimator.ukemi_active);
+        assert!((nom.servo_cmd.torque_nm[11] - 1.8).abs() < 1e-4);
+
+        // Tilt crosses ukemi_tilt_rad (0.56 rad ~32 deg) while below fall_cutoff_rad (0.65 rad)
+        fb.imu.pitch_rad = 0.60;
+        cmd.seq = 2;
+        let ukemi = kernel.step(20, 0.01, Some(&cmd), &fb);
+        assert_eq!(ukemi.telemetry.active_mode, ControlMode::Drive);
+        assert!(ukemi.telemetry.estimator.ukemi_active);
+        let expected_ceiling = 1.8 * BalanceGains::default().ukemi_torque_scale;
+        assert!(
+            ukemi.servo_cmd.torque_nm[11] <= expected_ceiling + 1e-4,
+            "ukemi must soften torque ceiling to <= {expected_ceiling}, got {}",
+            ukemi.servo_cmd.torque_nm[11]
+        );
+    }
+
+    #[test]
+    fn physical_torque_and_velocity_clamps_enforced() {
+        let cal = [JointCalibration {
+            max_torque_nm: 1.2,
+            max_velocity_rad_s: 5.0,
+            ..Default::default()
+        }; 4];
+        let mut kernel = DirectServoKernel::new(4, &cal);
+        let fb = RawServoFeedback::default();
+
+        let mut cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: 0b1111,
+            ..Default::default()
+        };
+        cmd.command_mode[0] = JointCommandMode::Position.to_wire();
+        cmd.torque_limit_nm[0] = 99.0; // Oversized torque limit -> clamped to 1.2
+        cmd.velocity_rad_s[0] = 40.0; // Oversized velocity -> clamped to 5.0
+        cmd.command_mode[1] = JointCommandMode::Torque.to_wire();
+        cmd.torque_limit_nm[1] = -99.0; // Negative torque command -> clamped to -1.2
+
+        let out = kernel.step(10, 0.01, Some(&cmd), &fb);
+        assert!((out.servo_cmd.torque_nm[0] - 1.2).abs() < 1e-5);
+        assert!((out.servo_cmd.raw_velocity_rad_s[0] - 5.0).abs() < 1e-5);
+        assert!((out.servo_cmd.torque_nm[1] - (-1.2)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn v1_valid_mask_marks_grf_and_momentum_unavailable() {
+        let cal = [JointCalibration::default(); 21];
+        let mut kernel = DirectServoKernel::new(21, &cal);
+        let fb = RawServoFeedback::default();
+        let cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Teach,
+            ..Default::default()
+        };
+        let out = kernel.step(10, 0.01, Some(&cmd), &fb);
+        let mask = out.telemetry.estimator.valid_mask;
+        assert_ne!(mask & rk_proto::estimator_valid::COM, 0);
+        assert_ne!(mask & rk_proto::estimator_valid::DCM, 0);
+        assert_ne!(mask & rk_proto::estimator_valid::LSM6DSV_OK, 0);
+        assert_eq!(mask & rk_proto::estimator_valid::GRF, 0);
+        assert_eq!(mask & rk_proto::estimator_valid::MOMENTUM, 0);
     }
 }

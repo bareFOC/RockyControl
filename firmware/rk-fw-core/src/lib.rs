@@ -9,7 +9,9 @@
 extern crate alloc;
 
 pub mod config;
+pub mod i3c_bus;
 pub mod imu;
+pub mod lsm6dsv;
 pub mod model_store;
 pub mod servo_bus;
 pub mod status_led;

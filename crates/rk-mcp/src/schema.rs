@@ -225,7 +225,13 @@ pub fn tool_definitions() -> Vec<Value> {
                     "gyro_damp_pitch": num("Direct sagittal ankle gyro rate damping (0.0..=1.0)"),
                     "gyro_damp_roll": num("Direct lateral ankle gyro rate damping (0.0..=1.0)"),
                     "arm_assist": num("Arm counter-spread balance assist gain (0.0..=1.5)"),
-                    "fall_cutoff_rad": num("Protective fall tuck and torque cutoff tilt threshold in radians (0.30..=1.20)")
+                    "fall_cutoff_rad": num("Protective fall tuck and torque cutoff tilt threshold in radians (0.30..=1.35)"),
+                    "dcm_step_gain": num("Kinematic DCM swing-foot landing modulation gain (0.0..=1.5)"),
+                    "foot_half_length_m": num("Physical printed foot half-length in meters (default 0.035 m = 7 cm foot)"),
+                    "foot_margin_m": num("Usable sagittal ankle/CoP margin before capture step (default 0.028 m = ±2.8 cm)"),
+                    "ukemi_tilt_rad": num("Ukemi pre-fall torque relaxation tilt threshold in radians (0.25..=1.20)"),
+                    "ukemi_torque_scale": num("Ukemi torque ceiling multiplier (0.05..=0.50)"),
+                    "compliance_scale": num("Global software current/torque compliance ceiling scale (0.10..=1.0)")
                 }),
                 &[],
             ),

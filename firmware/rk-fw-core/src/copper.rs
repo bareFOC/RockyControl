@@ -22,7 +22,10 @@ use bincode::{Decode, Encode};
 use critical_section::Mutex;
 use cu29::prelude::*;
 use rk_control::{DirectServoKernel, JointCalibration, RawServoCommand, RawServoFeedback};
-use rk_proto::{ConfigCmd, ControlMode, FaultFlags, HostToMcu, MAX_JOINTS, McuToHost};
+use rk_proto::{
+    ConfigCmd, ControlMode, EstimatorTelemetry, FaultFlags, HostToMcu, MAX_JOINTS, McuToHost,
+    PROTOCOL_VERSION,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{CONTROL_DT_SEC, DEFAULT_JOINT_COUNT};
@@ -48,12 +51,16 @@ pub fn current_led_mode() -> StatusLedMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
 pub struct HostCmdMsg {
     pub present: bool,
+    pub protocol_version: u16,
     pub seq: u32,
     /// `0 = Teach`, `1 = Drive`, `2 = EStop`.
     pub mode: u8,
     pub torque_mask: u32,
     pub speed_limit_pct: u8,
     pub target_rad: [f32; MAX_JOINTS],
+    pub command_mode: [u8; MAX_JOINTS],
+    pub velocity_rad_s: [f32; MAX_JOINTS],
+    pub torque_limit_nm: [f32; MAX_JOINTS],
     // High-level walking & balance command
     pub walk_enabled: bool,
     pub balance_enabled: bool,
@@ -66,13 +73,7 @@ pub struct HostCmdMsg {
     /// Encoded `ConfigCmd` tag (`0=None`, `1=SetZero`, `2=SetLimits`, `3=SetInvert`, `4=ClearFaults`, `5=CommitFlash`, `6=SetBalanceGains`).
     pub cfg_tag: u8,
     pub cfg_joint: u8,
-    pub cfg_f0: f32,
-    pub cfg_f1: f32,
-    pub cfg_f2: f32,
-    pub cfg_f3: f32,
-    pub cfg_f4: f32,
-    pub cfg_f5: f32,
-    pub cfg_f6: f32,
+    pub cfg_f: [f32; 13],
     pub cfg_bool: bool,
 }
 
@@ -83,25 +84,27 @@ impl HostCmdMsg {
             ControlMode::Drive => 1,
             ControlMode::EStop => 2,
         };
-        let (cfg_tag, cfg_joint, cfg_f0, cfg_f1, cfg_f2, cfg_f3, cfg_f4, cfg_f5, cfg_f6, cfg_bool) =
-            match cmd.config {
-                ConfigCmd::None => (0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
-                ConfigCmd::SetZeroOffset { joint, zero_rad } => {
-                    (1, joint, zero_rad, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false)
-                }
-                ConfigCmd::SetSoftLimits {
-                    joint,
-                    min_rad,
-                    max_rad,
-                } => (2, joint, min_rad, max_rad, 0.0, 0.0, 0.0, 0.0, 0.0, false),
-                ConfigCmd::SetInvert { joint, inverted } => {
-                    (3, joint, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, inverted)
-                }
-                ConfigCmd::ClearFaults => (4, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
-                ConfigCmd::CommitFlash => (5, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, false),
-                ConfigCmd::SetBalanceGains(g) => (
-                    6,
-                    0,
+        let mut cfg_f = [0.0_f32; 13];
+        let (cfg_tag, cfg_joint, cfg_bool) = match cmd.config {
+            ConfigCmd::None => (0, 0, false),
+            ConfigCmd::SetZeroOffset { joint, zero_rad } => {
+                cfg_f[0] = zero_rad;
+                (1, joint, false)
+            }
+            ConfigCmd::SetSoftLimits {
+                joint,
+                min_rad,
+                max_rad,
+            } => {
+                cfg_f[0] = min_rad;
+                cfg_f[1] = max_rad;
+                (2, joint, false)
+            }
+            ConfigCmd::SetInvert { joint, inverted } => (3, joint, inverted),
+            ConfigCmd::ClearFaults => (4, 0, false),
+            ConfigCmd::CommitFlash => (5, 0, false),
+            ConfigCmd::SetBalanceGains(g) => {
+                cfg_f = [
                     g.uvc_gain_pitch,
                     g.uvc_gain_roll,
                     g.tilt_deadband_rad,
@@ -109,16 +112,27 @@ impl HostCmdMsg {
                     g.gyro_damp_roll,
                     g.arm_assist,
                     g.fall_cutoff_rad,
-                    false,
-                ),
-            };
+                    g.dcm_step_gain,
+                    g.foot_half_length_m,
+                    g.foot_margin_m,
+                    g.ukemi_tilt_rad,
+                    g.ukemi_torque_scale,
+                    g.compliance_scale,
+                ];
+                (6, 0, false)
+            }
+        };
         Self {
             present: true,
+            protocol_version: cmd.protocol_version,
             seq: cmd.seq,
             mode,
             torque_mask: cmd.torque_mask,
             speed_limit_pct: cmd.speed_limit_pct,
             target_rad: cmd.target_rad,
+            command_mode: cmd.command_mode,
+            velocity_rad_s: cmd.velocity_rad_s,
+            torque_limit_nm: cmd.torque_limit_nm,
             walk_enabled: cmd.walk.walk_enabled,
             balance_enabled: cmd.walk.balance_enabled,
             walk_vx: cmd.walk.vx,
@@ -129,13 +143,7 @@ impl HostCmdMsg {
             walk_cadence_hz: cmd.walk.cadence_hz,
             cfg_tag,
             cfg_joint,
-            cfg_f0,
-            cfg_f1,
-            cfg_f2,
-            cfg_f3,
-            cfg_f4,
-            cfg_f5,
-            cfg_f6,
+            cfg_f,
             cfg_bool,
         }
     }
@@ -152,12 +160,12 @@ impl HostCmdMsg {
         let config = match self.cfg_tag {
             1 => ConfigCmd::SetZeroOffset {
                 joint: self.cfg_joint,
-                zero_rad: self.cfg_f0,
+                zero_rad: self.cfg_f[0],
             },
             2 => ConfigCmd::SetSoftLimits {
                 joint: self.cfg_joint,
-                min_rad: self.cfg_f0,
-                max_rad: self.cfg_f1,
+                min_rad: self.cfg_f[0],
+                max_rad: self.cfg_f[1],
             },
             3 => ConfigCmd::SetInvert {
                 joint: self.cfg_joint,
@@ -166,22 +174,32 @@ impl HostCmdMsg {
             4 => ConfigCmd::ClearFaults,
             5 => ConfigCmd::CommitFlash,
             6 => ConfigCmd::SetBalanceGains(rk_proto::BalanceGains {
-                uvc_gain_pitch: self.cfg_f0,
-                uvc_gain_roll: self.cfg_f1,
-                tilt_deadband_rad: self.cfg_f2,
-                gyro_damp_pitch: self.cfg_f3,
-                gyro_damp_roll: self.cfg_f4,
-                arm_assist: self.cfg_f5,
-                fall_cutoff_rad: self.cfg_f6,
+                uvc_gain_pitch: self.cfg_f[0],
+                uvc_gain_roll: self.cfg_f[1],
+                tilt_deadband_rad: self.cfg_f[2],
+                gyro_damp_pitch: self.cfg_f[3],
+                gyro_damp_roll: self.cfg_f[4],
+                arm_assist: self.cfg_f[5],
+                fall_cutoff_rad: self.cfg_f[6],
+                dcm_step_gain: self.cfg_f[7],
+                foot_half_length_m: self.cfg_f[8],
+                foot_margin_m: self.cfg_f[9],
+                ukemi_tilt_rad: self.cfg_f[10],
+                ukemi_torque_scale: self.cfg_f[11],
+                compliance_scale: self.cfg_f[12],
             }),
             _ => ConfigCmd::None,
         };
         Some(HostToMcu {
+            protocol_version: self.protocol_version,
             seq: self.seq,
             mode,
             torque_mask: self.torque_mask,
             speed_limit_pct: self.speed_limit_pct,
             target_rad: self.target_rad,
+            command_mode: self.command_mode,
+            velocity_rad_s: self.velocity_rad_s,
+            torque_limit_nm: self.torque_limit_nm,
             walk: rk_proto::WalkCmd {
                 walk_enabled: self.walk_enabled,
                 balance_enabled: self.balance_enabled,
@@ -201,10 +219,13 @@ impl HostCmdMsg {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
 pub struct ServoFeedbackMsg {
     pub raw_rad: [f32; MAX_JOINTS],
+    pub velocity_rad_s: [f32; MAX_JOINTS],
     pub current_ma: [u16; MAX_JOINTS],
     pub temp_c: [u8; MAX_JOINTS],
     pub bus_voltage_mv: u16,
     pub bus_error: bool,
+    pub i3c_timeout_count: u16,
+    pub imu_source_mask: u32,
     pub imu_available: bool,
     pub imu_pitch_rad: f32,
     pub imu_roll_rad: f32,
@@ -221,10 +242,13 @@ impl From<RawServoFeedback> for ServoFeedbackMsg {
     fn from(fb: RawServoFeedback) -> Self {
         Self {
             raw_rad: fb.raw_angle_rad,
+            velocity_rad_s: fb.velocity_rad_s,
             current_ma: fb.current_ma,
             temp_c: fb.temp_c,
             bus_voltage_mv: fb.bus_voltage_mv,
             bus_error: fb.bus_error,
+            i3c_timeout_count: fb.i3c_timeout_count,
+            imu_source_mask: fb.imu_source_mask,
             imu_available: fb.imu.available,
             imu_pitch_rad: fb.imu.pitch_rad,
             imu_roll_rad: fb.imu.roll_rad,
@@ -243,6 +267,7 @@ impl From<&ServoFeedbackMsg> for RawServoFeedback {
     fn from(msg: &ServoFeedbackMsg) -> Self {
         Self {
             raw_angle_rad: msg.raw_rad,
+            velocity_rad_s: msg.velocity_rad_s,
             current_ma: msg.current_ma,
             temp_c: msg.temp_c,
             bus_voltage_mv: msg.bus_voltage_mv,
@@ -257,6 +282,8 @@ impl From<&ServoFeedbackMsg> for RawServoFeedback {
                 yaw_rate_rad_s: msg.imu_yaw_rate_rad_s,
                 gravity: [msg.imu_gravity_x, msg.imu_gravity_y, msg.imu_gravity_z],
             },
+            i3c_timeout_count: msg.i3c_timeout_count,
+            imu_source_mask: msg.imu_source_mask,
         }
     }
 }
@@ -267,6 +294,9 @@ pub struct ControlStepMsg {
     // Outbound actuator command
     pub cmd_torque_mask: u32,
     pub cmd_raw_target_rad: [f32; MAX_JOINTS],
+    pub cmd_mode: [u8; MAX_JOINTS],
+    pub cmd_raw_velocity_rad_s: [f32; MAX_JOINTS],
+    pub cmd_torque_nm: [f32; MAX_JOINTS],
 
     // Outbound host telemetry
     pub telem_seq_ack: u32,
@@ -277,6 +307,7 @@ pub struct ControlStepMsg {
     pub telem_bus_voltage_mv: u16,
     pub telem_measured_rad: [f32; MAX_JOINTS],
     pub telem_applied_target_rad: [f32; MAX_JOINTS],
+    pub telem_velocity_rad_s: [f32; MAX_JOINTS],
     pub telem_current_ma: [u16; MAX_JOINTS],
     pub telem_temp_c: [u8; MAX_JOINTS],
     pub telem_imu_available: bool,
@@ -301,6 +332,21 @@ pub struct ControlStepMsg {
     pub telem_hip_height_m: f32,
     /// `fall_orientation::*` wire code captured with `TILT_FALL_CUTOFF`.
     pub telem_fall_orientation: u8,
+    // On-MCU kinematic CoM / DCM / ZMP estimator telemetry
+    pub est_com_pos_m: [f32; 3],
+    pub est_com_vel_m_s: [f32; 3],
+    pub est_dcm_xy_m: [f32; 2],
+    pub est_zmp_xy_m: [f32; 2],
+    pub est_foot_margin_m: f32,
+    pub est_grf_left_n: f32,
+    pub est_grf_right_n: f32,
+    pub est_contact_mask: u8,
+    pub est_ukemi_active: bool,
+    pub est_valid_mask: u32,
+    // Hardened wire & bus diagnostic counters
+    pub telem_rx_crc_errors: u16,
+    pub telem_rx_version_mismatches: u16,
+    pub telem_i3c_timeout_count: u16,
 }
 
 impl ControlStepMsg {
@@ -308,6 +354,9 @@ impl ControlStepMsg {
         RawServoCommand {
             torque_mask: self.cmd_torque_mask,
             raw_target_rad: self.cmd_raw_target_rad,
+            command_mode: self.cmd_mode,
+            raw_velocity_rad_s: self.cmd_raw_velocity_rad_s,
+            torque_nm: self.cmd_torque_nm,
         }
     }
 
@@ -318,6 +367,7 @@ impl ControlStepMsg {
             _ => ControlMode::EStop,
         };
         McuToHost {
+            protocol_version: PROTOCOL_VERSION,
             seq_ack: self.telem_seq_ack,
             uptime_ms: self.telem_uptime_ms,
             active_mode,
@@ -326,6 +376,7 @@ impl ControlStepMsg {
             bus_voltage_mv: self.telem_bus_voltage_mv,
             measured_rad: self.telem_measured_rad,
             applied_target_rad: self.telem_applied_target_rad,
+            velocity_rad_s: self.telem_velocity_rad_s,
             current_ma: self.telem_current_ma,
             temp_c: self.telem_temp_c,
             imu: rk_proto::ImuState {
@@ -355,6 +406,21 @@ impl ControlStepMsg {
                 hip_height_m: self.telem_hip_height_m,
                 fall_orientation: self.telem_fall_orientation,
             },
+            estimator: EstimatorTelemetry {
+                com_pos_m: self.est_com_pos_m,
+                com_vel_m_s: self.est_com_vel_m_s,
+                dcm_xy_m: self.est_dcm_xy_m,
+                zmp_xy_m: self.est_zmp_xy_m,
+                foot_margin_m: self.est_foot_margin_m,
+                grf_left_n: self.est_grf_left_n,
+                grf_right_n: self.est_grf_right_n,
+                contact_mask: self.est_contact_mask,
+                ukemi_active: self.est_ukemi_active,
+                valid_mask: self.est_valid_mask,
+            },
+            rx_crc_errors: self.telem_rx_crc_errors,
+            rx_version_mismatches: self.telem_rx_version_mismatches,
+            i3c_timeout_count: self.telem_i3c_timeout_count,
         }
     }
 }
@@ -421,6 +487,8 @@ impl CuTask for DirectServoCuTask {
             .map(RawServoFeedback::from)
             .unwrap_or_default();
 
+        let (crc_errs, ver_errs) = HOST_LINK_MAILBOX.wire_error_counts();
+        self.kernel.set_wire_error_counts(crc_errs, ver_errs);
         let step = self.kernel.step(now_ms, dt_sec, rx_cmd.as_ref(), &rx_fb);
 
         let led_mode = StatusLedMode::from_state(step.telemetry.active_mode, step.telemetry.faults);
@@ -438,6 +506,9 @@ impl CuTask for DirectServoCuTask {
         output.set_payload(ControlStepMsg {
             cmd_torque_mask: step.servo_cmd.torque_mask,
             cmd_raw_target_rad: step.servo_cmd.raw_target_rad,
+            cmd_mode: step.servo_cmd.command_mode,
+            cmd_raw_velocity_rad_s: step.servo_cmd.raw_velocity_rad_s,
+            cmd_torque_nm: step.servo_cmd.torque_nm,
             telem_seq_ack: step.telemetry.seq_ack,
             telem_uptime_ms: step.telemetry.uptime_ms,
             telem_active_mode: active_mode_u8,
@@ -446,6 +517,7 @@ impl CuTask for DirectServoCuTask {
             telem_bus_voltage_mv: step.telemetry.bus_voltage_mv,
             telem_measured_rad: step.telemetry.measured_rad,
             telem_applied_target_rad: step.telemetry.applied_target_rad,
+            telem_velocity_rad_s: step.telemetry.velocity_rad_s,
             telem_current_ma: step.telemetry.current_ma,
             telem_temp_c: step.telemetry.temp_c,
             telem_imu_available: step.telemetry.imu.available,
@@ -469,6 +541,19 @@ impl CuTask for DirectServoCuTask {
             telem_foot_dy_m: step.telemetry.balance.foot_dy_m,
             telem_hip_height_m: step.telemetry.balance.hip_height_m,
             telem_fall_orientation: step.telemetry.balance.fall_orientation,
+            est_com_pos_m: step.telemetry.estimator.com_pos_m,
+            est_com_vel_m_s: step.telemetry.estimator.com_vel_m_s,
+            est_dcm_xy_m: step.telemetry.estimator.dcm_xy_m,
+            est_zmp_xy_m: step.telemetry.estimator.zmp_xy_m,
+            est_foot_margin_m: step.telemetry.estimator.foot_margin_m,
+            est_grf_left_n: step.telemetry.estimator.grf_left_n,
+            est_grf_right_n: step.telemetry.estimator.grf_right_n,
+            est_contact_mask: step.telemetry.estimator.contact_mask,
+            est_ukemi_active: step.telemetry.estimator.ukemi_active,
+            est_valid_mask: step.telemetry.estimator.valid_mask,
+            telem_rx_crc_errors: step.telemetry.rx_crc_errors,
+            telem_rx_version_mismatches: step.telemetry.rx_version_mismatches,
+            telem_i3c_timeout_count: step.telemetry.i3c_timeout_count,
         });
 
         Ok(())
@@ -623,6 +708,7 @@ impl CuBridge for ServoBusBridge {
             let mut fb = SERVO_BUS_SLOT.read_feedback(CONTROL_DT_SEC);
             if let Some(hw_imu) = IMU_SLOT.latest() {
                 fb.imu = hw_imu;
+                fb.imu_source_mask = IMU_SLOT.latest_source_mask();
             }
             let fb_msg = ServoFeedbackMsg::from(fb);
             let mut slot = Some(fb_msg);
@@ -633,5 +719,25 @@ impl CuBridge for ServoBusBridge {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RP2350 stack & 64 KiB Copper heap guardrail: verifies the 3 `Copy` CopperList messages
+    /// stay compact (< 2 KiB total across all three) after adding P1a velocity, torque, and
+    /// estimator fields.
+    #[test]
+    fn copper_message_sizes_fit_rp2350_stack_budget() {
+        let host_sz = core::mem::size_of::<HostCmdMsg>();
+        let fb_sz = core::mem::size_of::<ServoFeedbackMsg>();
+        let step_sz = core::mem::size_of::<ControlStepMsg>();
+        let total = host_sz + fb_sz + step_sz;
+        assert!(host_sz <= 512, "HostCmdMsg too large for RP2350 stack: {host_sz} B");
+        assert!(fb_sz <= 384, "ServoFeedbackMsg too large for RP2350 stack: {fb_sz} B");
+        assert!(step_sz <= 1024, "ControlStepMsg too large for RP2350 stack: {step_sz} B");
+        assert!(total <= 1792, "Combined CopperList messages exceed 1792 B budget: {total} B");
     }
 }

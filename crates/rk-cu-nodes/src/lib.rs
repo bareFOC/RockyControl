@@ -47,6 +47,10 @@ impl DirectServoTask {
         &self.kernel
     }
 
+    pub fn kernel_mut(&mut self) -> &mut DirectServoKernel {
+        &mut self.kernel
+    }
+
     pub fn tick_index(&self) -> u64 {
         self.tick_index
     }
@@ -78,6 +82,8 @@ impl DirectServoTask {
 #[derive(Default, Debug)]
 pub struct HostLinkBridge {
     pub rx_decode_errors: u64,
+    pub rx_crc_errors: u16,
+    pub rx_version_mismatches: u16,
     pub tx_frames: u64,
 }
 
@@ -85,8 +91,17 @@ impl HostLinkBridge {
     pub fn decode_rx(&mut self, wire_frame: &mut [u8]) -> Option<HostToMcu> {
         match decode_host_cobs(wire_frame) {
             Ok(pkt) => Some(pkt),
-            Err(_) => {
+            Err(err) => {
                 self.rx_decode_errors = self.rx_decode_errors.saturating_add(1);
+                match err {
+                    CodecError::CrcMismatch => {
+                        self.rx_crc_errors = self.rx_crc_errors.saturating_add(1);
+                    }
+                    CodecError::VersionMismatch => {
+                        self.rx_version_mismatches = self.rx_version_mismatches.saturating_add(1);
+                    }
+                    _ => {}
+                }
                 None
             }
         }

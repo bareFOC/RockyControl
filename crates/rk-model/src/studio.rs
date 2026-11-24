@@ -1,8 +1,9 @@
 //! Bidirectional mirroring authority state machine (`StudioModel`), keyframes, and cubic Hermite playback.
 
-use rk_control::JointCalibration;
+use rk_control::{DEFAULT_MAX_TORQUE_NM, JointCalibration};
 use rk_proto::{
-    BalanceGains, ConfigCmd, ControlMode, FaultFlags, HostToMcu, MAX_JOINTS, McuToHost, WalkCmd,
+    BalanceGains, ConfigCmd, ControlMode, FaultFlags, HostToMcu, JointCommandMode, MAX_JOINTS,
+    McuToHost, PROTOCOL_VERSION, WalkCmd,
 };
 use serde::{Deserialize, Serialize};
 
@@ -570,6 +571,9 @@ pub struct StudioModel {
     pub speed_limit_pct: u8,
     pub torque_mask: u32,
     pub target_rad: [f32; MAX_JOINTS],
+    pub joint_command_mode: [u8; MAX_JOINTS],
+    pub target_velocity_rad_s: [f32; MAX_JOINTS],
+    pub torque_limit_nm: [f32; MAX_JOINTS],
     pub calibration: Vec<JointCalibration>,
     pub latest_telemetry: McuToHost,
     pub selected_joint: usize,
@@ -609,6 +613,9 @@ impl StudioModel {
             speed_limit_pct: 65,
             torque_mask: all_mask,
             target_rad: default_pose,
+            joint_command_mode: [JointCommandMode::Position.to_wire(); MAX_JOINTS],
+            target_velocity_rad_s: [0.0; MAX_JOINTS],
+            torque_limit_nm: [DEFAULT_MAX_TORQUE_NM; MAX_JOINTS],
             calibration,
             latest_telemetry,
             selected_joint: 3,
@@ -911,11 +918,15 @@ impl StudioModel {
         };
 
         HostToMcu {
+            protocol_version: PROTOCOL_VERSION,
             seq: self.tx_seq,
             mode,
             torque_mask,
             speed_limit_pct: self.speed_limit_pct.clamp(1, 100),
             target_rad: self.target_rad,
+            command_mode: self.joint_command_mode,
+            velocity_rad_s: self.target_velocity_rad_s,
+            torque_limit_nm: self.torque_limit_nm,
             walk: self.walk_cmd,
             config,
         }

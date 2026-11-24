@@ -261,8 +261,8 @@ impl RobotTransport for UdpTransport {
         loop {
             match self.socket.recv_from(&mut self.rx_buf) {
                 Ok((n, _)) if n > 0 => {
-                    match rk_proto::decode_cobs::<McuToHost>(&mut self.rx_buf[..n]) {
-                        Ok((telem, _)) => latest = Some(telem),
+                    match rk_proto::decode_mcu_cobs(&mut self.rx_buf[..n]) {
+                        Ok(telem) => latest = Some(telem),
                         Err(_) => self.link_errors = self.link_errors.saturating_add(1),
                     }
                 }

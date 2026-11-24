@@ -244,6 +244,22 @@ impl<'a, H: McpHost> RockyMcpTools<'a, H> {
                 "fall_orientation_code": b.fall_orientation,
             },
             "joints": joints,
+            "estimator": {
+                "com_pos_m": t.estimator.com_pos_m,
+                "com_vel_m_s": t.estimator.com_vel_m_s,
+                "dcm_xy_m": t.estimator.dcm_xy_m,
+                "zmp_xy_m": t.estimator.zmp_xy_m,
+                "foot_margin_m": t.estimator.foot_margin_m,
+                "contact_mask": t.estimator.contact_mask,
+                "ukemi_active": t.estimator.ukemi_active,
+                "valid_mask": t.estimator.valid_mask,
+            },
+            "wire": {
+                "protocol_version": t.protocol_version,
+                "rx_crc_errors": t.rx_crc_errors,
+                "rx_version_mismatches": t.rx_version_mismatches,
+                "i3c_timeout_count": t.i3c_timeout_count,
+            },
         })
     }
 
@@ -320,6 +336,12 @@ impl<'a, H: McpHost> RockyMcpTools<'a, H> {
                 "gyro_damp_roll": g.gyro_damp_roll,
                 "arm_assist": g.arm_assist,
                 "fall_cutoff_rad": g.fall_cutoff_rad,
+                "dcm_step_gain": g.dcm_step_gain,
+                "foot_half_length_m": g.foot_half_length_m,
+                "foot_margin_m": g.foot_margin_m,
+                "ukemi_tilt_rad": g.ukemi_tilt_rad,
+                "ukemi_torque_scale": g.ukemi_torque_scale,
+                "compliance_scale": g.compliance_scale,
             },
             "walk": {
                 "balance_enabled": w.balance_enabled,
@@ -736,14 +758,20 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
             "balance_get_gains" => self.ok_json(name, "read", self.balance_json()),
             "balance_set_gains" => {
                 let mut g = self.host.model().balance_gains;
-                let updates: [(&str, f32, f32, &mut f32); 7] = [
+                let updates: [(&str, f32, f32, &mut f32); 13] = [
                     ("uvc_gain_pitch", 0.0, 1.5, &mut g.uvc_gain_pitch),
                     ("uvc_gain_roll", 0.0, 1.5, &mut g.uvc_gain_roll),
                     ("tilt_deadband_rad", 0.005, 0.15, &mut g.tilt_deadband_rad),
                     ("gyro_damp_pitch", 0.0, 1.0, &mut g.gyro_damp_pitch),
                     ("gyro_damp_roll", 0.0, 1.0, &mut g.gyro_damp_roll),
                     ("arm_assist", 0.0, 1.5, &mut g.arm_assist),
-                    ("fall_cutoff_rad", 0.30, 1.20, &mut g.fall_cutoff_rad),
+                    ("fall_cutoff_rad", 0.30, 1.35, &mut g.fall_cutoff_rad),
+                    ("dcm_step_gain", 0.0, 1.5, &mut g.dcm_step_gain),
+                    ("foot_half_length_m", 0.015, 0.12, &mut g.foot_half_length_m),
+                    ("foot_margin_m", 0.010, 0.12, &mut g.foot_margin_m),
+                    ("ukemi_tilt_rad", 0.25, 1.20, &mut g.ukemi_tilt_rad),
+                    ("ukemi_torque_scale", 0.05, 0.50, &mut g.ukemi_torque_scale),
+                    ("compliance_scale", 0.10, 1.0, &mut g.compliance_scale),
                 ];
                 for (key, lo, hi, field) in updates {
                     match Self::finite_f32(args, key, lo, hi) {
