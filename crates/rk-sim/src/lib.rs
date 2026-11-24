@@ -73,6 +73,12 @@ pub struct SimulatedServoPlant {
     act_foot_dx: f32,
     act_foot_dy: f32,
     last_balance: rk_proto::BalanceTelemetry,
+    /// Optional `[0.0, 1.0]` normalized progress of an active get-up recovery sequence.
+    /// Models ground push-off contact restoring torso orientation smoothly to upright.
+    recovery_progress: Option<f32>,
+    recovery_start_pitch: f32,
+    recovery_start_roll: f32,
+    recovery_start_yaw: f32,
 }
 
 /// Body-frame gravity consistent with the kinematics tilt rotation.
@@ -117,6 +123,10 @@ impl SimulatedServoPlant {
             act_foot_dx: 0.0,
             act_foot_dy: 0.0,
             last_balance: rk_proto::BalanceTelemetry::default(),
+            recovery_progress: None,
+            recovery_start_pitch: 0.0,
+            recovery_start_roll: 0.0,
+            recovery_start_yaw: 0.0,
         }
     }
 
@@ -163,6 +173,28 @@ impl SimulatedServoPlant {
         self.act_roll_corr = 0.0;
         self.act_foot_dx = 0.0;
         self.act_foot_dy = 0.0;
+        self.recovery_progress = None;
+        self.recovery_start_pitch = 0.0;
+        self.recovery_start_roll = 0.0;
+        self.recovery_start_yaw = 0.0;
+    }
+
+    /// Updates active get-up recovery progress (`Some(0.0..=1.0)`) so simulated ground
+    /// contact torques lift the fallen torso smoothly upright in sync with keyframes.
+    pub fn set_recovery_progress(&mut self, progress: Option<f32>) {
+        match progress {
+            Some(p) if p.is_finite() => {
+                if self.recovery_progress.is_none() {
+                    self.recovery_start_pitch = self.torso_pitch_rad;
+                    self.recovery_start_roll = self.torso_roll_rad;
+                    self.recovery_start_yaw = self.torso_yaw_rad;
+                }
+                self.recovery_progress = Some(p.clamp(0.0, 1.0));
+            }
+            _ => {
+                self.recovery_progress = None;
+            }
+        }
     }
 
     pub fn set_balance_telemetry(&mut self, bal: rk_proto::BalanceTelemetry) {
@@ -242,7 +274,29 @@ impl SimulatedServoPlant {
         let legs_energized = (self.last_cmd.torque_mask & legs_mask) != 0 && self.joint_count >= 17;
         let leg_stalled = (9..leg_end).any(|idx| self.faults.stalled_joints[idx]);
 
-        if legs_energized {
+        if legs_energized && self.recovery_progress.is_some() {
+            // Ground push-off contact dynamics during active get-up recovery:
+            // stays near fallen pose during Fallen Tuck (0..0.12), lifts smoothly through
+            // Push Off & Kneel (0.12..0.78), and settles upright in Stand & Guard (0.78..1.0).
+            // External shoves still act on pitch/roll rates so a re-fall can abort recovery.
+            let p = self.recovery_progress.unwrap_or(0.0);
+            let f = ((p - 0.12_f32) / 0.66_f32).clamp(0.0_f32, 1.0_f32);
+            let s = f * f * (3.0_f32 - 2.0_f32 * f);
+            let goal_pitch = self.recovery_start_pitch * (1.0_f32 - s);
+            let goal_roll = self.recovery_start_roll * (1.0_f32 - s);
+            let goal_yaw = self.recovery_start_yaw * (1.0_f32 - s);
+
+            let kp = 26.0_f32;
+            let kd = 8.5_f32;
+            let alpha_pitch = kp * (goal_pitch - self.torso_pitch_rad) - kd * self.pitch_rate_rad_s;
+            let alpha_roll = kp * (goal_roll - self.torso_roll_rad) - kd * self.roll_rate_rad_s;
+
+            self.pitch_rate_rad_s = (self.pitch_rate_rad_s + alpha_pitch * dt).clamp(-8.0, 8.0);
+            self.roll_rate_rad_s = (self.roll_rate_rad_s + alpha_roll * dt).clamp(-8.0, 8.0);
+            self.torso_pitch_rad = (self.torso_pitch_rad + self.pitch_rate_rad_s * dt).clamp(-1.35, 1.35);
+            self.torso_roll_rad = (self.torso_roll_rad + self.roll_rate_rad_s * dt).clamp(-1.35, 1.35);
+            self.torso_yaw_rad += (goal_yaw - self.torso_yaw_rad) * (dt * 6.0_f32).clamp(0.0, 1.0);
+        } else if legs_energized {
             // Servo lag on ankle gyro damping & UVC foot CoP placement
             let act_rate = 7.0_f32 + self.faults.servo_lag_factor * 45.0_f32;
             let act_alpha = 1.0_f32 - (-act_rate * dt).exp();
@@ -628,6 +682,11 @@ impl CopperSimRunner {
         self.plant.reset_upright();
     }
 
+    /// Updates active get-up recovery progress so ground push-off lifts the fallen torso upright.
+    pub fn set_recovery_progress(&mut self, progress: Option<f32>) {
+        self.plant.set_recovery_progress(progress);
+    }
+
     /// Injects a malformed COBS byte stream to exercise silent drop + error counter increment.
     pub fn inject_corrupted_frame(&mut self) {
         let mut garbage = [0x05_u8, 0xFF, 0x00, 0x12, 0x00];
@@ -815,5 +874,40 @@ mod tests {
         let reset = plant.step_plant(0.01);
         assert_eq!(reset.imu.yaw_rad, 0.0);
         assert!((reset.imu.gravity[2]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn recovery_progress_lifts_fallen_torso_back_to_upright() {
+        let mut plant = SimulatedServoPlant::new(21, [0.0; MAX_JOINTS]);
+        // Knock robot prone with torque off so it rests fallen (> 0.60 rad).
+        plant.apply_push_impulse(5.5, 0.0);
+        let mut fallen = plant.step_plant(0.016);
+        for _ in 0..80 {
+            fallen = plant.step_plant(0.016);
+        }
+        assert!(
+            fallen.imu.pitch_rad > 0.70,
+            "expected fallen prone pitch, got {}",
+            fallen.imu.pitch_rad
+        );
+
+        // Energize legs and sweep recovery_progress 0.0 -> 1.0.
+        plant.write_command(&RawServoCommand {
+            torque_mask: (1u32 << 21) - 1,
+            raw_target_rad: [0.0; MAX_JOINTS],
+        });
+        let mut last = fallen;
+        for step_idx in 0..=150 {
+            let progress = (step_idx as f32 / 150.0).min(1.0);
+            plant.set_recovery_progress(Some(progress));
+            last = plant.step_plant(0.016);
+        }
+        plant.set_recovery_progress(None);
+        assert!(
+            last.imu.pitch_rad.abs() < 0.08 && last.imu.roll_rad.abs() < 0.08,
+            "recovery progress must lift torso upright (pitch={}, roll={})",
+            last.imu.pitch_rad,
+            last.imu.roll_rad
+        );
     }
 }

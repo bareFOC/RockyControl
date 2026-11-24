@@ -8,6 +8,7 @@
 //! - [`urdf_panel`], [`calibration_tab`], [`sim_tab`]: Focused engineering tabs inside the Config & Calibration drawer
 //! - [`responsive`]: Unified touch-first ergonomics adapting automatically between Landscape and Portrait
 
+mod action_studio;
 mod calibration_tab;
 mod config_screen;
 mod control_screen;
@@ -20,6 +21,8 @@ mod top_bar;
 mod urdf_panel;
 
 use std::collections::VecDeque;
+
+use action_studio::ActionCategoryFilter;
 
 use craft_keymap::{Active, Bindable, Binding, Keymap, Scope, Scopes};
 use craft_ui::theme::WidgetPalette;
@@ -37,9 +40,13 @@ use web_time::Instant;
 
 const TELEMETRY_HISTORY_LEN: usize = 180;
 const CMD_ESTOP: &str = "safety.estop";
-/// Sustained upright attitude required before a latched fall may start recovery,
-/// and before the visual alarm may be cleared after a successful get-up.
-const RECOVERY_STABLE_DWELL_SEC: f32 = 0.6;
+/// Sustained low-angular-rate settle dwell required after a fall before recovery starts.
+const RECOVERY_STABLE_DWELL_SEC: f32 = 0.45;
+/// Maximum pitch/roll angular rate (rad/s) considered settled on the floor or upright.
+const RECOVERY_SETTLED_RATE_RAD_S: f32 = 0.35;
+/// Temporary tilt cutoff (rad, ~77 deg) while pushing off the ground during get-up playback.
+/// Still trips immediately on a violent re-shove or operator E-Stop.
+const RECOVERY_PLAYBACK_CUTOFF_RAD: f32 = 1.35;
 
 /// Ordered, multi-frame fall-recovery sequence owned by [`RockyStudioApp`].
 ///
@@ -88,10 +95,11 @@ pub enum AppScreen {
     Config,
 }
 
-/// Focused 3-tab engineering drawer inside the Config & Calibration screen.
+/// Focused 4-tab engineering drawer inside the Config & Calibration screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigDrawerTab {
     BalanceGait,
+    Actions,
     Joints,
     Setup,
 }
@@ -100,6 +108,7 @@ impl ConfigDrawerTab {
     pub const fn label(self) -> &'static str {
         match self {
             Self::BalanceGait => "Balance",
+            Self::Actions => "Actions",
             Self::Joints => "Joints",
             Self::Setup => "Setup",
         }
@@ -191,6 +200,8 @@ pub struct RockyStudioApp {
     pub config_drawer_tab: ConfigDrawerTab,
     pub show_config_drawer: bool,
     pub show_quick_balance_tune: bool,
+    pub show_action_studio: bool,
+    pub(crate) action_category_filter: ActionCategoryFilter,
     pub push_strength: PushStrength,
     keymap: Keymap,
     keymap_dispatcher: craft_keymap::egui::Dispatcher,
@@ -232,10 +243,12 @@ pub struct RockyStudioApp {
     pub operator_confirmed: bool,
     /// Ordered recovery sequence state.
     pub recovery_state: RecoveryState,
-    /// Seconds of continuous upright attitude since the last fall latch.
+    /// Seconds of continuous settled state since the last fall latch.
     pub fall_dwell_sec: f32,
     /// True when the Get Up button (not the autonomous path) initiated this sequence.
     get_up_requested: bool,
+    /// Operator's original `(BalanceGains, balance_enabled)` saved while get-up plays.
+    saved_recovery_gains: Option<(rk_proto::BalanceGains, bool)>,
 }
 
 impl RockyStudioApp {
@@ -265,6 +278,8 @@ impl RockyStudioApp {
             config_drawer_tab: ConfigDrawerTab::BalanceGait,
             show_config_drawer: false,
             show_quick_balance_tune: false,
+            show_action_studio: false,
+            action_category_filter: ActionCategoryFilter::All,
             push_strength: PushStrength::Shove,
             keymap,
             keymap_dispatcher: craft_keymap::egui::Dispatcher::new(),
@@ -303,6 +318,7 @@ impl RockyStudioApp {
             recovery_state: RecoveryState::Idle,
             fall_dwell_sec: 0.0,
             get_up_requested: false,
+            saved_recovery_gains: None,
         }
     }
 
@@ -371,10 +387,65 @@ impl RockyStudioApp {
         self.pad_vx = 0.0;
         self.pad_vy = 0.0;
         self.pad_yaw = 0.0;
+        self.restore_recovery_gains();
+        self.transport.set_recovery_progress(None);
+        self.fall_event_active = false;
+        self.fall_orientation = FallOrientation::Unknown;
+        self.recovery_state = RecoveryState::Idle;
+        self.fall_dwell_sec = 0.0;
+        self.get_up_requested = false;
         self.connected = false;
         self.active_screen = AppScreen::Dashboard;
         self.show_config_drawer = false;
         self.model.status_message = "Disconnected from robot. Returned to Dashboard.".to_string();
+    }
+
+    /// Injects a deterministic directional shove strong enough to knock Rocky into
+    /// the requested fall orientation (`Prone`, `Supine`, `SideLeft`, `SideRight`) in simulation.
+    pub fn trigger_simulated_fall(&mut self, orientation: FallOrientation) {
+        if self.model.requested_mode == ControlMode::Teach && !self.model.is_estop_active() {
+            self.model.set_authority_mode(ControlMode::Drive);
+        }
+        self.model.walk_cmd.walk_enabled = false;
+        self.model.playback = None;
+        let (dp, dr) = match orientation {
+            FallOrientation::Prone => (6.0_f32, 0.0_f32),
+            FallOrientation::Supine => (-6.0_f32, 0.0_f32),
+            FallOrientation::SideLeft => (0.0_f32, -6.0_f32),
+            FallOrientation::SideRight => (0.0_f32, 6.0_f32),
+            FallOrientation::Unknown => (6.0_f32, 0.0_f32),
+        };
+        self.transport.apply_push_impulse(dp, dr);
+        self.model.status_message = format!(
+            "Simulated {} fall impulse injected — watching IMU threshold breach.",
+            orientation.label()
+        );
+    }
+
+    fn restore_recovery_gains(&mut self) {
+        if let Some((orig_gains, orig_balance_enabled)) = self.saved_recovery_gains.take() {
+            self.model.update_balance_gains(orig_gains);
+            self.model.walk_cmd.balance_enabled = orig_balance_enabled;
+        }
+    }
+
+    /// Explicit operator manual reset (stands sim upright, resets E-Stop to Teach, and clears fall alarm).
+    pub fn manual_reset_upright_and_clear(&mut self) {
+        if let Some(f) = self.transport.sim_faults_mut() {
+            f.drop_heartbeat = false;
+        }
+        self.transport.set_recovery_progress(None);
+        self.restore_recovery_gains();
+        self.transport.reset_upright();
+        if self.model.is_estop_active() {
+            self.model.reset_estop();
+        }
+        self.fall_event_active = false;
+        self.fall_orientation = FallOrientation::Unknown;
+        self.recovery_state = RecoveryState::Idle;
+        self.fall_dwell_sec = 0.0;
+        self.operator_confirmed = false;
+        self.get_up_requested = false;
     }
 
     /// Applies a newly parsed `AssetBundle` (from upload, drop, paste, preset, or MCU pull),
@@ -736,21 +807,34 @@ impl RockyStudioApp {
         let estop_active = self.model.is_estop_active();
         let imu_ok = telem.imu.available;
         let tilt = telem.imu.pitch_rad.abs().max(telem.imu.roll_rad.abs());
-        let upright = imu_ok && tilt < self.model.balance_gains.fall_cutoff_rad;
+        let rate = telem
+            .imu
+            .pitch_rate_rad_s
+            .abs()
+            .max(telem.imu.roll_rate_rad_s.abs());
+        let nominal_cutoff = self
+            .saved_recovery_gains
+            .map(|(g, _)| g.fall_cutoff_rad)
+            .unwrap_or(self.model.balance_gains.fall_cutoff_rad);
+        let upright = imu_ok && tilt < nominal_cutoff;
+        let settled = imu_ok && rate < RECOVERY_SETTLED_RATE_RAD_S;
         let orientation = FallOrientation::from_wire(telem.balance.fall_orientation);
 
         // 1. Latch a new fall (or abort an in-progress get-up on a re-fall / E-Stop).
         match self.recovery_state {
             RecoveryState::Idle | RecoveryState::Completed => {
                 if fall_fault {
+                    self.transport.set_recovery_progress(None);
+                    self.restore_recovery_gains();
                     self.fall_event_active = true;
                     self.fall_orientation = orientation;
                     self.fall_dwell_sec = 0.0;
+                    // Preserve standing opt-in; require fresh confirmation unless auto-recovery is armed.
                     self.operator_confirmed = false;
                     self.get_up_requested = false;
                     self.recovery_state = RecoveryState::FallLatched;
                     self.model.status_message = format!(
-                        "FALL DETECTED ({}). Recovery held until upright and consented.",
+                        "FALL DETECTED ({}). Click Get Up or confirm Auto Recovery to stand up.",
                         self.fall_orientation.label()
                     );
                 }
@@ -758,6 +842,8 @@ impl RockyStudioApp {
             RecoveryState::PlayingGetUp => {
                 if fall_fault || estop_active {
                     self.model.stop_playback();
+                    self.transport.set_recovery_progress(None);
+                    self.restore_recovery_gains();
                     // Explicitly cut torque even if the MCU has not yet mirrored the fault.
                     self.model.trigger_estop();
                     self.model.walk_cmd.walk_enabled = false;
@@ -769,8 +855,8 @@ impl RockyStudioApp {
                     self.operator_confirmed = false;
                     self.get_up_requested = false;
                     self.recovery_state = RecoveryState::FallLatched;
-                    self.model.status_message = "Get-up ABORTED by new fall / E-Stop — torque OFF."
-                        .to_string();
+                    self.model.status_message =
+                        "Get-up ABORTED by new fall / E-Stop — torque OFF.".to_string();
                     return;
                 }
             }
@@ -779,6 +865,8 @@ impl RockyStudioApp {
             | RecoveryState::ArmingDrive => {
                 // An operator E-Stop (without a new fall) also aborts an armed sequence.
                 if estop_active && !fall_fault && self.recovery_state != RecoveryState::FallLatched {
+                    self.transport.set_recovery_progress(None);
+                    self.restore_recovery_gains();
                     self.model.walk_cmd.walk_enabled = false;
                     self.fall_dwell_sec = 0.0;
                     self.operator_confirmed = false;
@@ -791,18 +879,14 @@ impl RockyStudioApp {
             }
         }
 
-        // 2. Track a stable upright dwell. While still tilted the dwell resets; only
-        //    sustained upright time counts. In FallLatched the TILT_FALL_CUTOFF bit stays
-        //    latched until ClearFaults is delivered, so waiting on `!fall_fault` here would
-        //    deadlock the consent path (the ClearFaults is queued by the transition below).
-        //    Requiring `upright` alone is safe: consent is still required, reset_estop()
-        //    returns strictly to Teach with torque off, and ClearingFault still waits for
-        //    the real fault clear before Drive is entered.
+        // 2. Track dwell:
+        //    - While FallLatched: wait for the robot to settle (stop tumbling/bouncing on the
+        //      floor, or sit upright) so recovery can start directly from a fallen pose.
+        //    - After playback (Completed): require genuine upright attitude before clearing alarm.
         if self.fall_event_active {
-            let dwell_ok = if self.recovery_state == RecoveryState::FallLatched {
-                upright
-            } else {
-                upright && !fall_fault
+            let dwell_ok = match self.recovery_state {
+                RecoveryState::FallLatched => settled,
+                _ => upright && !fall_fault,
             };
             if dwell_ok {
                 self.fall_dwell_sec += dt_sec;
@@ -819,6 +903,16 @@ impl RockyStudioApp {
                 if consent && self.fall_dwell_sec >= RECOVERY_STABLE_DWELL_SEC {
                     self.operator_confirmed = false;
                     self.get_up_requested = false;
+                    // Save operator gains and temporarily disable UVC balance & raise fall cutoff
+                    // BEFORE ClearFaults so the fallen torso (~65-71 deg) can push off without re-tripping.
+                    if self.saved_recovery_gains.is_none() {
+                        self.saved_recovery_gains =
+                            Some((self.model.balance_gains, self.model.walk_cmd.balance_enabled));
+                    }
+                    self.model.walk_cmd.balance_enabled = false;
+                    let mut rec_gains = self.model.balance_gains;
+                    rec_gains.fall_cutoff_rad = RECOVERY_PLAYBACK_CUTOFF_RAD;
+                    self.model.update_balance_gains(rec_gains);
                     self.model.reset_estop();
                     self.recovery_state = RecoveryState::ClearingFault;
                     self.model.status_message =
@@ -839,6 +933,7 @@ impl RockyStudioApp {
                     self.model.walk_cmd.walk_enabled = false;
                     if let Some(idx) = self.recovery_move_index() {
                         self.model.play_move(idx);
+                        self.transport.set_recovery_progress(Some(0.0));
                         self.recovery_state = RecoveryState::PlayingGetUp;
                         self.model.status_message = format!(
                             "Recovery step 3/3: playing '{}'.",
@@ -846,6 +941,7 @@ impl RockyStudioApp {
                         );
                     } else {
                         // No matching motion: fail safe instead of playing the wrong move.
+                        self.restore_recovery_gains();
                         self.model.set_authority_mode(ControlMode::Teach);
                         self.recovery_state = RecoveryState::Completed;
                         self.model.status_message = format!(
@@ -857,7 +953,11 @@ impl RockyStudioApp {
             }
             RecoveryState::PlayingGetUp => {
                 self.model.walk_cmd.walk_enabled = false;
-                if self.model.playback.is_none() {
+                if let Some(pb) = &self.model.playback {
+                    self.transport.set_recovery_progress(Some(pb.progress));
+                } else {
+                    self.transport.set_recovery_progress(None);
+                    self.restore_recovery_gains();
                     self.model.set_authority_mode(ControlMode::Teach);
                     self.recovery_state = RecoveryState::Completed;
                     self.model.status_message =

@@ -53,6 +53,8 @@ pub trait RobotTransport {
     fn apply_push_impulse(&mut self, _pitch_impulse_rad_s: f32, _roll_impulse_rad_s: f32) {}
     /// Resets the simulated torso upright at 0 deg pitch/roll (Sim mode only).
     fn reset_upright(&mut self) {}
+    /// Updates active get-up recovery progress (`Some(0.0..=1.0)`) for simulated ground push-off.
+    fn set_recovery_progress(&mut self, _progress: Option<f32>) {}
     fn is_recording(&self) -> bool {
         false
     }
@@ -161,6 +163,10 @@ impl RobotTransport for SimTransport {
 
     fn reset_upright(&mut self) {
         self.runner.reset_upright();
+    }
+
+    fn set_recovery_progress(&mut self, progress: Option<f32>) {
+        self.runner.set_recovery_progress(progress);
     }
 
     fn is_recording(&self) -> bool {
