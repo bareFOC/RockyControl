@@ -4,12 +4,14 @@
 //! - [`bundle`]: In-memory `AssetBundle`, `.zip` mesh resolution, and CRC32-verified MCU flash blobs
 //! - [`kinematics`]: `urdf-rs` parsing, `k::Chain<f32>` FK evaluation, ROS Z-Up auto-detection, and grounding
 //! - [`studio`]: Bidirectional mirroring authority state machine (`Teach`, `Drive`, `EStop`), keyframes, and playback
+//! - [`strike_optimizer`]: Host-only offline impact-aware strike keyframe optimizer (never linked into firmware)
 //! - [`samples`]: Built-in test URDF presets
 
 pub mod bundle;
 pub mod kinematics;
 pub mod samples;
 pub mod studio;
+pub mod strike_optimizer;
 
 pub use bundle::{AssetBundle, BUNDLED_URDF_XML, BundleDiagnostics, ModelSource};
 pub use k::nalgebra;
@@ -19,6 +21,11 @@ pub use kinematics::{
 pub use studio::{
     ActionMove, CalibrationFile, Keyframe, PlaybackState, StudioModel, cubic_smoothstep,
     default_combat_library, sample_action_move,
+};
+pub use strike_optimizer::{
+    BindingConstraint, OptimizedStrike, OptimizerError, StrikeExport, StrikeMetrics, StrikeParams,
+    StrikeTarget, export_strikes_json, import_strikes_json, optimize_and_export_json,
+    optimize_strike, optimize_strikes, optimized_strikes,
 };
 
 #[cfg(test)]

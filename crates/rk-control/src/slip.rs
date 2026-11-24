@@ -60,11 +60,7 @@ pub const DEFAULT_CBF_KAPPA: f32 = 3.0_f32;
 
 #[inline]
 fn finite_or(x: f32, fallback: f32) -> f32 {
-    if x.is_finite() {
-        x
-    } else {
-        fallback
-    }
+    if x.is_finite() { x } else { fallback }
 }
 
 /// Complete parameter set of the SLIP running template.
@@ -154,27 +150,32 @@ impl SlipConfig {
         let mut c = *self;
         c.mass_kg = finite_or(c.mass_kg, DEFAULT_MASS_KG).clamp(0.5_f32, 5.0_f32);
         c.spring_k_n_per_m = finite_or(c.spring_k_n_per_m, DEFAULT_SPRING_K_N_PER_M).max(1.0_f32);
-        c.rest_length_m = finite_or(c.rest_length_m, DEFAULT_REST_LENGTH_M).clamp(0.05_f32, 0.5_f32);
+        c.rest_length_m =
+            finite_or(c.rest_length_m, DEFAULT_REST_LENGTH_M).clamp(0.05_f32, 0.5_f32);
         c.target_hop_m = finite_or(c.target_hop_m, DEFAULT_TARGET_HOP_M).clamp(0.02_f32, 0.04_f32);
         c.gravity_m_s2 = finite_or(c.gravity_m_s2, DEFAULT_GRAVITY_M_S2).clamp(1.0_f32, 20.0_f32);
-        c.flight_debounce_s = finite_or(c.flight_debounce_s, DEFAULT_FLIGHT_DEBOUNCE_S)
-            .clamp(0.010_f32, 0.015_f32);
+        c.flight_debounce_s =
+            finite_or(c.flight_debounce_s, DEFAULT_FLIGHT_DEBOUNCE_S).clamp(0.010_f32, 0.015_f32);
         c.touchdown_debounce_s = finite_or(c.touchdown_debounce_s, DEFAULT_TOUCHDOWN_DEBOUNCE_S)
             .clamp(0.001_f32, 0.005_f32);
-        c.flight_current_threshold_ma =
-            finite_or(c.flight_current_threshold_ma, DEFAULT_FLIGHT_CURRENT_THRESHOLD_MA)
-                .max(1.0_f32);
+        c.flight_current_threshold_ma = finite_or(
+            c.flight_current_threshold_ma,
+            DEFAULT_FLIGHT_CURRENT_THRESHOLD_MA,
+        )
+        .max(1.0_f32);
         c.freefall_fraction =
             finite_or(c.freefall_fraction, DEFAULT_FREEFALL_FRACTION).clamp(0.05_f32, 0.8_f32);
         c.landing_k0_n_per_m =
             finite_or(c.landing_k0_n_per_m, DEFAULT_LANDING_K0_N_PER_M).max(1.0_f32);
-        c.landing_k1_n_per_m = finite_or(c.landing_k1_n_per_m, DEFAULT_LANDING_K1_N_PER_M)
-            .max(c.landing_k0_n_per_m);
-        c.landing_ramp_s = finite_or(c.landing_ramp_s, DEFAULT_LANDING_RAMP_S)
-            .clamp(0.025_f32, 0.040_f32);
-        c.landing_damping_n_s_per_m =
-            finite_or(c.landing_damping_n_s_per_m, DEFAULT_LANDING_DAMPING_N_S_PER_M)
-                .clamp(40.0_f32, 60.0_f32);
+        c.landing_k1_n_per_m =
+            finite_or(c.landing_k1_n_per_m, DEFAULT_LANDING_K1_N_PER_M).max(c.landing_k0_n_per_m);
+        c.landing_ramp_s =
+            finite_or(c.landing_ramp_s, DEFAULT_LANDING_RAMP_S).clamp(0.025_f32, 0.040_f32);
+        c.landing_damping_n_s_per_m = finite_or(
+            c.landing_damping_n_s_per_m,
+            DEFAULT_LANDING_DAMPING_N_S_PER_M,
+        )
+        .clamp(40.0_f32, 60.0_f32);
         c.moment_arm_m = finite_or(c.moment_arm_m, DEFAULT_MOMENT_ARM_M).clamp(0.01_f32, 0.2_f32);
         c.max_force_n = finite_or(c.max_force_n, DEFAULT_MAX_FORCE_N).max(1.0_f32);
         c.cbf_kappa = finite_or(c.cbf_kappa, DEFAULT_CBF_KAPPA).max(0.0_f32);
@@ -217,8 +218,7 @@ impl FlightDetector {
         let dt = finite_or(dt_s, 0.005_f32).clamp(0.0_f32, 0.05_f32);
         let low_current = finite_or(leg_current_ma, 1e9_f32) < cfg.flight_current_threshold_ma;
         let free_fall = imu_available
-            && finite_or(specific_force_m_s2, 1e9_f32)
-                < cfg.freefall_fraction * cfg.gravity_m_s2;
+            && finite_or(specific_force_m_s2, 1e9_f32) < cfg.freefall_fraction * cfg.gravity_m_s2;
         let candidate = low_current && free_fall;
 
         // Two independent debounce timers: the air timer measures how long
@@ -394,15 +394,15 @@ impl SlipController {
         }
 
         self.landing_ramp_s = (self.landing_ramp_s + dt).min(cfg.landing_ramp_s);
-        let compression = (cfg.rest_length_m - input.leg_length_m)
-            .clamp(0.0_f32, cfg.rest_length_m);
+        let compression =
+            (cfg.rest_length_m - input.leg_length_m).clamp(0.0_f32, cfg.rest_length_m);
         let damping_force = -cfg.landing_damping_n_s_per_m * input.leg_length_rate_m_s;
 
         // Landing impedance dominates the first `landing_ramp_s` of stance;
         // afterwards the nominal SLIP thrust spring renders push-off. The
         // force is always non-negative (a leg can push but never pull).
-        let landing_force = self.landing_stiffness_at(self.landing_ramp_s) * compression
-            + damping_force;
+        let landing_force =
+            self.landing_stiffness_at(self.landing_ramp_s) * compression + damping_force;
         let thrust_force = cfg.spring_k_n_per_m * compression + damping_force;
         let force = if self.landing_ramp_s < cfg.landing_ramp_s {
             landing_force
@@ -481,10 +481,28 @@ mod tests {
             ..Default::default()
         };
         // 10 ms (2 ticks) is below the 12 ms entry debounce.
-        assert!(!detector.update(dt, air.leg_current_ma, air.specific_force_m_s2, air.imu_available, &cfg));
-        assert!(!detector.update(dt, air.leg_current_ma, air.specific_force_m_s2, air.imu_available, &cfg));
+        assert!(!detector.update(
+            dt,
+            air.leg_current_ma,
+            air.specific_force_m_s2,
+            air.imu_available,
+            &cfg
+        ));
+        assert!(!detector.update(
+            dt,
+            air.leg_current_ma,
+            air.specific_force_m_s2,
+            air.imu_available,
+            &cfg
+        ));
         // Third tick => 15 ms >= 12 ms: flight declared.
-        assert!(detector.update(dt, air.leg_current_ma, air.specific_force_m_s2, air.imu_available, &cfg));
+        assert!(detector.update(
+            dt,
+            air.leg_current_ma,
+            air.specific_force_m_s2,
+            air.imu_available,
+            &cfg
+        ));
 
         // One grounded tick (5 ms) exceeds the 4 ms touchdown debounce, so
         // stance re-entry is immediate at 200 Hz (< 5 ms requirement).
@@ -533,7 +551,11 @@ mod tests {
         assert_eq!(out.phase, SlipPhase::Stance);
         // 5 ms into a 30 ms ramp: K = 800 + 3200*(5/30) = 1333.33 N/m.
         assert!((out.landing_stiffness_n_per_m - 1333.3334_f32).abs() < 0.01);
-        assert!((out.leg_force_n - 40.0_f32).abs() < 0.01, "F = {}" , out.leg_force_n);
+        assert!(
+            (out.leg_force_n - 40.0_f32).abs() < 0.01,
+            "F = {}",
+            out.leg_force_n
+        );
         assert!((out.joint_torque_nm - 2.0_f32).abs() < 0.01);
 
         // After the ramp the nominal thrust spring governs (670 * 0.03 = 20.1 N).
@@ -541,7 +563,11 @@ mod tests {
             let _ = ctrl.step(input);
         }
         let settled = ctrl.step(input);
-        assert!((settled.leg_force_n - 20.1_f32).abs() < 0.01, "F_to = {}", settled.leg_force_n);
+        assert!(
+            (settled.leg_force_n - 20.1_f32).abs() < 0.01,
+            "F_to = {}",
+            settled.leg_force_n
+        );
         assert!(settled.joint_torque_nm <= 1.8_f32 * 2.0_f32);
     }
 
@@ -572,7 +598,10 @@ mod tests {
 
         let land_out = ctrl.step(grounded);
         assert_eq!(land_out.phase, SlipPhase::Stance);
-        assert_eq!(land_out.landing_stiffness_n_per_m, 800.0 + 3200.0 * 0.005 / 0.030);
+        assert_eq!(
+            land_out.landing_stiffness_n_per_m,
+            800.0 + 3200.0 * 0.005 / 0.030
+        );
     }
 
     #[test]

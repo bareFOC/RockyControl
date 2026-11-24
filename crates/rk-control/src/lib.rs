@@ -15,6 +15,7 @@
 pub mod cbf;
 pub mod com_fk;
 pub mod estimator;
+pub mod impact;
 pub mod mass_table;
 pub mod slip;
 pub mod uvc;
@@ -24,17 +25,21 @@ use core::f32::consts::{FRAC_PI_2, PI, TAU};
 use libm::sqrtf;
 
 pub use cbf::{
-    CbfConfig, project_capture_point, project_com_velocity, project_tilt_rate,
-    project_tilt_torque, shield_torque,
+    CbfConfig, project_capture_point, project_com_velocity, project_tilt_rate, project_tilt_torque,
+    shield_torque,
 };
 pub use estimator::{DcmSwingHint, KinematicEstimator};
-pub use slip::{FlightDetector, SlipConfig, SlipController, SlipInputs, SlipOutput, SlipPhase};
+pub use impact::{
+    EFFECTIVE_INERTIA, ImpactConfig, ImpactDetector, ImpactOutput, ImpactSample, MAX_IMPACT_JOINTS,
+    gravity_torque_nm,
+};
 use rk_proto::{
     BalanceGains, BalanceTelemetry, ConfigCmd, ControlMode, FaultFlags, HostToMcu, ImuState,
-    JointCommandMode, MAX_JOINTS, McuToHost, PROTOCOL_VERSION, RunningConfig,
-    WATCHDOG_TIMEOUT_MS, WalkCmd, classify_fall, fall_orientation, uvc_phase,
+    JointCommandMode, MAX_JOINTS, McuToHost, PROTOCOL_VERSION, RunningConfig, WATCHDOG_TIMEOUT_MS,
+    WalkCmd, classify_fall, fall_orientation, uvc_phase,
 };
 use serde::{Deserialize, Serialize};
+pub use slip::{FlightDetector, SlipConfig, SlipController, SlipInputs, SlipOutput, SlipPhase};
 pub use uvc::{LegGeometry, LegIkAngles, UvcController, UvcPhase, UvcStepOutput, solve_leg_ik};
 
 pub const DEFAULT_BASE_SLEW_RAD_PER_SEC: f32 = 2.0;
@@ -103,6 +108,10 @@ pub fn sin_f32(mut x: f32) -> f32 {
 pub fn cos_f32(x: f32) -> f32 {
     sin_f32(x + FRAC_PI_2)
 }
+
+// `impact.rs` intentionally has no wire dependency; keep its fixed capacity in
+// lockstep with the protocol's joint array at compile time.
+const _: [(); 1] = [(); (impact::MAX_IMPACT_JOINTS == MAX_JOINTS) as usize];
 
 pub const DEFAULT_MAX_TORQUE_NM: f32 = 1.8;
 pub const DEFAULT_MAX_VELOCITY_RAD_S: f32 = 8.0;
@@ -238,6 +247,10 @@ pub struct DirectServoKernel {
     running_enabled: bool,
     /// Stateful SLIP controller (holds its own sanitized configuration).
     slip: SlipController,
+    // P4 combat impact detection. `torque_capable` is OFF by default: v1 runs
+    // the current-spike heuristic, v2 firmware opts into the momentum observer.
+    /// Stateful impact detector (momentum observer or v1 current heuristic).
+    impact: ImpactDetector,
 }
 
 impl DirectServoKernel {
@@ -276,6 +289,7 @@ impl DirectServoKernel {
             slip: SlipController::new(SlipConfig::from_nominal_height(
                 LegGeometry::rocky_mk1().nominal_height,
             )),
+            impact: ImpactDetector::new(ImpactConfig::default()),
         }
     }
 
@@ -349,6 +363,38 @@ impl DirectServoKernel {
         self.slip.config
     }
 
+    /// True when the torque-capable momentum observer replaces the v1
+    /// current-spike heuristic. Always `false` by default.
+    pub const fn torque_capable(&self) -> bool {
+        self.impact.config().torque_capable
+    }
+
+    /// Read-only copy of the active impact-detector parameters.
+    pub const fn impact_config(&self) -> ImpactConfig {
+        *self.impact.config()
+    }
+
+    /// Enables/disables the hardware gate. Changing the gate resets the
+    /// detector's baselines so no stale sample can trigger a false impact.
+    pub fn set_torque_capable(&mut self, enabled: bool) {
+        self.impact.set_torque_capable(enabled);
+    }
+
+    /// Replaces the complete impact parameter set (including the gate).
+    pub fn set_impact_config(&mut self, cfg: ImpactConfig) {
+        self.impact.set_config(cfg);
+    }
+
+    /// Debounced impact flag from the most recent tick (before fall/ukemi gating).
+    pub const fn impact_detected(&self) -> bool {
+        self.impact.impact_active()
+    }
+
+    /// Impact magnitude in N·m-equivalent from the most recent tick.
+    pub const fn impact_magnitude_nm(&self) -> f32 {
+        self.impact.last_magnitude_nm()
+    }
+
     /// Maps the wire `RunningConfig` (Group 2) onto the kernel's local
     /// `SlipConfig`. The running crate stays `rk-proto`-agnostic; only this
     /// integrator knows the wire layout. Invalid numeric fields force the
@@ -392,7 +438,11 @@ impl DirectServoKernel {
         let mut measured_vel_rad_s = [0.0_f32; MAX_JOINTS];
         for i in 0..self.joint_count {
             measured_rad[i] = raw_to_calibrated(feedback.raw_angle_rad[i], &self.calibration[i]);
-            let sign = if self.calibration[i].inverted { -1.0_f32 } else { 1.0_f32 };
+            let sign = if self.calibration[i].inverted {
+                -1.0_f32
+            } else {
+                1.0_f32
+            };
             measured_vel_rad_s[i] = sign * feedback.velocity_rad_s[i];
         }
 
@@ -503,6 +553,7 @@ impl DirectServoKernel {
                     self.estimator.reset();
                     self.uvc_blend = 0.0;
                     self.slip.reset();
+                    self.impact.reset();
                     self.fall_orientation = fall_orientation::UNKNOWN;
                     cleared_faults_this_tick = true;
                 }
@@ -535,6 +586,7 @@ impl DirectServoKernel {
                     self.applied_target_rad = measured_rad;
                     self.uvc.reset();
                     self.uvc_blend = 0.0;
+                    self.impact.reset();
                 }
                 self.active_mode = cmd.mode;
             }
@@ -639,42 +691,66 @@ impl DirectServoKernel {
                 } else {
                     // Bumpless ramp into UVC leg targets (instant when actively catching a shove or tucking)
                     let target_blend = 1.0_f32;
-                    let ramp_rate = if uvc_out.in_fall_tuck
-                        || uvc_out.phase == UvcPhase::ActiveCatchStep
-                    {
-                        24.0_f32
-                    } else {
-                        8.0_f32
-                    };
-                    self.uvc_blend += (target_blend - self.uvc_blend) * (dt * ramp_rate).clamp(0.0, 1.0);
+                    let ramp_rate =
+                        if uvc_out.in_fall_tuck || uvc_out.phase == UvcPhase::ActiveCatchStep {
+                            24.0_f32
+                        } else {
+                            8.0_f32
+                        };
+                    self.uvc_blend +=
+                        (target_blend - self.uvc_blend) * (dt * ramp_rate).clamp(0.0, 1.0);
                     let b = self.uvc_blend;
                     let lerp = |a: f32, t: f32| a + (t - a) * b;
 
                     if has_6dof_legs {
-                        desired_rad[J21_L_HIP_YAW] = lerp(desired_rad[J21_L_HIP_YAW], uvc_out.left_leg.hip_yaw);
-                        desired_rad[J21_L_HIP_ROLL] = lerp(desired_rad[J21_L_HIP_ROLL], uvc_out.left_leg.hip_roll);
-                        desired_rad[J21_L_HIP_PITCH] = lerp(desired_rad[J21_L_HIP_PITCH], uvc_out.left_leg.hip_pitch);
-                        desired_rad[J21_L_KNEE_PITCH] = lerp(desired_rad[J21_L_KNEE_PITCH], uvc_out.left_leg.knee_pitch);
-                        desired_rad[J21_L_ANKLE_PITCH] = lerp(desired_rad[J21_L_ANKLE_PITCH], uvc_out.left_leg.ankle_pitch);
-                        desired_rad[J21_L_ANKLE_ROLL] = lerp(desired_rad[J21_L_ANKLE_ROLL], uvc_out.left_leg.ankle_roll);
+                        desired_rad[J21_L_HIP_YAW] =
+                            lerp(desired_rad[J21_L_HIP_YAW], uvc_out.left_leg.hip_yaw);
+                        desired_rad[J21_L_HIP_ROLL] =
+                            lerp(desired_rad[J21_L_HIP_ROLL], uvc_out.left_leg.hip_roll);
+                        desired_rad[J21_L_HIP_PITCH] =
+                            lerp(desired_rad[J21_L_HIP_PITCH], uvc_out.left_leg.hip_pitch);
+                        desired_rad[J21_L_KNEE_PITCH] =
+                            lerp(desired_rad[J21_L_KNEE_PITCH], uvc_out.left_leg.knee_pitch);
+                        desired_rad[J21_L_ANKLE_PITCH] =
+                            lerp(desired_rad[J21_L_ANKLE_PITCH], uvc_out.left_leg.ankle_pitch);
+                        desired_rad[J21_L_ANKLE_ROLL] =
+                            lerp(desired_rad[J21_L_ANKLE_ROLL], uvc_out.left_leg.ankle_roll);
 
-                        desired_rad[J21_R_HIP_YAW] = lerp(desired_rad[J21_R_HIP_YAW], uvc_out.right_leg.hip_yaw);
-                        desired_rad[J21_R_HIP_ROLL] = lerp(desired_rad[J21_R_HIP_ROLL], uvc_out.right_leg.hip_roll);
-                        desired_rad[J21_R_HIP_PITCH] = lerp(desired_rad[J21_R_HIP_PITCH], uvc_out.right_leg.hip_pitch);
-                        desired_rad[J21_R_KNEE_PITCH] = lerp(desired_rad[J21_R_KNEE_PITCH], uvc_out.right_leg.knee_pitch);
-                        desired_rad[J21_R_ANKLE_PITCH] = lerp(desired_rad[J21_R_ANKLE_PITCH], uvc_out.right_leg.ankle_pitch);
-                        desired_rad[J21_R_ANKLE_ROLL] = lerp(desired_rad[J21_R_ANKLE_ROLL], uvc_out.right_leg.ankle_roll);
+                        desired_rad[J21_R_HIP_YAW] =
+                            lerp(desired_rad[J21_R_HIP_YAW], uvc_out.right_leg.hip_yaw);
+                        desired_rad[J21_R_HIP_ROLL] =
+                            lerp(desired_rad[J21_R_HIP_ROLL], uvc_out.right_leg.hip_roll);
+                        desired_rad[J21_R_HIP_PITCH] =
+                            lerp(desired_rad[J21_R_HIP_PITCH], uvc_out.right_leg.hip_pitch);
+                        desired_rad[J21_R_KNEE_PITCH] =
+                            lerp(desired_rad[J21_R_KNEE_PITCH], uvc_out.right_leg.knee_pitch);
+                        desired_rad[J21_R_ANKLE_PITCH] = lerp(
+                            desired_rad[J21_R_ANKLE_PITCH],
+                            uvc_out.right_leg.ankle_pitch,
+                        );
+                        desired_rad[J21_R_ANKLE_ROLL] =
+                            lerp(desired_rad[J21_R_ANKLE_ROLL], uvc_out.right_leg.ankle_roll);
                     } else {
                         // Graceful degradation for legacy 17-DoF 4-DoF-leg URDFs
-                        desired_rad[J17_L_HIP_PITCH] = lerp(desired_rad[J17_L_HIP_PITCH], uvc_out.left_leg.hip_pitch);
-                        desired_rad[J17_L_HIP_ROLL] = lerp(desired_rad[J17_L_HIP_ROLL], uvc_out.left_leg.hip_roll);
-                        desired_rad[J17_L_KNEE_PITCH] = lerp(desired_rad[J17_L_KNEE_PITCH], uvc_out.left_leg.knee_pitch);
-                        desired_rad[J17_L_ANKLE_PITCH] = lerp(desired_rad[J17_L_ANKLE_PITCH], uvc_out.left_leg.ankle_pitch);
+                        desired_rad[J17_L_HIP_PITCH] =
+                            lerp(desired_rad[J17_L_HIP_PITCH], uvc_out.left_leg.hip_pitch);
+                        desired_rad[J17_L_HIP_ROLL] =
+                            lerp(desired_rad[J17_L_HIP_ROLL], uvc_out.left_leg.hip_roll);
+                        desired_rad[J17_L_KNEE_PITCH] =
+                            lerp(desired_rad[J17_L_KNEE_PITCH], uvc_out.left_leg.knee_pitch);
+                        desired_rad[J17_L_ANKLE_PITCH] =
+                            lerp(desired_rad[J17_L_ANKLE_PITCH], uvc_out.left_leg.ankle_pitch);
 
-                        desired_rad[J17_R_HIP_PITCH] = lerp(desired_rad[J17_R_HIP_PITCH], uvc_out.right_leg.hip_pitch);
-                        desired_rad[J17_R_HIP_ROLL] = lerp(desired_rad[J17_R_HIP_ROLL], uvc_out.right_leg.hip_roll);
-                        desired_rad[J17_R_KNEE_PITCH] = lerp(desired_rad[J17_R_KNEE_PITCH], uvc_out.right_leg.knee_pitch);
-                        desired_rad[J17_R_ANKLE_PITCH] = lerp(desired_rad[J17_R_ANKLE_PITCH], uvc_out.right_leg.ankle_pitch);
+                        desired_rad[J17_R_HIP_PITCH] =
+                            lerp(desired_rad[J17_R_HIP_PITCH], uvc_out.right_leg.hip_pitch);
+                        desired_rad[J17_R_HIP_ROLL] =
+                            lerp(desired_rad[J17_R_HIP_ROLL], uvc_out.right_leg.hip_roll);
+                        desired_rad[J17_R_KNEE_PITCH] =
+                            lerp(desired_rad[J17_R_KNEE_PITCH], uvc_out.right_leg.knee_pitch);
+                        desired_rad[J17_R_ANKLE_PITCH] = lerp(
+                            desired_rad[J17_R_ANKLE_PITCH],
+                            uvc_out.right_leg.ankle_pitch,
+                        );
                     }
 
                     // Waist coupling + upper-body arm counter-spread (`armCont`)
@@ -700,6 +776,9 @@ impl DirectServoKernel {
                     running_active: false,
                     flight_detected: false,
                     running_com_height_m: 0.0,
+                    // Filled in by the impact stage below (after torque control).
+                    impact_detected: false,
+                    impact_magnitude_nm: 0.0,
                 };
             } else {
                 self.uvc.reset();
@@ -731,10 +810,9 @@ impl DirectServoKernel {
             // Virtual leg length proxy from measured knee bend. The torque-capable
             // simulation plant (Group 2) can later supply the true leg length;
             // this estimate is deterministic and uses only f32 encoder inputs.
-            let knee_rad = 0.5_f32
-                * (measured_rad[J21_L_KNEE_PITCH] + measured_rad[J21_R_KNEE_PITCH]);
-            let hip_height = (geom.nominal_height
-                - geom.thigh_len * (knee_rad - 0.35_f32))
+            let knee_rad =
+                0.5_f32 * (measured_rad[J21_L_KNEE_PITCH] + measured_rad[J21_R_KNEE_PITCH]);
+            let hip_height = (geom.nominal_height - geom.thigh_len * (knee_rad - 0.35_f32))
                 .clamp(geom.min_height, geom.nominal_height + 0.06_f32);
             let leg_length_m = cfg.rest_length_m * (hip_height / geom.nominal_height);
             // Shortening the leg (negative knee rate) compresses the virtual spring.
@@ -743,8 +821,12 @@ impl DirectServoKernel {
                 * geom.thigh_len;
 
             let leg_idx = [
-                J21_L_HIP_PITCH, J21_L_KNEE_PITCH, J21_L_ANKLE_PITCH,
-                J21_R_HIP_PITCH, J21_R_KNEE_PITCH, J21_R_ANKLE_PITCH,
+                J21_L_HIP_PITCH,
+                J21_L_KNEE_PITCH,
+                J21_L_ANKLE_PITCH,
+                J21_R_HIP_PITCH,
+                J21_R_KNEE_PITCH,
+                J21_R_ANKLE_PITCH,
             ];
             let mut leg_current_ma = 0.0_f32;
             for &i in &leg_idx {
@@ -913,6 +995,29 @@ impl DirectServoKernel {
                 torque_nm_out[i] = 0.0;
             }
         }
+
+        // 6b. P4 combat impact detection. Runs *after* the safety/torque stage
+        // so the momentum observer sees exactly the torque applied this tick.
+        // The result is telemetry only: fall/ukemi logic retains priority and
+        // no servo command is modified by an impact.
+        let impact_out = if self.active_mode == ControlMode::Drive {
+            self.impact.step(&ImpactSample {
+                dt_s: dt,
+                joint_count: self.joint_count,
+                angles: &measured_rad,
+                velocities: &measured_vel_rad_s,
+                torque_nm: &torque_nm_out,
+                current_ma: &feedback.current_ma,
+            })
+        } else {
+            self.impact.reset();
+            ImpactOutput::default()
+        };
+        let fall_priority =
+            ukemi_active || self.latched_faults.contains(FaultFlags::TILT_FALL_CUTOFF);
+        balance_telem.impact_detected = impact_out.impact && !fall_priority;
+        balance_telem.impact_magnitude_nm = impact_out.magnitude_nm;
+        estimator_telem.valid_mask |= rk_proto::estimator_valid::IMPACT;
 
         let telemetry = McuToHost {
             protocol_version: PROTOCOL_VERSION,
@@ -1091,10 +1196,22 @@ mod tests {
         }
         assert_eq!(out.telemetry.active_mode, ControlMode::Drive);
         assert!(out.telemetry.balance.balance_active);
-        assert_eq!(out.telemetry.balance.uvc_phase, uvc_phase::ACTIVE_CATCH_STEP);
-        assert_eq!(out.telemetry.balance.support_foot, 1, "left foot catches -roll lean");
-        assert!(out.telemetry.balance.foot_dx_m > 0.02, "foot must step forward under forward tilt");
-        assert!(out.telemetry.balance.foot_dy_m < -0.01, "left foot must step left under -roll");
+        assert_eq!(
+            out.telemetry.balance.uvc_phase,
+            uvc_phase::ACTIVE_CATCH_STEP
+        );
+        assert_eq!(
+            out.telemetry.balance.support_foot, 1,
+            "left foot catches -roll lean"
+        );
+        assert!(
+            out.telemetry.balance.foot_dx_m > 0.02,
+            "foot must step forward under forward tilt"
+        );
+        assert!(
+            out.telemetry.balance.foot_dy_m < -0.01,
+            "left foot must step left under -roll"
+        );
 
         // Exceed fall cutoff -> protective FallTuck then EStop with TILT_FALL_CUTOFF
         fb.imu.pitch_rad = 0.90;
@@ -1374,7 +1491,12 @@ mod tests {
         // Sensor absent: no channel derived from live attitude may be marked valid.
         fb.imu.available = false;
         let outage = kernel.step(10, 0.01, Some(&cmd), &fb);
-        assert_eq!(outage.telemetry.estimator.valid_mask, 0);
+        // Impact detection is current-based, so its validity bit is independent
+        // of IMU availability; all IMU-derived channels remain invalid.
+        assert_eq!(
+            outage.telemetry.estimator.valid_mask,
+            rk_proto::estimator_valid::IMPACT
+        );
 
         // Sensor returns with a BNO055 source tag: COM/DCM and that source become valid.
         fb.imu.available = true;
@@ -1421,7 +1543,10 @@ mod tests {
         assert!(!out.telemetry.balance.running_active);
         assert!(!out.telemetry.balance.flight_detected);
         // Host torque passes through verbatim when the gate is off.
-        assert_eq!(out.servo_cmd.command_mode[11], JointCommandMode::Torque.to_wire());
+        assert_eq!(
+            out.servo_cmd.command_mode[11],
+            JointCommandMode::Torque.to_wire()
+        );
         assert!((out.servo_cmd.torque_nm[11] - 0.7_f32).abs() < 1e-6);
 
         // Explicitly disabling twice is a no-op and yields identical commands.
@@ -1481,10 +1606,19 @@ mod tests {
         assert!(!out.telemetry.balance.flight_detected);
         assert_eq!(kernel.slip_phase(), SlipPhase::Stance);
         // Leg joints switch to torque mode and receive SLIP thrust.
-        assert_eq!(out.servo_cmd.command_mode[J21_L_KNEE_PITCH], JointCommandMode::Torque.to_wire());
+        assert_eq!(
+            out.servo_cmd.command_mode[J21_L_KNEE_PITCH],
+            JointCommandMode::Torque.to_wire()
+        );
         let leg_torque = out.servo_cmd.torque_nm[J21_L_KNEE_PITCH];
-        assert!(leg_torque > 0.0_f32, "compressed leg must push off: {leg_torque}");
-        assert!(leg_torque <= 1.8_f32 + 1e-6, "existing torque ceiling must hold: {leg_torque}");
+        assert!(
+            leg_torque > 0.0_f32,
+            "compressed leg must push off: {leg_torque}"
+        );
+        assert!(
+            leg_torque <= 1.8_f32 + 1e-6,
+            "existing torque ceiling must hold: {leg_torque}"
+        );
         // A non-leg joint keeps the host's command mode/value.
         cmd.seq = 2;
         assert_eq!(out.servo_cmd.raw_velocity_rad_s[J21_L_KNEE_PITCH], 0.0);
@@ -1544,10 +1678,182 @@ mod tests {
         let tilted = leaning.step(10, 0.005, Some(&cmd), &leaning_fb);
         let torque_tilted = tilted.servo_cmd.torque_nm[J21_L_KNEE_PITCH];
 
-        assert!(torque_upright > 0.0_f32, "baseline thrust required: {torque_upright}");
+        assert!(
+            torque_upright > 0.0_f32,
+            "baseline thrust required: {torque_upright}"
+        );
         assert!(
             torque_tilted < torque_upright,
             "CBF must minimally reduce the command: {torque_tilted} >= {torque_upright}"
         );
+    }
+
+    // ---- Group 3 (P4): hardware-gated impact detection -------------------
+
+    fn impact_test_kernel() -> DirectServoKernel {
+        let cal = [JointCalibration {
+            min_rad: -2.2_f32,
+            max_rad: 2.2_f32,
+            ..Default::default()
+        }; 21];
+        DirectServoKernel::new(21, &cal)
+    }
+
+    fn impact_test_cmd() -> HostToMcu {
+        HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: (1u32 << 21) - 1,
+            torque_limit_nm: [1.8_f32; MAX_JOINTS],
+            walk: WalkCmd {
+                balance_enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn current_spike_detects_impact_without_changing_servo_commands() {
+        let mut kernel = impact_test_kernel();
+        assert!(!kernel.torque_capable(), "v1 gate must default to OFF");
+        assert!(!kernel.impact_config().torque_capable);
+
+        let mut cmd = impact_test_cmd();
+        let mut fb = RawServoFeedback::default();
+        for c in fb.current_ma.iter_mut() {
+            *c = 200;
+        }
+
+        let quiet = kernel.step(5, 0.005_f32, Some(&cmd), &fb);
+        assert!(!quiet.telemetry.balance.impact_detected);
+        assert_ne!(
+            quiet.telemetry.estimator.valid_mask & rk_proto::estimator_valid::IMPACT,
+            0,
+            "impact telemetry must be marked valid on the v1 path"
+        );
+
+        fb.current_ma[11] = 800; // +600 mA -> 0.54 N·m-equivalent
+        cmd.seq = 2;
+        let first = kernel.step(10, 0.005_f32, Some(&cmd), &fb);
+        assert!(!first.telemetry.balance.impact_detected, "2-tick debounce");
+
+        cmd.seq = 3;
+        let hit = kernel.step(15, 0.005_f32, Some(&cmd), &fb);
+        assert!(hit.telemetry.balance.impact_detected);
+        assert!(hit.telemetry.balance.impact_magnitude_nm > 0.3_f32);
+        assert!(kernel.impact_detected());
+
+        // A second kernel seeing the same command but no current spike must
+        // produce byte-identical servo commands: detection is telemetry-only.
+        let mut control = impact_test_kernel();
+        let mut quiet_fb = fb;
+        quiet_fb.current_ma[11] = 200;
+        let reference = control.step(15, 0.005_f32, Some(&cmd), &quiet_fb);
+        assert_eq!(hit.servo_cmd.torque_nm, reference.servo_cmd.torque_nm);
+        assert_eq!(
+            hit.servo_cmd.raw_target_rad,
+            reference.servo_cmd.raw_target_rad
+        );
+        assert_eq!(hit.servo_cmd.command_mode, reference.servo_cmd.command_mode);
+        assert_eq!(
+            hit.servo_cmd.raw_velocity_rad_s,
+            reference.servo_cmd.raw_velocity_rad_s
+        );
+    }
+
+    #[test]
+    fn momentum_observer_detects_injected_torque_behind_the_gate() {
+        let mut kernel = impact_test_kernel();
+        kernel.set_torque_capable(true);
+        assert!(kernel.torque_capable());
+
+        let angles = [0.0_f32; MAX_JOINTS];
+        let mut hold = [0.0_f32; MAX_IMPACT_JOINTS];
+        gravity_torque_nm(&angles, &mut hold);
+
+        let mut cmd = impact_test_cmd();
+        for i in 0..MAX_JOINTS {
+            cmd.command_mode[i] = JointCommandMode::Torque.to_wire();
+            cmd.torque_limit_nm[i] = -hold[i.min(MAX_IMPACT_JOINTS - 1)];
+        }
+        // Inject +0.6 N·m on hip pitch while the plant does not accelerate:
+        // that is exactly an unmodeled external wrench at the joint.
+        cmd.torque_limit_nm[J21_L_HIP_PITCH] += 0.6_f32;
+
+        let fb = RawServoFeedback::default();
+        let mut impact_seen = false;
+        for tick in 1..=8 {
+            cmd.seq = tick;
+            let out = kernel.step(tick * 5, 0.005_f32, Some(&cmd), &fb);
+            if out.telemetry.balance.impact_detected {
+                impact_seen = true;
+                assert!(
+                    out.telemetry.balance.impact_magnitude_nm > 0.20_f32,
+                    "magnitude must exceed the 0.2 N·m floor"
+                );
+                break;
+            }
+        }
+        assert!(
+            impact_seen,
+            "momentum observer must flag injected external torque"
+        );
+
+        // Same gravity-compensated command without injection stays quiet.
+        let mut quiet_kernel = impact_test_kernel();
+        quiet_kernel.set_torque_capable(true);
+        let mut quiet_cmd = cmd;
+        quiet_cmd.torque_limit_nm[J21_L_HIP_PITCH] -= 0.6_f32;
+        for tick in 1..=8 {
+            quiet_cmd.seq = tick;
+            let out = quiet_kernel.step(tick * 5, 0.005_f32, Some(&quiet_cmd), &fb);
+            assert!(
+                !out.telemetry.balance.impact_detected,
+                "gravity-compensated quiet stance must not flag impact at tick {tick}"
+            );
+        }
+    }
+
+    #[test]
+    fn impact_flag_never_latches_fall_cutoff_and_yields_to_ukemi() {
+        let mut kernel = impact_test_kernel();
+        let mut cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: (1u32 << 21) - 1,
+            walk: WalkCmd {
+                balance_enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut fb = RawServoFeedback::default();
+        fb.imu.available = true;
+        fb.imu.pitch_rad = 0.10_f32; // well below ukemi/fall thresholds
+        for c in fb.current_ma.iter_mut() {
+            *c = 200;
+        }
+
+        // Seed the current baseline with a quiet sample first.
+        let mut out = kernel.step(5, 0.005_f32, Some(&cmd), &fb);
+        fb.current_ma[11] = 800;
+        for tick in 2..=3 {
+            cmd.seq = tick;
+            out = kernel.step(tick * 5, 0.005_f32, Some(&cmd), &fb);
+        }
+        assert!(out.telemetry.balance.impact_detected);
+        assert_eq!(out.telemetry.active_mode, ControlMode::Drive);
+        assert!(!out.telemetry.faults.contains(FaultFlags::TILT_FALL_CUTOFF));
+        assert!(!out.telemetry.faults.contains(FaultFlags::ESTOP_ACTIVE));
+
+        // Ukemi takes priority: the impact channel is suppressed while the
+        // pre-fall torque relaxation is active, but the fall logic is intact.
+        fb.imu.pitch_rad = 0.60_f32;
+        cmd.seq = 5;
+        let ukemi = kernel.step(25, 0.005_f32, Some(&cmd), &fb);
+        assert!(ukemi.telemetry.estimator.ukemi_active);
+        assert!(!ukemi.telemetry.balance.impact_detected);
+        assert_eq!(ukemi.telemetry.active_mode, ControlMode::Drive);
     }
 }

@@ -245,8 +245,8 @@ impl KinematicEstimator {
         let foot_half = gains.foot_half_length_m.clamp(0.015_f32, 0.12_f32);
         let zmp_x = (com_pos[0] - (h_com / GRAVITY_M_S2) * self.com_acc[0])
             .clamp(-foot_half * 2.5_f32, foot_half * 2.5_f32);
-        let zmp_z = (com_pos[2] - (h_com / GRAVITY_M_S2) * self.com_acc[2])
-            .clamp(-foot_half, foot_half);
+        let zmp_z =
+            (com_pos[2] - (h_com / GRAVITY_M_S2) * self.com_acc[2]).clamp(-foot_half, foot_half);
 
         // 5. Support polygon margin against 7 cm foot (±2.8 cm usable sagittal ankle margin).
         let usable_margin = gains.foot_margin_m.clamp(0.010_f32, foot_half);
@@ -280,7 +280,8 @@ impl KinematicEstimator {
         //    CoM & DCM are published only while the IMU is live; a dropout must
         //    not publish stale kinematic state as authoritative.
         let imu_bits = if imu.available {
-            let masked = imu_source_mask & (estimator_valid::LSM6DSV_OK | estimator_valid::BNO055_OK);
+            let masked =
+                imu_source_mask & (estimator_valid::LSM6DSV_OK | estimator_valid::BNO055_OK);
             if masked != 0 {
                 masked
             } else {
@@ -388,7 +389,16 @@ mod tests {
         let angles = [0.0_f32; MAX_JOINTS];
         let vel = [0.0_f32; MAX_JOINTS];
         let (telem, _) = est.step(
-            0.005, 21, &angles, &vel, imu_upright(), 0.4, 0b11, 0, false, gains(),
+            0.005,
+            21,
+            &angles,
+            &vel,
+            imu_upright(),
+            0.4,
+            0b11,
+            0,
+            false,
+            gains(),
         );
         assert!(
             telem.foot_margin_m > 0.0,
@@ -424,7 +434,16 @@ mod tests {
         vel: &[f32; MAX_JOINTS],
     ) -> EstimatorTelemetry {
         let (t, _) = est.step(
-            0.005, 21, angles, vel, imu_upright(), 0.4, 0b11, tick, false, gains(),
+            0.005,
+            21,
+            angles,
+            vel,
+            imu_upright(),
+            0.4,
+            0b11,
+            tick,
+            false,
+            gains(),
         );
         t
     }
@@ -443,7 +462,16 @@ mod tests {
         let before = est.last_telemetry().com_vel_m_s;
         // Switch to left stance (contact_mask 0b01).
         let (after, _) = est.step(
-            0.005, 21, &angles, &vel, imu_upright(), 0.4, 0b01, 20, false, gains(),
+            0.005,
+            21,
+            &angles,
+            &vel,
+            imu_upright(),
+            0.4,
+            0b01,
+            20,
+            false,
+            gains(),
         );
         for axis in 0..3 {
             let delta = (after.com_vel_m_s[axis] - before[axis]).abs();
@@ -465,7 +493,16 @@ mod tests {
             let mut g = gains();
             g.h_com_m = h;
             let (telem, _) = est.step(
-                0.005, 21, &angles, &vel, imu_upright(), 0.4, 0b11, 0, false, g,
+                0.005,
+                21,
+                &angles,
+                &vel,
+                imu_upright(),
+                0.4,
+                0b11,
+                0,
+                false,
+                g,
             );
             telem.dcm_xy_m
         };
@@ -493,9 +530,7 @@ mod tests {
         let vel = [0.0_f32; MAX_JOINTS];
         let mut imu = imu_upright();
         imu.pitch_rad = 0.05;
-        let (telem, _) = est.step(
-            0.005, 17, &angles, &vel, imu, 0.4, 0b11, 0, false, gains(),
-        );
+        let (telem, _) = est.step(0.005, 17, &angles, &vel, imu, 0.4, 0b11, 0, false, gains());
         assert!(telem.valid_mask & estimator_valid::COM != 0);
     }
 }

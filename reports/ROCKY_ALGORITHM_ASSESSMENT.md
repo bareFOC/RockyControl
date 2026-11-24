@@ -217,6 +217,8 @@ The earlier "20 cm hop" is arithmetically correct ($v=\sqrt{2g(0.20)}=1.98$ m/s)
 
 ## 6. Staged roadmap — split by actuator generation (critique §5)
 
+> **P4 STATUS (2026-11-25): IMPLEMENTED.** `p4-combat-behaviors` added scripted combo ActionMoves with balance-restore tails and telemetry-triggered abort→recovery handoff, an offline host-only impact-aware strike optimizer (`rk-model/src/strike_optimizer.rs`, closed-form impulse caps, exports playable keyframes), and hardware-gated impact detection (`rk-control/src/impact.rs`: momentum observer for torque-capable v2, current-spike heuristic for v1; `PROTOCOL_VERSION=5`). Forceful strikes with full effect require v2 torque hardware; learned MLP residual remains deferred (no opponent sensing).
+
 > **P3 STATUS (2026-11-25): IMPLEMENTED (software).** `p3-dynamic-running` added SLIP thrust control (`rk-control/src/slip.rs`, k=670 N/m, 2–4 cm hops, stance ~149 ms), flight detection (current + IMU free-fall, 12 ms debounce), 30 ms landing impedance ramp, scalar CBF safety (`cbf.rs`), and a `RunningConfig` wire field (`PROTOCOL_VERSION=4`). Running is gated OFF by default (v1 unaffected); real running requires v2 torque hardware + ESP32-P4 bring-up. Sim plant validated hop height/flight/landing.
 
 > **P2 STATUS (2026-11-25): IMPLEMENTED.** `p2-robust-walking` added a continuous phase-locked gait clock, Raibert/capture foot placement from support-relative DCM, Khadiv step-timing adaptation, and a gait/estimator telemetry HUD. Optional LIPM-MPC deferred.

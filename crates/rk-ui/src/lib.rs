@@ -819,28 +819,45 @@ impl RockyStudioApp {
         let upright = imu_ok && tilt < nominal_cutoff;
         let settled = imu_ok && rate < RECOVERY_SETTLED_RATE_RAD_S;
         let orientation = FallOrientation::from_wire(telem.balance.fall_orientation);
+        // An action abort in `StudioModel::ingest_telemetry` latches this signal so
+        // recovery can take over even when the MCU has not yet published a fall fault.
+        let aborted = self.model.playback_aborted;
+        if fall_fault && self.fall_orientation == FallOrientation::Unknown {
+            self.fall_orientation = orientation;
+        }
 
         // 1. Latch a new fall (or abort an in-progress get-up on a re-fall / E-Stop).
         match self.recovery_state {
             RecoveryState::Idle | RecoveryState::Completed => {
-                if fall_fault {
+                if fall_fault || aborted {
+                    self.model.playback_aborted = false;
                     self.transport.set_recovery_progress(None);
                     self.restore_recovery_gains();
                     self.fall_event_active = true;
-                    self.fall_orientation = orientation;
+                    if fall_fault || orientation != FallOrientation::Unknown {
+                        self.fall_orientation = orientation;
+                    }
                     self.fall_dwell_sec = 0.0;
                     // Preserve standing opt-in; require fresh confirmation unless auto-recovery is armed.
                     self.operator_confirmed = false;
                     self.get_up_requested = false;
                     self.recovery_state = RecoveryState::FallLatched;
-                    self.model.status_message = format!(
-                        "FALL DETECTED ({}). Click Get Up or confirm Auto Recovery to stand up.",
-                        self.fall_orientation.label()
-                    );
+                    if fall_fault {
+                        self.model.status_message = format!(
+                            "FALL DETECTED ({}). Click Get Up or confirm Auto Recovery to stand up.",
+                            self.fall_orientation.label()
+                        );
+                    } else {
+                        self.model.status_message = format!(
+                            "ACTION ABORTED ({}). Recovery standby — click Get Up or confirm Auto Recovery.",
+                            self.fall_orientation.label()
+                        );
+                    }
                 }
             }
             RecoveryState::PlayingGetUp => {
                 if fall_fault || estop_active {
+                    self.model.playback_aborted = false;
                     self.model.stop_playback();
                     self.transport.set_recovery_progress(None);
                     self.restore_recovery_gains();
@@ -865,6 +882,8 @@ impl RockyStudioApp {
             | RecoveryState::ArmingDrive => {
                 // An operator E-Stop (without a new fall) also aborts an armed sequence.
                 if estop_active && !fall_fault && self.recovery_state != RecoveryState::FallLatched {
+                    self.model.playback_aborted = false;
+                    self.model.recovery_playback = false;
                     self.transport.set_recovery_progress(None);
                     self.restore_recovery_gains();
                     self.model.walk_cmd.walk_enabled = false;
@@ -933,6 +952,10 @@ impl RockyStudioApp {
                     self.model.walk_cmd.walk_enabled = false;
                     if let Some(idx) = self.recovery_move_index() {
                         self.model.play_move(idx);
+                        // Elevated tilt during get-up belongs to this state machine,
+                        // not to the action-abort path in `ingest_telemetry`.
+                        self.model.playback_aborted = false;
+                        self.model.recovery_playback = true;
                         self.transport.set_recovery_progress(Some(0.0));
                         self.recovery_state = RecoveryState::PlayingGetUp;
                         self.model.status_message = format!(
@@ -957,6 +980,7 @@ impl RockyStudioApp {
                     self.transport.set_recovery_progress(Some(pb.progress));
                 } else {
                     self.transport.set_recovery_progress(None);
+                    self.model.recovery_playback = false;
                     self.restore_recovery_gains();
                     self.model.set_authority_mode(ControlMode::Teach);
                     self.recovery_state = RecoveryState::Completed;
@@ -1276,6 +1300,68 @@ mod fall_recovery_tests {
             .model
             .pending_config
             .contains(&ConfigCmd::ClearFaults));
+    }
+
+    /// Pushes a synthetic telemetry frame through the real `ingest_telemetry` path
+    /// so the abort signal is produced exactly as it is in the live control loop.
+    fn ingest(app: &mut RockyStudioApp, fall: bool, pitch: f32, roll: f32, code: u8) {
+        let mut t = app.model.latest_telemetry;
+        t.imu.available = true;
+        t.imu.pitch_rad = pitch;
+        t.imu.roll_rad = roll;
+        t.balance.fall_orientation = code;
+        if fall {
+            t.faults.insert(FaultFlags::TILT_FALL_CUTOFF);
+            t.active_mode = ControlMode::EStop;
+        } else {
+            t.faults.remove(FaultFlags::TILT_FALL_CUTOFF);
+            t.active_mode = ControlMode::Teach;
+        }
+        app.model.ingest_telemetry(t);
+    }
+
+    #[test]
+    fn action_abort_hands_off_to_fall_recovery() {
+        let mut app = new_app();
+        app.model.set_authority_mode(ControlMode::Drive);
+        let combo = app
+            .model
+            .moves
+            .iter()
+            .position(|m| m.category == "Combo")
+            .expect("combo exists");
+        app.model.play_move(combo);
+        assert!(app.model.playback.is_some());
+
+        // Tilt breach before the MCU latches a fall fault.
+        ingest(&mut app, false, 0.62, 0.0, fall_orientation::UNKNOWN);
+        assert!(app.model.playback.is_none());
+        assert!(app.model.playback_aborted);
+
+        app.update_fall_watcher(0.016);
+        assert_eq!(app.recovery_state, RecoveryState::FallLatched);
+        assert!(!app.model.playback_aborted, "handoff signal is consumed once");
+        assert!(app.model.playback.is_none(), "no playback may fight recovery");
+        assert!(app.fall_event_active);
+        assert!(app.model.status_message.contains("ACTION ABORTED"));
+    }
+
+    #[test]
+    fn get_up_playback_is_not_aborted_by_its_own_tilt() {
+        let mut app = new_app();
+        drive_to_playback(&mut app, fall_orientation::PRONE);
+        assert!(app.model.recovery_playback);
+
+        ingest(&mut app, false, 1.10, 0.0, fall_orientation::UNKNOWN);
+        assert!(app.model.playback.is_some());
+        assert!(!app.model.playback_aborted);
+
+        // A genuine new fall still cuts get-up playback and re-latches.
+        ingest(&mut app, true, 1.20, 0.0, fall_orientation::PRONE);
+        app.update_fall_watcher(0.016);
+        assert!(app.model.playback.is_none());
+        assert_eq!(app.recovery_state, RecoveryState::FallLatched);
+        assert_eq!(app.fall_orientation, FallOrientation::Prone);
     }
 }
 

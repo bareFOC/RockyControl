@@ -147,13 +147,16 @@ pub fn solve_leg_ik(
 
     let l1 = geom.thigh_len;
     let l2 = geom.shin_len;
-    let d_safe = d.clamp((l1 - l2).abs() + 0.01_f32, (l1 + l2 - 0.0005_f32).min(geom.max_reach));
+    let d_safe = d.clamp(
+        (l1 - l2).abs() + 0.01_f32,
+        (l1 + l2 - 0.0005_f32).min(geom.max_reach),
+    );
 
     let x_ang = asinf((x / d_safe).clamp(-0.999_f32, 0.999_f32));
-    let cos_hip = ((l1 * l1 + d_safe * d_safe - l2 * l2) / (2.0_f32 * l1 * d_safe))
-        .clamp(-1.0_f32, 1.0_f32);
-    let cos_knee = ((l1 * l1 + l2 * l2 - d_safe * d_safe) / (2.0_f32 * l1 * l2))
-        .clamp(-1.0_f32, 1.0_f32);
+    let cos_hip =
+        ((l1 * l1 + d_safe * d_safe - l2 * l2) / (2.0_f32 * l1 * d_safe)).clamp(-1.0_f32, 1.0_f32);
+    let cos_knee =
+        ((l1 * l1 + l2 * l2 - d_safe * d_safe) / (2.0_f32 * l1 * l2)).clamp(-1.0_f32, 1.0_f32);
 
     let hip_bend = acosf(cos_hip).min(MAX_HALF_KNEE_RAD);
     let knee_bend = (PI - acosf(cos_knee)).clamp(0.0_f32, 2.0_f32 * MAX_HALF_KNEE_RAD);
@@ -365,7 +368,10 @@ impl UvcController {
     /// computed on the previous tick — the intended 1-tick-lagged sharing from
     /// the P1 design. No state-machine refactor is required.
     pub fn bias_compensated_attitude(&self, imu: &ImuState) -> (f32, f32) {
-        (imu.pitch_rad - self.pitch_bias, imu.roll_rad - self.roll_bias)
+        (
+            imu.pitch_rad - self.pitch_bias,
+            imu.roll_rad - self.roll_bias,
+        )
     }
 
     /// Foot contact bitmask (`bit 0 = Right stance`, `bit 1 = Left stance`) for air-gating CoM velocity.
@@ -645,7 +651,8 @@ impl UvcController {
                     && imu.roll_rate_rad_s.abs() < 0.08_f32
                 {
                     let drift = (0.04_f32 * dt).clamp(0.0_f32, 0.005_f32);
-                    self.pitch_bias = (self.pitch_bias + raw_pitch * drift).clamp(-0.08_f32, 0.08_f32);
+                    self.pitch_bias =
+                        (self.pitch_bias + raw_pitch * drift).clamp(-0.08_f32, 0.08_f32);
                     self.roll_bias = (self.roll_bias + raw_roll * drift).clamp(-0.08_f32, 0.08_f32);
                 }
 
@@ -658,7 +665,11 @@ impl UvcController {
                     // The free-running phase clock drives support swaps: which
                     // half of the cycle the accumulator occupies is the stance
                     // foot, and progress is the position within that half.
-                    let phase_support = if self.phase_accum_rad >= PI { 1_u8 } else { 0_u8 };
+                    let phase_support = if self.phase_accum_rad >= PI {
+                        1_u8
+                    } else {
+                        0_u8
+                    };
                     if phase_support != self.support_foot {
                         // Half-cycle boundary crossed -> foot landing. Apply
                         // the same CoP bleed as the timer-driven landing path.
@@ -702,7 +713,11 @@ impl UvcController {
                 // Superpose commanded walking stride (`WalkCmd`) onto UVC foot landing target
                 if wants_walk {
                     let target_walk_x = vx * self.geom.max_dx * 0.68_f32;
-                    let lat_sign = if self.support_foot == 0 { -1.0_f32 } else { 1.0_f32 };
+                    let lat_sign = if self.support_foot == 0 {
+                        -1.0_f32
+                    } else {
+                        1.0_f32
+                    };
                     let target_walk_y = (vy * lat_sign * self.geom.max_dy * 0.55_f32).max(0.0_f32);
                     let walk_blend = (dt * 7.5_f32).clamp(0.0_f32, 1.0_f32);
                     self.dxi = (self.dxi + (target_walk_x - self.dxi) * walk_blend)
@@ -714,11 +729,16 @@ impl UvcController {
                 // Swing-foot landing ONLY. With a valid DCM channel the capture target
                 // (ξ + K_v·(v_des − v_com)/ω) is authoritative; the legacy hint is a fallback.
                 // `dxi`/`dyi` (stance hip) are never written here — UVC remains I-only.
-                let swing_lat_sign = if self.support_foot == 0 { -1.0_f32 } else { 1.0_f32 };
+                let swing_lat_sign = if self.support_foot == 0 {
+                    -1.0_f32
+                } else {
+                    1.0_f32
+                };
                 if capture_valid {
                     self.dxis = capture_sag.clamp(-self.geom.max_swing_dx, self.geom.max_swing_dx);
                     // Right-positive world lateral -> outward-from-pelvis on the swing side.
-                    self.dyis = (capture_lat * swing_lat_sign).clamp(0.0_f32, self.geom.max_swing_dy);
+                    self.dyis =
+                        (capture_lat * swing_lat_sign).clamp(0.0_f32, self.geom.max_swing_dy);
                 } else {
                     let dcm_swing_y = (dcm.swing_dy_m * swing_lat_sign).max(0.0_f32);
                     self.dxis = (-self.dxi + dcm.swing_dx_m)
@@ -735,9 +755,9 @@ impl UvcController {
                     step_h_scale
                 } else {
                     // Scale catch-step lift with disturbance magnitude so tiny corrections don't stomp
-                    let offset_norm =
-                        (sqrtf(self.dxi * self.dxi + self.dyi * self.dyi) / self.geom.max_dx)
-                            .clamp(0.28_f32, 1.0_f32);
+                    let offset_norm = (sqrtf(self.dxi * self.dxi + self.dyi * self.dyi)
+                        / self.geom.max_dx)
+                        .clamp(0.28_f32, 1.0_f32);
                     step_h_scale * offset_norm
                 };
                 swing_lift_m = self.geom.max_foot_lift * lift_scale * sinf(PI * progress);
@@ -854,7 +874,9 @@ impl UvcController {
         // 5. Solve 6-DoF Analytic Leg IK for support and swing legs
         let sup_x = self.dxi;
         let sup_y = (self.dyi - self.sway).max(0.0_f32);
-        let sup_h = self.auto_h.clamp(self.geom.min_height, self.geom.nominal_height);
+        let sup_h = self
+            .auto_h
+            .clamp(self.geom.min_height, self.geom.nominal_height);
 
         let swg_x = self.dxis;
         let swg_y = (self.dyis + self.sway).max(0.0_f32);
@@ -879,11 +901,9 @@ impl UvcController {
         let mut pitch_corr = 0.0_f32;
         let mut roll_corr = 0.0_f32;
         if walk.balance_enabled {
-            let damp_p = (-gains.gyro_damp_pitch * imu.pitch_rate_rad_s
-                - 0.22_f32 * raw_pitch)
+            let damp_p = (-gains.gyro_damp_pitch * imu.pitch_rate_rad_s - 0.22_f32 * raw_pitch)
                 .clamp(-0.35_f32, 0.35_f32);
-            let damp_r = (-gains.gyro_damp_roll * imu.roll_rate_rad_s
-                - 0.22_f32 * raw_roll)
+            let damp_r = (-gains.gyro_damp_roll * imu.roll_rate_rad_s - 0.22_f32 * raw_roll)
                 .clamp(-0.30_f32, 0.30_f32);
 
             left_leg.ankle_pitch += damp_p;
@@ -937,11 +957,7 @@ impl UvcController {
         // a catch step always starts at progress 0, so its accumulator value is
         // the start of the selected support foot's half-cycle (0 or π). This
         // makes `gait_phase_rad` continuous across the state/clock handoff.
-        self.phase_accum_rad = if self.support_foot == 0 {
-            0.0_f32
-        } else {
-            PI
-        };
+        self.phase_accum_rad = if self.support_foot == 0 { 0.0_f32 } else { PI };
     }
 
     /// Core ai2001 spherical-projection UVC integration (`uvc()` in `main.c`) with
@@ -1029,9 +1045,19 @@ mod tests {
     #[test]
     fn analytic_6dof_leg_ik_keeps_sole_strictly_parallel_on_khr_and_rocky() {
         for geom in [LegGeometry::khr_3hv(), LegGeometry::rocky_mk1()] {
-            let xs = [-geom.max_dx, -geom.max_dx * 0.4, 0.0, geom.max_dx * 0.5, geom.max_dx];
+            let xs = [
+                -geom.max_dx,
+                -geom.max_dx * 0.4,
+                0.0,
+                geom.max_dx * 0.5,
+                geom.max_dx,
+            ];
             let ys = [0.0, geom.max_dy * 0.5, geom.max_dy];
-            let hs = [geom.min_height, (geom.min_height + geom.nominal_height) * 0.5, geom.nominal_height];
+            let hs = [
+                geom.min_height,
+                (geom.min_height + geom.nominal_height) * 0.5,
+                geom.nominal_height,
+            ];
             for &x in &xs {
                 for &y in &ys {
                     for &h in &hs {
@@ -1101,8 +1127,14 @@ mod tests {
             out = ctrl.step(0.005, imu_lean, walk, gains);
         }
         assert_eq!(out.phase, UvcPhase::ActiveCatchStep);
-        assert!(out.foot_dx_m > 0.02, "foot must project forward under forward lean");
-        assert!(out.foot_dy_m > 0.005, "right foot must project right under +roll lean");
+        assert!(
+            out.foot_dx_m > 0.02,
+            "foot must project forward under forward lean"
+        );
+        assert!(
+            out.foot_dy_m > 0.005,
+            "right foot must project right under +roll lean"
+        );
         assert!(!out.in_fall_tuck);
 
         // Exceed fall cutoff -> enters protective FallTuck for 40 ms before cutoff ready
@@ -1125,7 +1157,10 @@ mod tests {
         for _ in 0..6 {
             tuck_end = ctrl.step(0.01, imu_fall, walk, gains);
         }
-        assert!(tuck_end.fall_cutoff_ready, "cutoff must fire after 40 ms tuck");
+        assert!(
+            tuck_end.fall_cutoff_ready,
+            "cutoff must fire after 40 ms tuck"
+        );
     }
 
     /// Group 1 (P2): phase advances by exactly one fixed-dt increment every
@@ -1248,12 +1283,11 @@ mod tests {
             }
         }
         let entry = entry.expect("walking must engage a catch step");
-        assert_eq!(entry.support_foot, 0, "+roll lean must select right support");
-        let locked = if entry.support_foot == 0 {
-            0.0_f32
-        } else {
-            PI
-        };
+        assert_eq!(
+            entry.support_foot, 0,
+            "+roll lean must select right support"
+        );
+        let locked = if entry.support_foot == 0 { 0.0_f32 } else { PI };
         assert!(
             (entry.gait_phase_rad - locked).abs() < 1e-5,
             "catch-step entry must lock phase to synthetic progress 0 (got {}, expected {locked})",
@@ -1324,14 +1358,7 @@ mod tests {
         let omega = sqrtf(GRAVITY_M_S2 / gains.h_com_m);
         let v_des = walk.vx.clamp(-1.0, 1.0) * 0.5_f32;
         let telem = capture_telemetry(v_des / omega, v_des, true);
-        let out = ctrl.step_with_dcm(
-            0.005,
-            imu,
-            walk,
-            gains,
-            DcmSwingHint::default(),
-            telem,
-        );
+        let out = ctrl.step_with_dcm(0.005, imu, walk, gains, DcmSwingHint::default(), telem);
 
         let (dxis, _) = ctrl.swing_targets();
         assert!(
@@ -1432,22 +1459,10 @@ mod tests {
         let mut out_valid = UvcStepOutput::default();
         let mut out_invalid = UvcStepOutput::default();
         for _ in 0..10 {
-            out_valid = valid.step_with_dcm(
-                0.005,
-                imu,
-                walk,
-                gains,
-                DcmSwingHint::default(),
-                telem,
-            );
-            out_invalid = invalid.step_with_dcm(
-                0.005,
-                imu,
-                walk,
-                gains,
-                DcmSwingHint::default(),
-                gated,
-            );
+            out_valid =
+                valid.step_with_dcm(0.005, imu, walk, gains, DcmSwingHint::default(), telem);
+            out_invalid =
+                invalid.step_with_dcm(0.005, imu, walk, gains, DcmSwingHint::default(), gated);
             phase_valid = out_valid.phase;
             phase_invalid = out_invalid.phase;
         }

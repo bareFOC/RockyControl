@@ -194,6 +194,32 @@ pub fn default_combat_library(rig: &KinematicRig) -> Vec<ActionMove> {
         ("r_ankle_pitch", 0.42),
     ]);
 
+    // Capture-safe Guard used as the final balance-restore stage of every combo:
+    // centred waist, tight arms, and a slightly deeper symmetric crouch lower the CoM
+    // and keep the capture point inside the support margin while momentum decays.
+    let capture_guard = pose(&[
+        ("waist_yaw", 0.10),
+        ("head_yaw", -0.08),
+        ("l_shoulder_pitch", -1.04),
+        ("l_shoulder_roll", 0.16),
+        ("l_elbow_pitch", -1.64),
+        ("r_shoulder_pitch", -1.10),
+        ("r_shoulder_roll", -0.16),
+        ("r_elbow_pitch", -1.74),
+        ("l_hip_pitch", -0.34),
+        ("l_knee_pitch", 0.62),
+        ("l_ankle_pitch", -0.28),
+        ("r_hip_pitch", -0.30),
+        ("r_knee_pitch", 0.58),
+        ("r_ankle_pitch", -0.26),
+    ]);
+
+    let kf = |label: &str, duration_ms: u32, angles_rad: [f32; MAX_JOINTS]| Keyframe {
+        label: label.to_string(),
+        duration_ms,
+        angles_rad,
+    };
+
     vec![
         ActionMove {
             name: "Guard".to_string(),
@@ -280,6 +306,37 @@ pub fn default_combat_library(rig: &KinematicRig) -> Vec<ActionMove> {
                 duration_ms: 650,
                 angles_rad: neutral,
             }],
+        },
+        // Combos chain the authored strikes above and finish with an explicit
+        // two-stage balance tail: settle into the capture-safe crouch, then return
+        // to the standard Guard so a finished combo always ends ready to defend.
+        ActionMove {
+            name: "Combo: Jab-Cross-Kick".to_string(),
+            category: "Combo".to_string(),
+            keyframes: vec![
+                kf("Guard Ready", 240, guard),
+                kf("Jab Snap", 320, left_jab),
+                kf("Cross Windup", 260, right_cross_windup),
+                kf("Cross Impact", 380, right_cross_impact),
+                kf("Kick Chamber", 340, kick_chamber),
+                kf("Kick Snap", 380, kick_snap),
+                kf("Balance Restore", 540, capture_guard),
+                kf("Guard", 420, guard),
+            ],
+        },
+        ActionMove {
+            name: "Combo: Guard-Cross-Jab-Guard".to_string(),
+            category: "Combo".to_string(),
+            keyframes: vec![
+                kf("Guard Ready", 240, guard),
+                kf("Cross Windup", 300, right_cross_windup),
+                kf("Cross Impact", 380, right_cross_impact),
+                kf("Guard", 300, guard),
+                kf("Jab Snap", 320, left_jab),
+                kf("Guard", 300, guard),
+                kf("Balance Restore", 540, capture_guard),
+                kf("Guard", 420, guard),
+            ],
         },
     ]
 }
@@ -580,6 +637,12 @@ pub struct StudioModel {
     pub moves: Vec<ActionMove>,
     pub selected_move: usize,
     pub playback: Option<PlaybackState>,
+    /// Latched signal that the active action was cut short by fall / E-Stop / tilt.
+    /// Consumed by the rk-ui recovery state machine to take over cleanly.
+    pub playback_aborted: bool,
+    /// True while an approved get-up sequence plays; its elevated tilt is owned by
+    /// the recovery state machine and must not be mistaken for an action abort.
+    pub recovery_playback: bool,
     pub walk_cmd: WalkCmd,
     pub balance_gains: BalanceGains,
     pub pending_config: Vec<ConfigCmd>,
@@ -595,6 +658,9 @@ impl StudioModel {
         let calibration = rig.default_calibration();
         let default_pose = rig.default_pose();
         let mut moves = default_combat_library(&rig);
+        // Offline impact-aware optimized strikes (computed once on the host from
+        // the authored library; never solved at runtime on the MCU).
+        moves.extend(crate::strike_optimizer::optimized_strikes(&rig, &moves));
         moves.extend(default_recovery_library(&rig));
         let all_mask = if rig.joints.len() >= 32 {
             u32::MAX
@@ -622,6 +688,8 @@ impl StudioModel {
             moves,
             selected_move: 0,
             playback: None,
+            playback_aborted: false,
+            recovery_playback: false,
             walk_cmd: WalkCmd::default(),
             balance_gains: BalanceGains::default(),
             pending_config: Vec::new(),
@@ -636,11 +704,16 @@ impl StudioModel {
         let default_pose = rig.default_pose();
         self.requested_mode = ControlMode::Teach;
         self.playback = None;
+        self.playback_aborted = false;
+        self.recovery_playback = false;
         self.calibration = rig.default_calibration();
         self.target_rad = default_pose;
         self.latest_telemetry.measured_rad = default_pose;
         self.latest_telemetry.applied_target_rad = default_pose;
         let mut moves = default_combat_library(&rig);
+        // Offline impact-aware optimized strikes (computed once on the host from
+        // the authored library; never solved at runtime on the MCU).
+        moves.extend(crate::strike_optimizer::optimized_strikes(&rig, &moves));
         moves.extend(default_recovery_library(&rig));
         self.moves = moves;
         self.selected_joint = 0;
@@ -689,6 +762,7 @@ impl StudioModel {
     pub fn trigger_estop(&mut self) {
         self.requested_mode = ControlMode::EStop;
         self.playback = None;
+        self.recovery_playback = false;
         self.walk_cmd.walk_enabled = false;
         self.walk_cmd.vx = 0.0;
         self.walk_cmd.vy = 0.0;
@@ -701,6 +775,7 @@ impl StudioModel {
     pub fn reset_estop(&mut self) {
         self.requested_mode = ControlMode::Teach;
         self.playback = None;
+        self.recovery_playback = false;
         self.walk_cmd.walk_enabled = false;
         self.walk_cmd.vx = 0.0;
         self.walk_cmd.vy = 0.0;
@@ -729,6 +804,7 @@ impl StudioModel {
                 "Switched Teach -> Drive (Bumpless sync: 0.000 rad delta).".to_string();
         } else if mode == ControlMode::Teach {
             self.playback = None;
+            self.recovery_playback = false;
             self.status_message = "Switched to Teach mode (Robot -> GUI, Torque OFF).".to_string();
         }
         self.requested_mode = mode;
@@ -764,11 +840,30 @@ impl StudioModel {
         }
     }
 
+    /// Host-side tilt breach threshold: the pre-fall ukemi boundary. Below the MCU's
+    /// fall cutoff this lets the studio abort a strike before the robot actually falls.
+    fn tilt_breach(telem: &McuToHost, gains: &BalanceGains) -> bool {
+        telem.imu.available
+            && telem
+                .imu
+                .pitch_rad
+                .abs()
+                .max(telem.imu.roll_rad.abs())
+                >= gains.ukemi_tilt_rad
+    }
+
     /// Starts cubic-interpolated playback of a combat move (Drive mode only).
     pub fn play_move(&mut self, move_idx: usize) {
         if self.requested_mode != ControlMode::Drive || self.is_estop_active() {
             self.status_message =
                 "Switch to Drive mode before playing combat actions.".to_string();
+            return;
+        }
+        // Refuse to start (or immediately restart) an action while the robot is
+        // already tilted past the abort threshold — this is the abort hysteresis.
+        if Self::tilt_breach(&self.latest_telemetry, &self.balance_gains) {
+            self.status_message =
+                "Unsafe attitude — action playback blocked until the robot is upright.".to_string();
             return;
         }
         if move_idx < self.moves.len() {
@@ -780,15 +875,36 @@ impl StudioModel {
                 progress: 0.0,
                 active_keyframe: 0,
             });
+            self.playback_aborted = false;
+            self.recovery_playback = false;
             self.status_message = format!("Playing '{}'.", self.moves[move_idx].name);
         }
     }
 
     pub fn stop_playback(&mut self) {
         if self.playback.take().is_some() {
+            self.recovery_playback = false;
             self.target_rad = self.latest_telemetry.measured_rad;
             self.status_message = "Playback stopped.".to_string();
         }
+    }
+
+    /// Cuts the active action immediately, holds the last measured pose so no stale
+    /// keyframe target fights the controller, and signals the recovery handoff.
+    pub fn abort_playback(&mut self, reason: &str) {
+        let name = self
+            .playback
+            .as_ref()
+            .map(|pb| pb.move_idx)
+            .and_then(|idx| self.moves.get(idx))
+            .map(|mv| mv.name.clone())
+            .unwrap_or_else(|| "Action".to_string());
+        self.playback = None;
+        self.recovery_playback = false;
+        self.playback_aborted = true;
+        self.walk_cmd.walk_enabled = false;
+        self.target_rad = self.latest_telemetry.measured_rad;
+        self.status_message = format!("'{name}' ABORTED ({reason}) — recovery handoff.");
     }
 
     /// Sets the current raw angle of `joint` as zero offset via `ConfigCmd::SetZeroOffset`.
@@ -933,11 +1049,39 @@ impl StudioModel {
     }
 
     pub fn ingest_telemetry(&mut self, telem: McuToHost) {
-        if telem.active_mode == ControlMode::EStop && self.requested_mode == ControlMode::Drive {
+        let fault_abort = telem.active_mode == ControlMode::EStop
+            || telem.faults.intersects(
+                FaultFlags::ESTOP_ACTIVE
+                    | FaultFlags::WATCHDOG_TIMEOUT
+                    | FaultFlags::TILT_FALL_CUTOFF,
+            );
+        let tilt_abort = Self::tilt_breach(&telem, &self.balance_gains);
+        self.latest_telemetry = telem;
+
+        // Only an action playback is aborted here. Approved get-up playback is
+        // intentionally allowed to exceed the normal tilt bound; its safety gates
+        // live in the rk-ui recovery state machine.
+        if self.playback.is_some() && !self.recovery_playback {
+            if fault_abort {
+                let reason = if self.latest_telemetry.faults.contains(FaultFlags::TILT_FALL_CUTOFF)
+                {
+                    "fall detected"
+                } else {
+                    "E-Stop / MCU fault"
+                };
+                self.abort_playback(reason);
+            } else if tilt_abort {
+                self.abort_playback("tilt breach");
+            }
+        }
+
+        if self.latest_telemetry.active_mode == ControlMode::EStop
+            && self.requested_mode == ControlMode::Drive
+        {
             self.requested_mode = ControlMode::EStop;
             self.playback = None;
+            self.recovery_playback = false;
         }
-        self.latest_telemetry = telem;
     }
 }
 
@@ -1032,5 +1176,171 @@ mod tests {
                 "'{name}' must remain selectable after model reload"
             );
         }
+    }
+
+    #[test]
+    fn combos_chain_strikes_and_end_in_guard_after_balance_tail() {
+        let rig = rig();
+        let moves = default_combat_library(&rig);
+        let combos: Vec<&ActionMove> = moves
+            .iter()
+            .filter(|m| m.category == "Combo")
+            .collect();
+        assert_eq!(combos.len(), 2, "expected two scripted combos");
+        assert!(combos.iter().all(|m| m.name.starts_with("Combo: ")));
+
+        let guard = moves.iter().find(|m| m.name == "Guard").unwrap();
+        let guard_pose = guard.keyframes[0].angles_rad;
+        let jab = moves.iter().find(|m| m.name == "Left Jab").unwrap();
+        let cross = moves.iter().find(|m| m.name == "Right Cross").unwrap();
+        let kick = moves.iter().find(|m| m.name == "Front Kick").unwrap();
+
+        let calibration = rig.default_calibration();
+        for combo in combos {
+            assert!(combo.keyframes.len() >= 6, "{} too short", combo.name);
+            assert!(
+                combo.keyframes.iter().any(|k| k.label == "Balance Restore"),
+                "{} missing explicit balance tail",
+                combo.name
+            );
+            let last = combo.keyframes.last().unwrap();
+            assert_eq!(last.label, "Guard");
+            assert_eq!(last.angles_rad, guard_pose, "{} must finish in Guard", combo.name);
+
+            let expected_poses: &[&[f32; MAX_JOINTS]] = if combo.name == "Combo: Jab-Cross-Kick" {
+                &[
+                    &jab.keyframes[1].angles_rad,
+                    &cross.keyframes[1].angles_rad,
+                    &kick.keyframes[1].angles_rad,
+                ]
+            } else {
+                &[
+                    &jab.keyframes[1].angles_rad,
+                    &cross.keyframes[1].angles_rad,
+                    &guard_pose,
+                ]
+            };
+            for expected in expected_poses {
+                assert!(
+                    combo
+                        .keyframes
+                        .iter()
+                        .any(|k| &k.angles_rad == *expected),
+                    "{} must reuse the authored strike/Guard poses",
+                    combo.name
+                );
+            }
+
+            for kf in &combo.keyframes {
+                for (idx, &angle) in kf.angles_rad.iter().enumerate() {
+                    if idx >= rig.joints.len() {
+                        assert!((angle - rig.default_pose()[idx]).abs() < 1e-6);
+                        continue;
+                    }
+                    let j = &rig.joints[idx];
+                    assert!(
+                        angle >= j.default_min_rad - 1e-5 && angle <= j.default_max_rad + 1e-5,
+                        "{} / {}: outside URDF limits for {}",
+                        combo.name,
+                        kf.label,
+                        j.name
+                    );
+                    let cal = &calibration[idx];
+                    assert!(
+                        angle >= cal.min_rad - 1e-5 && angle <= cal.max_rad + 1e-5,
+                        "{} / {}: outside calibration soft limits for {}",
+                        combo.name,
+                        kf.label,
+                        j.name
+                    );
+                }
+            }
+        }
+    }
+
+    fn playing_model() -> (StudioModel, usize) {
+        let mut model = StudioModel::new_default();
+        model.set_authority_mode(ControlMode::Drive);
+        let idx = model
+            .moves
+            .iter()
+            .position(|m| m.name == "Combo: Jab-Cross-Kick")
+            .expect("combo exists");
+        model.play_move(idx);
+        assert!(model.playback.is_some());
+        (model, idx)
+    }
+
+    fn telemetry_with_tilt(model: &StudioModel, pitch: f32) -> McuToHost {
+        let mut telem = model.latest_telemetry;
+        telem.imu.available = true;
+        telem.imu.pitch_rad = pitch;
+        telem.imu.roll_rad = 0.0;
+        telem
+    }
+
+    #[test]
+    fn ingest_telemetry_aborts_playback_on_tilt_breach_and_signals_handoff() {
+        let (mut model, _) = playing_model();
+        let measured = model.latest_telemetry.measured_rad;
+        model.walk_cmd.walk_enabled = true;
+
+        // 0.62 rad is above ukemi_tilt_rad (0.56) but below the 0.65 fall cutoff.
+        model.ingest_telemetry(telemetry_with_tilt(&model, 0.62));
+
+        assert!(model.playback.is_none());
+        assert!(model.playback_aborted, "recovery handoff must be signalled");
+        assert!(!model.walk_cmd.walk_enabled);
+        assert_eq!(model.target_rad, measured, "no stale action target may fight recovery");
+        assert!(model.status_message.contains("ABORTED"));
+
+        // The abort latches until the recovery state machine consumes it.
+        model.ingest_telemetry(telemetry_with_tilt(&model, 0.0));
+        assert!(model.playback_aborted);
+        assert!(model.playback.is_none());
+    }
+
+    #[test]
+    fn ingest_telemetry_aborts_playback_on_fall_fault() {
+        let (mut model, _) = playing_model();
+        let mut telem = telemetry_with_tilt(&model, 1.20);
+        telem.faults.insert(FaultFlags::TILT_FALL_CUTOFF);
+        telem.balance.fall_orientation = rk_proto::fall_orientation::PRONE;
+
+        model.ingest_telemetry(telem);
+
+        assert!(model.playback.is_none());
+        assert!(model.playback_aborted);
+        assert!(model.status_message.contains("fall detected"));
+    }
+
+    #[test]
+    fn recovery_playback_defers_all_aborts_to_the_recovery_watcher() {
+        let (mut model, _) = playing_model();
+        model.recovery_playback = true;
+
+        // A get-up legitimately passes through large tilt; the recovery state machine
+        // owns its fall/E-Stop gates, so the action-abort path stays out of its way.
+        model.ingest_telemetry(telemetry_with_tilt(&model, 1.10));
+        assert!(model.playback.is_some());
+        assert!(!model.playback_aborted);
+
+        let mut telem = telemetry_with_tilt(&model, 1.20);
+        telem.faults.insert(FaultFlags::TILT_FALL_CUTOFF);
+        model.ingest_telemetry(telem);
+        assert!(model.playback.is_some());
+        assert!(!model.playback_aborted);
+    }
+
+    #[test]
+    fn play_move_is_blocked_while_tilted() {
+        let (mut model, idx) = playing_model();
+        model.stop_playback();
+        model.ingest_telemetry(telemetry_with_tilt(&model, 0.70));
+
+        model.play_move(idx);
+
+        assert!(model.playback.is_none());
+        assert!(model.status_message.contains("blocked"));
     }
 }

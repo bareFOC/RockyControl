@@ -17,7 +17,9 @@ pub const MAX_COBS_FRAME_BYTES: usize = 1024;
 /// v3 adds [`BalanceGains::h_com_m`] (fixed CoM height for support-relative DCM/ZMP).
 /// v4 adds [`RunningConfig`] on [`WalkCmd`] (torque-capable running gate/gains) and
 /// running telemetry fields on [`BalanceTelemetry`].
-pub const PROTOCOL_VERSION: u16 = 4;
+/// v5 adds the combat impact flag/magnitude on [`BalanceTelemetry`] and the
+/// matching `estimator_valid::IMPACT` validity bit.
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const MODEL_CHUNK_BYTES: usize = 256;
 pub const MAX_MODEL_NAME_BYTES: usize = 32;
 pub const MAX_MODEL_COBS_FRAME_BYTES: usize = 384;
@@ -67,6 +69,11 @@ pub mod estimator_valid {
     /// Running telemetry channels (`BalanceTelemetry::flight_detected`,
     /// `BalanceTelemetry::running_com_height_m`) are meaningful only when this bit is set.
     pub const RUNNING: u32 = 1 << 6;
+    /// Combat impact channels (`BalanceTelemetry::impact_detected`,
+    /// `BalanceTelemetry::impact_magnitude_nm`) are meaningful only when this
+    /// bit is set. Published on both hardware paths (momentum observer on
+    /// torque-capable builds, current-spike heuristic on v1).
+    pub const IMPACT: u32 = 1 << 7;
 }
 
 #[repr(u8)]
@@ -245,10 +252,12 @@ fn sin_cos_f32(x: f32) -> (f32, f32) {
         a += two_pi;
     }
     let a2 = a * a;
-    let s = a * (1.0
-        + a2 * (-0.166_666_67 + a2 * (0.008_333_334 + a2 * (-0.000_198_412_7 + a2 * 0.000_002_755_732))));
-    let c = 1.0
-        + a2 * (-0.5 + a2 * (0.041_666_664 + a2 * (-0.001_388_888_9 + a2 * 0.000_024_801_588)));
+    let s = a
+        * (1.0
+            + a2 * (-0.166_666_67
+                + a2 * (0.008_333_334 + a2 * (-0.000_198_412_7 + a2 * 0.000_002_755_732))));
+    let c =
+        1.0 + a2 * (-0.5 + a2 * (0.041_666_664 + a2 * (-0.001_388_888_9 + a2 * 0.000_024_801_588)));
     (s, c)
 }
 
@@ -500,6 +509,15 @@ pub struct BalanceTelemetry {
     /// Estimated vertical CoM height above the support sole in metres.
     /// Valid only when `EstimatorTelemetry.valid_mask & estimator_valid::RUNNING != 0`.
     pub running_com_height_m: f32,
+    /// Debounced combat impact flag from the shared kernel. Suppressed while
+    /// ukemi or `TILT_FALL_CUTOFF` is active so fall handling keeps priority.
+    /// Valid only when `EstimatorTelemetry.valid_mask & estimator_valid::IMPACT != 0`.
+    pub impact_detected: bool,
+    /// Impact strength in N·m-equivalent. On torque-capable builds this is the
+    /// L∞ generalized-momentum residual; on v1 it is the largest per-joint
+    /// current jump divided by the configured mA-per-N·m factor (pseudo-torque).
+    /// Valid only when `EstimatorTelemetry.valid_mask & estimator_valid::IMPACT != 0`.
+    pub impact_magnitude_nm: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
@@ -987,10 +1005,7 @@ fn cobs_decode_in_place(buf: &mut [u8]) -> Result<(usize, usize), CodecError> {
 ///
 /// Raw framing layout before COBS: `[postcard_payload..., crc32_le_4B]`, terminated on the wire
 /// by a single `0x00` COBS delimiter byte.
-pub fn encode_cobs<'a, T: Serialize>(
-    value: &T,
-    buf: &'a mut [u8],
-) -> Result<&'a [u8], CodecError> {
+pub fn encode_cobs<'a, T: Serialize>(value: &T, buf: &'a mut [u8]) -> Result<&'a [u8], CodecError> {
     let mut raw = [0u8; MAX_COBS_FRAME_BYTES];
     let payload_len = {
         let max_payload = MAX_COBS_FRAME_BYTES.saturating_sub(12);
@@ -1005,9 +1020,7 @@ pub fn encode_cobs<'a, T: Serialize>(
 
 /// Zero-allocation COBS decode + IEEE CRC-32 check + `postcard` deserialize.
 /// Never panics on malformed, truncated, or bit-flipped frames.
-pub fn decode_cobs<'a, T: Deserialize<'a>>(
-    buf: &'a mut [u8],
-) -> Result<(T, &'a [u8]), CodecError> {
+pub fn decode_cobs<'a, T: Deserialize<'a>>(buf: &'a mut [u8]) -> Result<(T, &'a [u8]), CodecError> {
     let (dec_len, consumed) = cobs_decode_in_place(buf)?;
     if dec_len < 4 {
         return Err(CodecError::DecodeFailed);
@@ -1113,6 +1126,7 @@ pub fn decode_mcu_cobs(buf: &mut [u8]) -> Result<McuToHost, CodecError> {
         || !pkt.balance.foot_dy_m.is_finite()
         || !pkt.balance.hip_height_m.is_finite()
         || !pkt.balance.running_com_height_m.is_finite()
+        || !pkt.balance.impact_magnitude_nm.is_finite()
         || est.com_pos_m.iter().any(|v| !v.is_finite())
         || est.com_vel_m_s.iter().any(|v| !v.is_finite())
         || est.dcm_xy_m.iter().any(|v| !v.is_finite())
@@ -1240,6 +1254,8 @@ mod tests {
                 running_active: false,
                 flight_detected: false,
                 running_com_height_m: 0.0,
+                impact_detected: false,
+                impact_magnitude_nm: 0.0,
             },
             estimator: EstimatorTelemetry {
                 com_pos_m: [0.004, 0.245, 0.011],
@@ -1304,7 +1320,9 @@ mod tests {
             protocol_version: PROTOCOL_VERSION.wrapping_add(1),
             ..Default::default()
         };
-        let len2 = encode_cobs(&bad_ver, &mut wire).expect("encode bad ver").len();
+        let len2 = encode_cobs(&bad_ver, &mut wire)
+            .expect("encode bad ver")
+            .len();
         assert_eq!(
             decode_host_cobs(&mut wire[..len2]).unwrap_err(),
             CodecError::VersionMismatch
@@ -1314,7 +1332,9 @@ mod tests {
             protocol_version: PROTOCOL_VERSION.wrapping_add(1),
             ..Default::default()
         };
-        let len3 = encode_cobs(&bad_mcu, &mut wire).expect("encode bad mcu").len();
+        let len3 = encode_cobs(&bad_mcu, &mut wire)
+            .expect("encode bad mcu")
+            .len();
         assert_eq!(
             decode_mcu_cobs(&mut wire[..len3]).unwrap_err(),
             CodecError::VersionMismatch
@@ -1347,11 +1367,14 @@ mod tests {
 
     #[test]
     fn running_config_wire_round_trip() {
-        assert_eq!(PROTOCOL_VERSION, 4, "running gains require wire v4");
+        assert_eq!(PROTOCOL_VERSION, 5, "impact telemetry requires wire v5");
 
         let mut running = RunningConfig::default();
         assert!(running.all_finite());
-        assert!(!running.enabled, "running must default to OFF (v1 unaffected)");
+        assert!(
+            !running.enabled,
+            "running must default to OFF (v1 unaffected)"
+        );
         assert!((running.hop_height_m - 0.03).abs() < 1e-6);
         assert!((running.leg_spring_n_m - 670.0).abs() < 1e-6);
         assert!((running.cbf_kappa - 3.0).abs() < 1e-6);
@@ -1401,12 +1424,8 @@ mod tests {
                 "leg_rest_length_m" => bad.leg_rest_length_m = f32::NEG_INFINITY,
                 "mass_kg" => bad.mass_kg = f32::NAN,
                 "cbf_kappa" => bad.cbf_kappa = f32::NAN,
-                "landing_stiffness_touchdown_n_m" => {
-                    bad.landing_stiffness_touchdown_n_m = f32::NAN
-                }
-                "landing_stiffness_nominal_n_m" => {
-                    bad.landing_stiffness_nominal_n_m = f32::NAN
-                }
+                "landing_stiffness_touchdown_n_m" => bad.landing_stiffness_touchdown_n_m = f32::NAN,
+                "landing_stiffness_nominal_n_m" => bad.landing_stiffness_nominal_n_m = f32::NAN,
                 "landing_damping_n_s_m" => bad.landing_damping_n_s_m = f32::NAN,
                 "landing_ramp_s" => bad.landing_ramp_s = f32::NAN,
                 _ => unreachable!(),
@@ -1438,7 +1457,9 @@ mod tests {
         pkt.estimator.valid_mask |= estimator_valid::RUNNING;
 
         let mut wire = [0u8; MAX_COBS_FRAME_BYTES];
-        let len = encode_cobs(&pkt, &mut wire).expect("encode running telem").len();
+        let len = encode_cobs(&pkt, &mut wire)
+            .expect("encode running telem")
+            .len();
         let decoded = decode_mcu_cobs(&mut wire[..len]).expect("decode running telem");
         assert_eq!(decoded, pkt);
         assert!(decoded.balance.running_active);
@@ -1447,7 +1468,39 @@ mod tests {
 
         let mut bad = pkt;
         bad.balance.running_com_height_m = f32::NAN;
-        let len = encode_cobs(&bad, &mut wire).expect("encode bad telem").len();
+        let len = encode_cobs(&bad, &mut wire)
+            .expect("encode bad telem")
+            .len();
+        assert_eq!(
+            decode_mcu_cobs(&mut wire[..len]).unwrap_err(),
+            CodecError::NonFiniteFloat
+        );
+    }
+
+    #[test]
+    fn impact_telemetry_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 5, "impact telemetry requires wire v5");
+        let mut pkt = McuToHost::default();
+        pkt.balance.impact_detected = true;
+        pkt.balance.impact_magnitude_nm = 0.275;
+        pkt.estimator.valid_mask |= estimator_valid::IMPACT;
+
+        let mut wire = [0u8; MAX_COBS_FRAME_BYTES];
+        let len = encode_cobs(&pkt, &mut wire)
+            .expect("encode impact telem")
+            .len();
+        assert!(len < MAX_COBS_FRAME_BYTES);
+        let decoded = decode_mcu_cobs(&mut wire[..len]).expect("decode impact telem");
+        assert_eq!(decoded, pkt);
+        assert!(decoded.balance.impact_detected);
+        assert!((decoded.balance.impact_magnitude_nm - 0.275).abs() < 1e-6);
+        assert_ne!(decoded.estimator.valid_mask & estimator_valid::IMPACT, 0);
+
+        let mut bad = pkt;
+        bad.balance.impact_magnitude_nm = f32::NAN;
+        let len = encode_cobs(&bad, &mut wire)
+            .expect("encode bad impact telem")
+            .len();
         assert_eq!(
             decode_mcu_cobs(&mut wire[..len]).unwrap_err(),
             CodecError::NonFiniteFloat
@@ -1513,14 +1566,22 @@ mod tests {
             gravity: [0.0, -9.81, 0.0],
             ..Default::default()
         };
-        assert_eq!(classify_fall(&s), FallOrientation::Unknown, "IMU unavailable");
+        assert_eq!(
+            classify_fall(&s),
+            FallOrientation::Unknown,
+            "IMU unavailable"
+        );
 
         s.available = true;
         s.gravity = [0.0, 0.0, 0.0];
         assert_eq!(classify_fall(&s), FallOrientation::Unknown, "zero gravity");
 
         s.gravity = [f32::NAN, -9.81, 0.0];
-        assert_eq!(classify_fall(&s), FallOrientation::Unknown, "non-finite gravity");
+        assert_eq!(
+            classify_fall(&s),
+            FallOrientation::Unknown,
+            "non-finite gravity"
+        );
 
         s.gravity = [0.0, -9.81, 0.0];
         s.pitch_rad = 0.0;
@@ -1559,8 +1620,13 @@ mod tests {
             offset: 0,
             max_len: 128,
         };
-        let n = encode_model_req_cobs(&req, &mut wire).expect("encode req").len();
-        assert_eq!(decode_model_req_cobs(&mut wire[..n]).expect("decode req"), req);
+        let n = encode_model_req_cobs(&req, &mut wire)
+            .expect("encode req")
+            .len();
+        assert_eq!(
+            decode_model_req_cobs(&mut wire[..n]).expect("decode req"),
+            req
+        );
 
         let resp_info = ModelResponse::Info(info);
         let n = encode_model_resp_cobs(&resp_info, &mut wire)

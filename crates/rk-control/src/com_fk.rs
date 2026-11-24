@@ -49,49 +49,115 @@ pub struct JointKin {
 /// `21` pelvis root). Derived from `rocky_mk1.urdf` `<joint>` tags.
 pub const JOINT_KINEMATICS: [JointKin; LINK_COUNT] = [
     // torso (0) <- pelvis: waist_yaw
-    JointKin { axis: [0.0, 1.0, 0.0], origin: [0.0, 0.08, 0.0] },
+    JointKin {
+        axis: [0.0, 1.0, 0.0],
+        origin: [0.0, 0.08, 0.0],
+    },
     // neck (1) <- torso: head_yaw
-    JointKin { axis: [0.0, 1.0, 0.0], origin: [0.0, 0.33, 0.0] },
+    JointKin {
+        axis: [0.0, 1.0, 0.0],
+        origin: [0.0, 0.33, 0.0],
+    },
     // head (2) <- neck: head_pitch
-    JointKin { axis: [1.0, 0.0, 0.0], origin: [0.0, 0.06, 0.0] },
+    JointKin {
+        axis: [1.0, 0.0, 0.0],
+        origin: [0.0, 0.06, 0.0],
+    },
     // l_shoulder (3) <- torso: l_shoulder_pitch
-    JointKin { axis: [1.0, 0.0, 0.0], origin: [0.18, 0.27, 0.0] },
+    JointKin {
+        axis: [1.0, 0.0, 0.0],
+        origin: [0.18, 0.27, 0.0],
+    },
     // l_upper_arm (4) <- l_shoulder: l_shoulder_roll
-    JointKin { axis: [0.0, 0.0, 1.0], origin: [0.04, 0.0, 0.0] },
+    JointKin {
+        axis: [0.0, 0.0, 1.0],
+        origin: [0.04, 0.0, 0.0],
+    },
     // l_forearm (5) <- l_upper_arm: l_elbow_pitch
-    JointKin { axis: [1.0, 0.0, 0.0], origin: [0.0, -0.24, 0.0] },
+    JointKin {
+        axis: [1.0, 0.0, 0.0],
+        origin: [0.0, -0.24, 0.0],
+    },
     // r_shoulder (6) <- torso: r_shoulder_pitch
-    JointKin { axis: [1.0, 0.0, 0.0], origin: [-0.18, 0.27, 0.0] },
+    JointKin {
+        axis: [1.0, 0.0, 0.0],
+        origin: [-0.18, 0.27, 0.0],
+    },
     // r_upper_arm (7) <- r_shoulder: r_shoulder_roll
-    JointKin { axis: [0.0, 0.0, 1.0], origin: [-0.04, 0.0, 0.0] },
+    JointKin {
+        axis: [0.0, 0.0, 1.0],
+        origin: [-0.04, 0.0, 0.0],
+    },
     // r_forearm (8) <- r_upper_arm: r_elbow_pitch
-    JointKin { axis: [1.0, 0.0, 0.0], origin: [0.0, -0.24, 0.0] },
+    JointKin {
+        axis: [1.0, 0.0, 0.0],
+        origin: [0.0, -0.24, 0.0],
+    },
     // l_hip_yaw_link (9) <- pelvis: l_hip_yaw
-    JointKin { axis: [0.0, 1.0, 0.0], origin: [0.095, -0.06, 0.0] },
+    JointKin {
+        axis: [0.0, 1.0, 0.0],
+        origin: [0.095, -0.06, 0.0],
+    },
     // l_hip_roll_link (10) <- 9: l_hip_roll
-    JointKin { axis: [0.0, 0.0, 1.0], origin: [0.0, -0.03, 0.0] },
+    JointKin {
+        axis: [0.0, 0.0, 1.0],
+        origin: [0.0, -0.03, 0.0],
+    },
     // l_thigh (11) <- 10: l_hip_pitch
-    JointKin { axis: [1.0, 0.0, 0.0], origin: [0.0, -0.03, 0.0] },
+    JointKin {
+        axis: [1.0, 0.0, 0.0],
+        origin: [0.0, -0.03, 0.0],
+    },
     // l_shin (12) <- 11: l_knee_pitch
-    JointKin { axis: [1.0, 0.0, 0.0], origin: [0.0, -0.32, 0.0] },
+    JointKin {
+        axis: [1.0, 0.0, 0.0],
+        origin: [0.0, -0.32, 0.0],
+    },
     // l_ankle_link (13) <- 12: l_ankle_pitch
-    JointKin { axis: [1.0, 0.0, 0.0], origin: [0.0, -0.32, 0.0] },
+    JointKin {
+        axis: [1.0, 0.0, 0.0],
+        origin: [0.0, -0.32, 0.0],
+    },
     // l_foot (14) <- 13: l_ankle_roll
-    JointKin { axis: [0.0, 0.0, 1.0], origin: [0.0, -0.03, 0.0] },
+    JointKin {
+        axis: [0.0, 0.0, 1.0],
+        origin: [0.0, -0.03, 0.0],
+    },
     // r_hip_yaw_link (15) <- pelvis: r_hip_yaw
-    JointKin { axis: [0.0, 1.0, 0.0], origin: [-0.095, -0.06, 0.0] },
+    JointKin {
+        axis: [0.0, 1.0, 0.0],
+        origin: [-0.095, -0.06, 0.0],
+    },
     // r_hip_roll_link (16) <- 15: r_hip_roll
-    JointKin { axis: [0.0, 0.0, 1.0], origin: [0.0, -0.03, 0.0] },
+    JointKin {
+        axis: [0.0, 0.0, 1.0],
+        origin: [0.0, -0.03, 0.0],
+    },
     // r_thigh (17) <- 16: r_hip_pitch
-    JointKin { axis: [1.0, 0.0, 0.0], origin: [0.0, -0.03, 0.0] },
+    JointKin {
+        axis: [1.0, 0.0, 0.0],
+        origin: [0.0, -0.03, 0.0],
+    },
     // r_shin (18) <- 17: r_knee_pitch
-    JointKin { axis: [1.0, 0.0, 0.0], origin: [0.0, -0.32, 0.0] },
+    JointKin {
+        axis: [1.0, 0.0, 0.0],
+        origin: [0.0, -0.32, 0.0],
+    },
     // r_ankle_link (19) <- 18: r_ankle_pitch
-    JointKin { axis: [1.0, 0.0, 0.0], origin: [0.0, -0.32, 0.0] },
+    JointKin {
+        axis: [1.0, 0.0, 0.0],
+        origin: [0.0, -0.32, 0.0],
+    },
     // r_foot (20) <- 19: r_ankle_roll
-    JointKin { axis: [0.0, 0.0, 1.0], origin: [0.0, -0.03, 0.0] },
+    JointKin {
+        axis: [0.0, 0.0, 1.0],
+        origin: [0.0, -0.03, 0.0],
+    },
     // pelvis (21): fixed root, no joint.
-    JointKin { axis: [0.0, 0.0, 0.0], origin: [0.0, 0.0, 0.0] },
+    JointKin {
+        axis: [0.0, 0.0, 0.0],
+        origin: [0.0, 0.0, 0.0],
+    },
 ];
 
 /// Result of one full FK traversal: lumped CoM plus both foot frames, all
@@ -282,10 +348,7 @@ pub fn compute_com(angles: &[f32; MAX_JOINTS]) -> [f32; 3] {
 }
 
 /// Mass-weighted CoM velocity in the pelvis frame from measured joint rates.
-pub fn com_velocity(
-    angles: &[f32; MAX_JOINTS],
-    velocities: &[f32; MAX_JOINTS],
-) -> [f32; 3] {
+pub fn com_velocity(angles: &[f32; MAX_JOINTS], velocities: &[f32; MAX_JOINTS]) -> [f32; 3] {
     compute_state(angles, velocities).com_vel
 }
 

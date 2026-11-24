@@ -37,11 +37,7 @@ pub const DEFAULT_OMEGA: f32 = 6.26;
 
 #[inline]
 fn finite_or(x: f32, fallback: f32) -> f32 {
-    if x.is_finite() {
-        x
-    } else {
-        fallback
-    }
+    if x.is_finite() { x } else { fallback }
 }
 
 #[inline]
@@ -98,7 +94,11 @@ pub fn project_tilt_rate(tilt_rad: f32, tilt_rate_rad_s: f32, cfg: &CbfConfig) -
 
     if h <= 0.0_f32 {
         // Unsafe: command a rate back toward the safe interior.
-        return if theta >= 0.0_f32 { -kappa * theta_max } else { kappa * theta_max };
+        return if theta >= 0.0_f32 {
+            -kappa * theta_max
+        } else {
+            kappa * theta_max
+        };
     }
     if theta > 1e-4_f32 {
         let rate_max = kappa * h / (2.0_f32 * theta);
@@ -291,9 +291,18 @@ mod tests {
         // push-off torque must be reduced (or reversed) by the ECBF.
         let pushed = 1.8_f32;
         let clamped = project_tilt_torque(pushed, 0.49, 0.0, &cfg, authority, dt);
-        assert!(clamped < pushed, "ECBF must reduce the push torque: {clamped}");
-        assert!(clamped > 0.0, "the admissible torque is reduced, not reversed: {clamped}");
-        assert!((clamped - 1.5153044_f32).abs() < 1e-4, "projection = {clamped}");
+        assert!(
+            clamped < pushed,
+            "ECBF must reduce the push torque: {clamped}"
+        );
+        assert!(
+            clamped > 0.0,
+            "the admissible torque is reduced, not reversed: {clamped}"
+        );
+        assert!(
+            (clamped - 1.5153044_f32).abs() < 1e-4,
+            "projection = {clamped}"
+        );
         // Upright and quiet: command passes through untouched.
         let free = project_tilt_torque(pushed, 0.0, 0.0, &cfg, authority, dt);
         assert_eq!(free, pushed);
@@ -310,7 +319,10 @@ mod tests {
         let p2 = project_com_velocity(0.10, 0.0, -0.5, &cfg, -0.035, 0.035);
         assert!(p2 < 0.10, "backward CBF must lower the support point: {p2}");
         // Quiet: command passes unchanged.
-        assert_eq!(project_com_velocity(0.01, 0.0, 0.0, &cfg, -0.035, 0.035), 0.01);
+        assert_eq!(
+            project_com_velocity(0.01, 0.0, 0.0, &cfg, -0.035, 0.035),
+            0.01
+        );
     }
 
     #[test]
@@ -320,7 +332,10 @@ mod tests {
         // sqrt(3*0.028^2 / (2*6.26+3)) = 0.01231 m, so p must be within
         // [0.03769, 0.06231]. A command at the origin is projected forward.
         let p = project_capture_point(0.0, 0.05, &cfg, -0.16, 0.16);
-        assert!(p > 0.03, "capture CBF must move the support point toward xi: {p}");
+        assert!(
+            p > 0.03,
+            "capture CBF must move the support point toward xi: {p}"
+        );
         assert!(p <= 0.05 + 0.0125);
         assert!(p >= 0.05 - 0.0125);
         // Command inside the ξ=0 disk (radius 0.01231 m): unchanged.

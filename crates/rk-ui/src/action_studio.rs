@@ -14,6 +14,7 @@ pub enum ActionCategoryFilter {
     #[default]
     All,
     Combat,
+    Combo,
     Recovery,
 }
 
@@ -22,6 +23,7 @@ impl ActionCategoryFilter {
         match self {
             Self::All => "All",
             Self::Combat => "Combat",
+            Self::Combo => "Combos",
             Self::Recovery => "Recovery",
         }
     }
@@ -30,7 +32,11 @@ impl ActionCategoryFilter {
         match self {
             Self::All => true,
             Self::Recovery => category.eq_ignore_ascii_case("Recovery"),
-            Self::Combat => !category.eq_ignore_ascii_case("Recovery"),
+            Self::Combo => category.eq_ignore_ascii_case("Combo"),
+            Self::Combat => {
+                !category.eq_ignore_ascii_case("Recovery")
+                    && !category.eq_ignore_ascii_case("Combo")
+            }
         }
     }
 }
@@ -53,16 +59,18 @@ impl RockyStudioApp {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 for filter in [
                     ActionCategoryFilter::Recovery,
+                    ActionCategoryFilter::Combo,
                     ActionCategoryFilter::Combat,
                     ActionCategoryFilter::All,
                 ] {
                     let active = self.action_category_filter == filter;
+                    let accent = match filter {
+                        ActionCategoryFilter::Recovery => Color32::from_rgb(180, 83, 9),
+                        ActionCategoryFilter::Combo => Color32::from_rgb(124, 58, 237),
+                        _ => Color32::from_rgb(14, 116, 144),
+                    };
                     let fill = if active {
-                        if filter == ActionCategoryFilter::Recovery {
-                            Color32::from_rgb(180, 83, 9)
-                        } else {
-                            Color32::from_rgb(14, 116, 144)
-                        }
+                        accent
                     } else {
                         Color32::from_rgb(22, 30, 44)
                     };
@@ -113,17 +121,22 @@ impl RockyStudioApp {
                     .as_ref()
                     .is_some_and(|pb| pb.move_idx == *idx);
                 let is_recovery = mv.category.eq_ignore_ascii_case("Recovery");
+                let is_combo = mv.category.eq_ignore_ascii_case("Combo");
 
                 let fill = if is_playing {
                     Color32::from_rgb(22, 134, 96)
                 } else if is_sel {
                     if is_recovery {
                         Color32::from_rgb(146, 64, 14)
+                    } else if is_combo {
+                        Color32::from_rgb(124, 58, 237)
                     } else {
                         Color32::from_rgb(14, 116, 144)
                     }
                 } else if is_recovery {
                     Color32::from_rgb(38, 28, 24)
+                } else if is_combo {
+                    Color32::from_rgb(38, 24, 58)
                 } else {
                     Color32::from_rgb(24, 33, 48)
                 };
@@ -133,6 +146,8 @@ impl RockyStudioApp {
                         1.2,
                         if is_recovery {
                             Color32::from_rgb(251, 191, 36)
+                        } else if is_combo {
+                            Color32::from_rgb(192, 132, 252)
                         } else {
                             Color32::from_rgb(103, 232, 249)
                         },
