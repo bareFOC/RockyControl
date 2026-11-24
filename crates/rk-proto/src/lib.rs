@@ -15,7 +15,9 @@ pub const MAX_COBS_FRAME_BYTES: usize = 1024;
 /// Compile-time wire protocol version checked on every decoded HostToMcu / McuToHost frame.
 ///
 /// v3 adds [`BalanceGains::h_com_m`] (fixed CoM height for support-relative DCM/ZMP).
-pub const PROTOCOL_VERSION: u16 = 3;
+/// v4 adds [`RunningConfig`] on [`WalkCmd`] (torque-capable running gate/gains) and
+/// running telemetry fields on [`BalanceTelemetry`].
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MODEL_CHUNK_BYTES: usize = 256;
 pub const MAX_MODEL_NAME_BYTES: usize = 32;
 pub const MAX_MODEL_COBS_FRAME_BYTES: usize = 384;
@@ -62,6 +64,9 @@ pub mod estimator_valid {
     pub const MOMENTUM: u32 = 1 << 3;
     pub const LSM6DSV_OK: u32 = 1 << 4;
     pub const BNO055_OK: u32 = 1 << 5;
+    /// Running telemetry channels (`BalanceTelemetry::flight_detected`,
+    /// `BalanceTelemetry::running_com_height_m`) are meaningful only when this bit is set.
+    pub const RUNNING: u32 = 1 << 6;
 }
 
 #[repr(u8)]
@@ -279,6 +284,12 @@ pub struct WalkCmd {
     pub step_height: f32,
     /// Gait oscillator frequency in Hz (`[0.6, 2.8]`).
     pub cadence_hz: f32,
+    /// Running mode gate and SLIP/landing/CBF gains.
+    ///
+    /// Carried on the streamed `WalkCmd` (rather than a one-shot `ConfigCmd`) so the
+    /// kernel receives the running gate and its gains on the same 200 Hz tick as the
+    /// walk flags. `enabled = false` keeps v1/non-torque builds completely unaffected.
+    pub running: RunningConfig,
 }
 
 impl Default for WalkCmd {
@@ -292,7 +303,69 @@ impl Default for WalkCmd {
             stance_crouch: 0.30,
             step_height: 0.55,
             cadence_hz: 1.55,
+            running: RunningConfig::default(),
         }
+    }
+}
+
+/// Wire-facing running gains for the torque-capable (v2/BLDC) hardware generation.
+///
+/// This is the **wire** representation only. The `no_std` control kernel keeps its own
+/// local `SlipConfig`; the integrator maps these fields onto it without rk-control
+/// depending on rk-proto. Defaults follow `reports/P2_P3_P4_IMPLEMENTATION_RESEARCH.md` §2.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct RunningConfig {
+    /// Master gate. Set only on torque-capable builds; v1 firmware ignores running entirely.
+    pub enabled: bool,
+    /// Target vertical hop height above nominal stance in metres (2–4 cm).
+    pub hop_height_m: f32,
+    /// SLIP virtual leg spring stiffness in N/m (`k = mg / (0.1 L0) ≈ 670`).
+    pub leg_spring_n_m: f32,
+    /// SLIP virtual leg rest length in metres (`L0 ≈ 0.22`).
+    pub leg_rest_length_m: f32,
+    /// Total robot mass used by the SLIP template in kg (`≈ 1.5`).
+    pub mass_kg: f32,
+    /// Scalar control-barrier projection rate in s⁻¹ (`κ ≈ 3`).
+    pub cbf_kappa: f32,
+    /// Landing impedance stiffness at touchdown in N/m (`≈ 800`).
+    pub landing_stiffness_touchdown_n_m: f32,
+    /// Landing impedance stiffness after the ramp in N/m (`≈ 4000`).
+    pub landing_stiffness_nominal_n_m: f32,
+    /// Landing impedance damping in N·s/m (`≈ 50`, `ζ ≈ 0.7`).
+    pub landing_damping_n_s_m: f32,
+    /// Landing stiffness ramp duration in seconds (25–40 ms).
+    pub landing_ramp_s: f32,
+}
+
+impl Default for RunningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hop_height_m: 0.03,
+            leg_spring_n_m: 670.0,
+            leg_rest_length_m: 0.22,
+            mass_kg: 1.5,
+            cbf_kappa: 3.0,
+            landing_stiffness_touchdown_n_m: 800.0,
+            landing_stiffness_nominal_n_m: 4000.0,
+            landing_damping_n_s_m: 50.0,
+            landing_ramp_s: 0.03,
+        }
+    }
+}
+
+impl RunningConfig {
+    /// True when every numeric gain is finite (booleans excluded).
+    pub fn all_finite(&self) -> bool {
+        self.hop_height_m.is_finite()
+            && self.leg_spring_n_m.is_finite()
+            && self.leg_rest_length_m.is_finite()
+            && self.mass_kg.is_finite()
+            && self.cbf_kappa.is_finite()
+            && self.landing_stiffness_touchdown_n_m.is_finite()
+            && self.landing_stiffness_nominal_n_m.is_finite()
+            && self.landing_damping_n_s_m.is_finite()
+            && self.landing_ramp_s.is_finite()
     }
 }
 
@@ -418,6 +491,15 @@ pub struct BalanceTelemetry {
     /// Fall orientation captured when `TILT_FALL_CUTOFF` latched
     /// (`fall_orientation::*` wire code; `UNKNOWN` when no fall has been classified).
     pub fall_orientation: u8,
+    /// True while the running controller is active (gated by `RunningConfig::enabled`).
+    /// Valid only when `EstimatorTelemetry.valid_mask & estimator_valid::RUNNING != 0`.
+    pub running_active: bool,
+    /// Debounced airborne state published by the running flight detector.
+    /// Valid only when `EstimatorTelemetry.valid_mask & estimator_valid::RUNNING != 0`.
+    pub flight_detected: bool,
+    /// Estimated vertical CoM height above the support sole in metres.
+    /// Valid only when `EstimatorTelemetry.valid_mask & estimator_valid::RUNNING != 0`.
+    pub running_com_height_m: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
@@ -964,6 +1046,7 @@ pub fn validate_host_packet(pkt: &HostToMcu) -> Result<(), CodecError> {
         || !w.stance_crouch.is_finite()
         || !w.step_height.is_finite()
         || !w.cadence_hz.is_finite()
+        || !w.running.all_finite()
     {
         return Err(CodecError::NonFiniteFloat);
     }
@@ -1029,6 +1112,7 @@ pub fn decode_mcu_cobs(buf: &mut [u8]) -> Result<McuToHost, CodecError> {
         || !pkt.balance.foot_dx_m.is_finite()
         || !pkt.balance.foot_dy_m.is_finite()
         || !pkt.balance.hip_height_m.is_finite()
+        || !pkt.balance.running_com_height_m.is_finite()
         || est.com_pos_m.iter().any(|v| !v.is_finite())
         || est.com_vel_m_s.iter().any(|v| !v.is_finite())
         || est.dcm_xy_m.iter().any(|v| !v.is_finite())
@@ -1095,6 +1179,13 @@ mod tests {
                 stance_crouch: 0.35,
                 step_height: 0.6,
                 cadence_hz: 1.7,
+                running: RunningConfig {
+                    enabled: true,
+                    hop_height_m: 0.035,
+                    cbf_kappa: 2.7,
+                    landing_ramp_s: 0.032,
+                    ..Default::default()
+                },
             },
             config: ConfigCmd::SetBalanceGains(BalanceGains::default()),
         };
@@ -1146,6 +1237,9 @@ mod tests {
                 foot_dy_m: -0.032,
                 hip_height_m: 0.61,
                 fall_orientation: fall_orientation::PRONE,
+                running_active: false,
+                flight_detected: false,
+                running_com_height_m: 0.0,
             },
             estimator: EstimatorTelemetry {
                 com_pos_m: [0.004, 0.245, 0.011],
@@ -1249,6 +1343,115 @@ mod tests {
             ConfigCmd::SetBalanceGains(g) => assert_eq!(g.h_com_m, 0.25),
             _ => panic!("expected SetBalanceGains"),
         }
+    }
+
+    #[test]
+    fn running_config_wire_round_trip() {
+        assert_eq!(PROTOCOL_VERSION, 4, "running gains require wire v4");
+
+        let mut running = RunningConfig::default();
+        assert!(running.all_finite());
+        assert!(!running.enabled, "running must default to OFF (v1 unaffected)");
+        assert!((running.hop_height_m - 0.03).abs() < 1e-6);
+        assert!((running.leg_spring_n_m - 670.0).abs() < 1e-6);
+        assert!((running.cbf_kappa - 3.0).abs() < 1e-6);
+
+        running.enabled = true;
+        running.hop_height_m = 0.04;
+        running.landing_stiffness_touchdown_n_m = 900.0;
+        running.landing_stiffness_nominal_n_m = 3800.0;
+        running.landing_damping_n_s_m = 55.0;
+        running.landing_ramp_s = 0.035;
+
+        let pkt = HostToMcu {
+            seq: 77,
+            walk: WalkCmd {
+                walk_enabled: true,
+                running,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut wire = [0u8; MAX_COBS_FRAME_BYTES];
+        let len = encode_cobs(&pkt, &mut wire).expect("encode running").len();
+        let decoded = decode_host_cobs(&mut wire[..len]).expect("decode running");
+        assert_eq!(decoded, pkt);
+        assert_eq!(decoded.walk.running, running);
+        assert_eq!(decoded.protocol_version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn nonfinite_running_gain_is_rejected() {
+        let mut running = RunningConfig::default();
+        for field in [
+            "hop_height_m",
+            "leg_spring_n_m",
+            "leg_rest_length_m",
+            "mass_kg",
+            "cbf_kappa",
+            "landing_stiffness_touchdown_n_m",
+            "landing_stiffness_nominal_n_m",
+            "landing_damping_n_s_m",
+            "landing_ramp_s",
+        ] {
+            let mut bad = running;
+            match field {
+                "hop_height_m" => bad.hop_height_m = f32::NAN,
+                "leg_spring_n_m" => bad.leg_spring_n_m = f32::INFINITY,
+                "leg_rest_length_m" => bad.leg_rest_length_m = f32::NEG_INFINITY,
+                "mass_kg" => bad.mass_kg = f32::NAN,
+                "cbf_kappa" => bad.cbf_kappa = f32::NAN,
+                "landing_stiffness_touchdown_n_m" => {
+                    bad.landing_stiffness_touchdown_n_m = f32::NAN
+                }
+                "landing_stiffness_nominal_n_m" => {
+                    bad.landing_stiffness_nominal_n_m = f32::NAN
+                }
+                "landing_damping_n_s_m" => bad.landing_damping_n_s_m = f32::NAN,
+                "landing_ramp_s" => bad.landing_ramp_s = f32::NAN,
+                _ => unreachable!(),
+            }
+            assert!(!bad.all_finite(), "{field} must be rejected");
+            let pkt = HostToMcu {
+                walk: WalkCmd {
+                    running: bad,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert_eq!(
+                validate_host_packet(&pkt),
+                Err(CodecError::NonFiniteFloat),
+                "{field} must fail validation"
+            );
+        }
+        running.enabled = true;
+        assert!(running.all_finite(), "the boolean gate is not a float");
+    }
+
+    #[test]
+    fn running_telemetry_round_trip() {
+        let mut pkt = McuToHost::default();
+        pkt.balance.running_active = true;
+        pkt.balance.flight_detected = true;
+        pkt.balance.running_com_height_m = 0.247;
+        pkt.estimator.valid_mask |= estimator_valid::RUNNING;
+
+        let mut wire = [0u8; MAX_COBS_FRAME_BYTES];
+        let len = encode_cobs(&pkt, &mut wire).expect("encode running telem").len();
+        let decoded = decode_mcu_cobs(&mut wire[..len]).expect("decode running telem");
+        assert_eq!(decoded, pkt);
+        assert!(decoded.balance.running_active);
+        assert!(decoded.balance.flight_detected);
+        assert!((decoded.balance.running_com_height_m - 0.247).abs() < 1e-6);
+
+        let mut bad = pkt;
+        bad.balance.running_com_height_m = f32::NAN;
+        let len = encode_cobs(&bad, &mut wire).expect("encode bad telem").len();
+        assert_eq!(
+            decode_mcu_cobs(&mut wire[..len]).unwrap_err(),
+            CodecError::NonFiniteFloat
+        );
     }
 
     #[test]

@@ -12,14 +12,29 @@ pub use rk_fw_core::replay::{
 use rk_fw_core::servo_bus::ServoBusPort;
 use rk_fw_core::transport::{CobsStreamFramer, HostLinkMailbox, encode_telemetry_frame};
 use rk_proto::{
-    HostToMcu, MAX_COBS_FRAME_BYTES, MAX_JOINTS, MAX_MODEL_COBS_FRAME_BYTES, McuToHost, ModelFormat,
-    ModelInfo, ModelRequest, ModelResponse, decode_mcu_cobs, decode_model_req_cobs,
-    decode_model_resp_cobs, encode_cobs, encode_model_req_cobs, encode_model_resp_cobs,
+    HostToMcu, JointCommandMode, MAX_COBS_FRAME_BYTES, MAX_JOINTS, MAX_MODEL_COBS_FRAME_BYTES,
+    McuToHost, ModelFormat, ModelInfo, ModelRequest, ModelResponse, RunningConfig, decode_mcu_cobs,
+    decode_model_req_cobs, decode_model_resp_cobs, encode_cobs, encode_model_req_cobs,
+    encode_model_resp_cobs,
 };
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_MCU_FLASH_URDF: &[u8] =
     include_bytes!("../../../assets/sample_humanoid/rocky_mk1.urdf");
+
+// --- Torque-capable running plant constants ---------------------------------
+/// Gravity used by the vertical hop integrator (m/s²).
+const RUNNING_G_M_S2: f32 = 9.81;
+/// Effective joint-torque -> vertical-thrust lever arm in metres (~0.05 m per research §2.1).
+const RUNNING_LEVER_ARM_M: f32 = 0.05;
+/// Thrust ceiling: ~4× body weight for the 1.5 kg template (N).
+const RUNNING_MAX_THRUST_N: f32 = 60.0;
+/// Braking (negative thrust) ceiling, allowing energy absorption during landing (N).
+const RUNNING_MIN_THRUST_N: f32 = -120.0;
+/// Flight detector debounce in seconds (10–15 ms per research §2.2).
+const RUNNING_FLIGHT_DEBOUNCE_S: f32 = 0.012;
+/// Nominal torque used to translate commanded N·m into reported motor current.
+const RUNNING_NOMINAL_TORQUE_NM: f32 = 1.8;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SimFaultInjection {
@@ -83,6 +98,31 @@ pub struct SimulatedServoPlant {
     recovery_start_pitch: f32,
     recovery_start_roll: f32,
     recovery_start_yaw: f32,
+    // --- Torque-capable running plant (v2). Inactive unless running_cfg.enabled ---
+    /// Current wire running configuration (also holds physics parameters for the plant).
+    running_cfg: RunningConfig,
+    /// True once `running_cfg.enabled` is set; switches torque-mode joints to the hop model.
+    running_mode: bool,
+    /// Vertical CoM height above the support sole in metres.
+    running_com_height_m: f32,
+    /// Vertical CoM velocity in m/s (positive = rising).
+    running_com_vel_z_m_s: f32,
+    /// Debounced airborne flag published by the plant-side flight detector.
+    running_in_flight: bool,
+    /// Consecutive raw-airborne time used for the flight debounce (seconds).
+    running_air_time_s: f32,
+    /// Previous debounced flight state, for touchdown edge detection.
+    running_prev_in_flight: bool,
+    /// Landing stiffness ramp progress in `[0.0, 1.0]`.
+    running_landing_ramp: f32,
+    /// Peak ground-reaction force seen during the most recent landing ramp (N).
+    running_peak_landing_force_n: f32,
+    /// Highest CoM height reached during the current flight (m).
+    running_apex_height_m: f32,
+    /// Ground reaction force from the most recent hop step (N).
+    running_ground_reaction_n: f32,
+    /// Vertical thrust converted from joint torque commands in the most recent step (N).
+    running_thrust_n: f32,
 }
 
 /// Body-frame gravity consistent with the kinematics tilt rotation.
@@ -132,6 +172,18 @@ impl SimulatedServoPlant {
             recovery_start_pitch: 0.0,
             recovery_start_roll: 0.0,
             recovery_start_yaw: 0.0,
+            running_cfg: RunningConfig::default(),
+            running_mode: false,
+            running_com_height_m: RunningConfig::default().leg_rest_length_m,
+            running_com_vel_z_m_s: 0.0,
+            running_in_flight: false,
+            running_air_time_s: 0.0,
+            running_prev_in_flight: false,
+            running_landing_ramp: 0.0,
+            running_peak_landing_force_n: 0.0,
+            running_apex_height_m: RunningConfig::default().leg_rest_length_m,
+            running_ground_reaction_n: 0.0,
+            running_thrust_n: 0.0,
         }
     }
 
@@ -182,6 +234,7 @@ impl SimulatedServoPlant {
         self.recovery_start_pitch = 0.0;
         self.recovery_start_roll = 0.0;
         self.recovery_start_yaw = 0.0;
+        self.reset_running_dynamics();
     }
 
     /// Updates active get-up recovery progress (`Some(0.0..=1.0)`) so simulated ground
@@ -206,6 +259,204 @@ impl SimulatedServoPlant {
         self.last_balance = bal;
     }
 
+    // --- Torque-capable running plant API -----------------------------------
+
+    /// Installs the wire running configuration. Invalid (non-finite) gains fall back
+    /// to `RunningConfig::default()` with the gate forced OFF, so a corrupt host frame
+    /// can never activate the hop plant. Disabling running re-initialises the vertical
+    /// state so the default plant remains unchanged on the next tick.
+    pub fn set_running_config(&mut self, cfg: RunningConfig) {
+        let sanitized = if cfg.all_finite() {
+            cfg
+        } else {
+            RunningConfig {
+                enabled: false,
+                ..Default::default()
+            }
+        };
+        let gate_changed = sanitized.enabled != self.running_mode;
+        self.running_cfg = sanitized;
+        self.running_mode = sanitized.enabled;
+        if gate_changed {
+            self.reset_running_dynamics();
+        }
+    }
+
+    /// Enables/disables running without replacing the gains.
+    pub fn set_running_enabled(&mut self, enabled: bool) {
+        let mut cfg = self.running_cfg;
+        cfg.enabled = enabled;
+        self.set_running_config(cfg);
+    }
+
+    pub fn running_enabled(&self) -> bool {
+        self.running_mode
+    }
+
+    /// Debounced flight state reported by the plant-side detector.
+    pub fn in_flight(&self) -> bool {
+        self.running_in_flight
+    }
+
+    pub fn com_height_m(&self) -> f32 {
+        self.running_com_height_m
+    }
+
+    pub fn com_velocity_z_m_s(&self) -> f32 {
+        self.running_com_vel_z_m_s
+    }
+
+    /// Stance spring/ground reaction force from the most recent hop step (N).
+    pub fn ground_reaction_n(&self) -> f32 {
+        self.running_ground_reaction_n
+    }
+
+    /// Vertical thrust produced from commanded torque in the most recent step (N).
+    pub fn thrust_n(&self) -> f32 {
+        self.running_thrust_n
+    }
+
+    /// Peak ground reaction during the most recent landing-ramp window (N).
+    pub fn peak_landing_force_n(&self) -> f32 {
+        self.running_peak_landing_force_n
+    }
+
+    /// Peak landing force expressed as equivalent single-joint torque (N·m).
+    pub fn peak_landing_torque_nm(&self) -> f32 {
+        self.running_peak_landing_force_n * RUNNING_LEVER_ARM_M
+    }
+
+    /// Highest CoM height reached in the current flight (m).
+    pub fn apex_height_m(&self) -> f32 {
+        self.running_apex_height_m
+    }
+
+    /// Apex height above the configured leg rest length, i.e. achieved hop height (m).
+    pub fn hop_height_m(&self) -> f32 {
+        (self.running_apex_height_m - self.running_cfg.leg_rest_length_m).max(0.0)
+    }
+
+    /// Directly seeds the vertical hop state. Intended for deterministic validation
+    /// of landing/flight behaviour without having to synthesise a full approach run.
+    pub fn set_running_state(&mut self, height_m: f32, velocity_z_m_s: f32, in_flight: bool) {
+        if !height_m.is_finite() || !velocity_z_m_s.is_finite() {
+            return;
+        }
+        self.running_com_height_m = height_m.max(0.0);
+        self.running_com_vel_z_m_s = velocity_z_m_s.clamp(-5.0, 5.0);
+        self.running_in_flight = in_flight;
+        self.running_prev_in_flight = in_flight;
+        self.running_air_time_s = if in_flight {
+            RUNNING_FLIGHT_DEBOUNCE_S
+        } else {
+            0.0
+        };
+        self.running_apex_height_m = self.running_com_height_m;
+        self.running_landing_ramp = 0.0;
+        self.running_peak_landing_force_n = 0.0;
+        self.running_ground_reaction_n = 0.0;
+        self.running_thrust_n = 0.0;
+    }
+
+    /// Returns vertical state to standing at leg rest length with zero velocity.
+    fn reset_running_dynamics(&mut self) {
+        let l0 = if self.running_cfg.leg_rest_length_m.is_finite()
+            && self.running_cfg.leg_rest_length_m > 0.0
+        {
+            self.running_cfg.leg_rest_length_m
+        } else {
+            RunningConfig::default().leg_rest_length_m
+        };
+        self.running_com_height_m = l0;
+        self.running_com_vel_z_m_s = 0.0;
+        self.running_in_flight = false;
+        self.running_prev_in_flight = false;
+        self.running_air_time_s = 0.0;
+        self.running_landing_ramp = 0.0;
+        self.running_peak_landing_force_n = 0.0;
+        self.running_apex_height_m = l0;
+        self.running_ground_reaction_n = 0.0;
+        self.running_thrust_n = 0.0;
+    }
+
+    /// Deterministic vertical SLIP hop integrator driven by joint torque commands.
+    ///
+    /// Joint torque in `Torque` mode is converted to upward thrust through a fixed
+    /// lever arm; a stance spring with the configured landing-impedance stiffness
+    /// (soft at touchdown, ramped to nominal over `landing_ramp_s`) supplies ground
+    /// reaction. Gravity is always applied. No wall-clock, randomness or allocation.
+    fn step_running_dynamics(&mut self, dt: f32) {
+        let cfg = self.running_cfg;
+        let mass = cfg.mass_kg.clamp(0.2, 10.0);
+        let l0 = cfg.leg_rest_length_m.clamp(0.05, 1.0);
+        let ramp_s = cfg.landing_ramp_s.clamp(0.002, 0.2);
+
+        // Sum signed commanded torque over torque-mode, energised joints -> thrust.
+        // Negative thrust is permitted so a controller can absorb energy / brake.
+        let mut torque_sum_nm = 0.0_f32;
+        for i in 0..self.joint_count {
+            if ((self.last_cmd.torque_mask >> i) & 1) == 1
+                && JointCommandMode::from_wire(self.last_cmd.command_mode[i])
+                    == JointCommandMode::Torque
+            {
+                torque_sum_nm += self.last_cmd.torque_nm[i];
+            }
+        }
+        let thrust = (torque_sum_nm / RUNNING_LEVER_ARM_M)
+            .clamp(RUNNING_MIN_THRUST_N, RUNNING_MAX_THRUST_N);
+        self.running_thrust_n = thrust;
+
+        // Stance spring with first-order landing stiffening ramp.
+        let mut ground = 0.0_f32;
+        if self.running_com_height_m < l0 {
+            let compression = l0 - self.running_com_height_m;
+            // Compression rate is positive while the leg shortens, negative while extending.
+            let compression_rate = -self.running_com_vel_z_m_s;
+            self.running_landing_ramp = (self.running_landing_ramp + dt / ramp_s).min(1.0);
+            let k = cfg.landing_stiffness_touchdown_n_m
+                + (cfg.landing_stiffness_nominal_n_m - cfg.landing_stiffness_touchdown_n_m)
+                    * self.running_landing_ramp;
+            let d = cfg.landing_damping_n_s_m;
+            ground = (k * compression + d * compression_rate).max(0.0);
+            self.running_peak_landing_force_n = self.running_peak_landing_force_n.max(ground);
+        } else {
+            self.running_landing_ramp = 0.0;
+        }
+        self.running_ground_reaction_n = ground;
+
+        // Semi-implicit Euler: deterministic for a fixed dt.
+        let accel = (ground + thrust) / mass - RUNNING_G_M_S2;
+        self.running_com_vel_z_m_s = (self.running_com_vel_z_m_s + accel * dt).clamp(-5.0, 5.0);
+        self.running_com_height_m += self.running_com_vel_z_m_s * dt;
+        if self.running_com_height_m <= 0.0 {
+            self.running_com_height_m = 0.0;
+            if self.running_com_vel_z_m_s < 0.0 {
+                self.running_com_vel_z_m_s = 0.0;
+            }
+        }
+
+        // Flight detector: debounce on entry (>=12ms), immediate on touchdown.
+        let raw_airborne = self.running_com_height_m > l0 + 1.0e-4_f32;
+        if raw_airborne {
+            self.running_air_time_s += dt;
+            self.running_apex_height_m = self.running_apex_height_m.max(self.running_com_height_m);
+            if self.running_air_time_s >= RUNNING_FLIGHT_DEBOUNCE_S {
+                self.running_in_flight = true;
+            }
+        } else {
+            self.running_air_time_s = 0.0;
+            self.running_in_flight = false;
+        }
+
+        // Touchdown edge: reset the compliance ramp and landing-force peak.
+        if self.running_prev_in_flight && !self.running_in_flight {
+            self.running_landing_ramp = 0.0;
+            self.running_peak_landing_force_n = 0.0;
+            self.running_apex_height_m = self.running_com_height_m;
+        }
+        self.running_prev_in_flight = self.running_in_flight;
+    }
+
     pub fn step_plant(&mut self, dt_sec: f32) -> RawServoFeedback {
         let dt = dt_sec.clamp(0.001_f32, 0.05_f32);
         self.wave_phase += dt * 2.4_f32;
@@ -215,8 +466,25 @@ impl SimulatedServoPlant {
         for i in 0..self.joint_count {
             let torque_on = ((self.last_cmd.torque_mask >> i) & 1) == 1;
             let stalled = self.faults.stalled_joints[i];
+            let running_torque = self.running_mode
+                && torque_on
+                && JointCommandMode::from_wire(self.last_cmd.command_mode[i])
+                    == JointCommandMode::Torque;
 
-            if torque_on {
+            if running_torque {
+                // Torque-capable running: torque_nm is a thrust command, not a
+                // position-servo target. The vertical hop integrator consumes it;
+                // joint angles are held at their last pose. Current tracks the
+                // commanded torque so flight detection sees near-zero leg current.
+                let tq = self.last_cmd.torque_nm[i].abs();
+                self.velocity_rad_s[i] = 0.0;
+                self.current_ma[i] = if stalled {
+                    2250
+                } else {
+                    (tq / RUNNING_NOMINAL_TORQUE_NM * rk_proto::RATED_CURRENT_MA as f32)
+                        .clamp(0.0, 3400.0) as u16
+                };
+            } else if torque_on {
                 let target = self.last_cmd.raw_target_rad[i];
                 let pos = self.raw_angle_rad[i];
                 let err = target - pos;
@@ -411,6 +679,11 @@ impl SimulatedServoPlant {
         // clamped so a violent fall cannot spin the robot arbitrarily far.
         self.torso_yaw_rad = (self.torso_yaw_rad + self.roll_rate_rad_s * 0.06_f32 * dt)
             .clamp(-0.6_f32, 0.6_f32);
+
+        // Torque-capable running hop dynamics (inactive unless the gate is enabled).
+        if self.running_mode {
+            self.step_running_dynamics(dt);
+        }
 
         let mut temp_c = [28u8; MAX_JOINTS];
         for i in 0..self.joint_count {
@@ -614,6 +887,8 @@ impl CopperSimRunner {
     /// Executes one full Copper DAG cycle including real COBS encode/decode in both directions.
     pub fn tick(&mut self, dt_sec: f32, host_pkt: &HostToMcu) -> McuToHost {
         let dt = dt_sec.clamp(0.002_f32, 0.05_f32);
+        // Forward the streamed running gate/gains to the torque-capable plant.
+        self.plant.set_running_config(host_pkt.walk.running);
         self.uptime_ms_f += (dt as f64) * 1000.0;
         let now_ms = self.uptime_ms_f.round() as u32;
 
@@ -1024,5 +1299,196 @@ mod tests {
             after_corrupt.rx_crc_errors >= 1,
             "injected bit-flip must increment rx_crc_errors in telemetry"
         );
+    }
+
+    // --- Torque-capable running plant tests ----------------------------------
+
+    /// Minimal deterministic thrust command: joint 9 (a leg joint) is the sole
+    /// torque-mode actuator, so its torque maps directly to vertical thrust.
+    fn running_thrust_cmd(thrust_n: f32) -> RawServoCommand {
+        let mut cmd = RawServoCommand::default();
+        cmd.torque_mask = 1u32 << 9;
+        cmd.command_mode[9] = JointCommandMode::Torque.to_wire();
+        cmd.torque_nm[9] = (thrust_n * RUNNING_LEVER_ARM_M)
+            .clamp(RUNNING_MIN_THRUST_N * RUNNING_LEVER_ARM_M, RUNNING_MAX_THRUST_N * RUNNING_LEVER_ARM_M);
+        cmd
+    }
+
+    /// Drives one deterministic SLIP hop: seeds a touchdown at `-sqrt(2 g H)` and
+    /// cancels the stance spring with signed thrust so the CoM accelerates at
+    /// `+PUSH_ACCEL` until the target takeoff velocity is reached, then coasts to
+    /// liftoff. This is a validation driver only; the plant stays a pure physics model.
+    fn drive_single_hop(cfg: RunningConfig, ticks: usize) -> (SimulatedServoPlant, usize) {
+        const PUSH_ACCEL: f32 = 20.0_f32;
+        const DT: f32 = 0.001_f32;
+        let mut plant = SimulatedServoPlant::new(21, [0.0; MAX_JOINTS]);
+        plant.set_running_config(cfg);
+        let takeoff_vel = (2.0 * RUNNING_G_M_S2 * cfg.hop_height_m).sqrt();
+        plant.set_running_state(cfg.leg_rest_length_m, -takeoff_vel, false);
+
+        let mut flight_steps = 0usize;
+        for _ in 0..ticks {
+            let h = plant.com_height_m();
+            let v = plant.com_velocity_z_m_s();
+            let stance = h <= cfg.leg_rest_length_m + 1.0e-4_f32;
+            let a_des = if !stance {
+                0.0
+            } else if v < takeoff_vel {
+                PUSH_ACCEL
+            } else {
+                0.0
+            };
+            let thrust = if stance {
+                (cfg.mass_kg * (a_des + RUNNING_G_M_S2) - plant.ground_reaction_n())
+                    .clamp(RUNNING_MIN_THRUST_N, RUNNING_MAX_THRUST_N)
+            } else {
+                0.0
+            };
+            plant.write_command(&running_thrust_cmd(thrust));
+            let _ = plant.step_plant(DT);
+            if plant.in_flight() {
+                flight_steps += 1;
+            }
+        }
+        (plant, flight_steps)
+    }
+
+    #[test]
+    fn running_hop_height_tracks_target() {
+        let cfg = RunningConfig {
+            enabled: true,
+            hop_height_m: 0.03,
+            ..Default::default()
+        };
+        // 170 ms at 1 kHz: covers the 0.12–0.15 s stance and the ballistic apex.
+        let (plant, _) = drive_single_hop(cfg, 170);
+        let achieved = plant.hop_height_m();
+        assert!(
+            (achieved - cfg.hop_height_m).abs() < 0.008,
+            "hop height {achieved:.4} m must track target {:.3} m within 8 mm",
+            cfg.hop_height_m
+        );
+        assert!(plant.running_enabled());
+        assert!(plant.apex_height_m() > cfg.leg_rest_length_m);
+    }
+
+    #[test]
+    fn running_flight_detector_debounces_and_clears_on_touchdown() {
+        let cfg = RunningConfig {
+            enabled: true,
+            hop_height_m: 0.03,
+            ..Default::default()
+        };
+        let (plant, flight_steps) = drive_single_hop(cfg, 170);
+        assert!(flight_steps > 0, "flight detector must assert during a hop");
+
+        // Expected ballistic time is 2*v_to/g ≈ 0.156 s; debounce removes ~12 ms.
+        let flight_s = flight_steps as f32 * 0.001_f32;
+        assert!(
+            (0.06..=0.25).contains(&flight_s),
+            "flight duration {flight_s:.3} s must be a plausible ballistic arc"
+        );
+        assert!(
+            flight_s >= RUNNING_FLIGHT_DEBOUNCE_S,
+            "flight must persist beyond the 12 ms debounce"
+        );
+        assert!(plant.in_flight(), "plant must be airborne near the apex");
+
+        // After the apex the plant comes back down: flight must clear on touchdown.
+        let mut settled = plant;
+        let zero = running_thrust_cmd(0.0);
+        for _ in 0..120 {
+            settled.write_command(&zero);
+            let _ = settled.step_plant(0.005_f32);
+        }
+        assert!(!settled.in_flight(), "flight must clear at touchdown");
+    }
+
+    /// Drops the plant from its apex with zero thrust and records the landing peak.
+    fn landing_peak(cfg: RunningConfig) -> (f32, f32, u16) {
+        let mut plant = SimulatedServoPlant::new(21, [0.0; MAX_JOINTS]);
+        plant.set_running_config(cfg);
+        let rest = cfg.leg_rest_length_m;
+        plant.set_running_state(rest + cfg.hop_height_m, 0.0, true);
+        let zero = running_thrust_cmd(0.0);
+        let mut peak_force = 0.0_f32;
+        let mut peak_current = 0_u16;
+        for _ in 0..400 {
+            plant.write_command(&zero);
+            let fb = plant.step_plant(0.005_f32);
+            peak_force = peak_force.max(plant.peak_landing_force_n());
+            for i in 0..plant.joint_count {
+                peak_current = peak_current.max(fb.current_ma[i]);
+            }
+        }
+        (peak_force, peak_force * RUNNING_LEVER_ARM_M, peak_current)
+    }
+
+    #[test]
+    fn compliant_landing_does_not_spike_torque_or_current() {
+        // Compliant landing uses the specified 25–40 ms ramp at the upper end (40 ms).
+        // At 30 ms the ramp completes right at maximum leg compression (~30 ms for
+        // k=4000, m=1.5), so its peak force is indistinguishable from a rigid landing;
+        // 40 ms keeps stiffness low through the compression and is the physical
+        // compliance mechanism described in research §2.3.
+        let soft = RunningConfig {
+            enabled: true,
+            hop_height_m: 0.03,
+            landing_ramp_s: 0.04,
+            ..Default::default()
+        };
+        // Rigid position-hold equivalent: full stiffness from touchdown with no ramp.
+        // 8000 N/m represents the effectively rigid impedance the ramp avoids.
+        let rigid = RunningConfig {
+            landing_stiffness_touchdown_n_m: 8000.0,
+            landing_stiffness_nominal_n_m: 8000.0,
+            landing_ramp_s: 0.002,
+            ..soft
+        };
+
+        let (soft_force, soft_torque, soft_ma) = landing_peak(soft);
+        let (rigid_force, rigid_torque, _rigid_ma) = landing_peak(rigid);
+        assert!(soft_force > 0.0, "landing ramp must register ground reaction");
+        assert!(
+            soft_force < rigid_force * 0.75,
+            "compliant touchdown must cut landing force ({soft_force:.1} vs {rigid_force:.1} N)"
+        );
+        // v2 BLDC joints tolerate more than the v1 1.8 N·m ceiling; 3.5 N·m is a
+        // modest torque-capable ceiling that the compliant landing stays under.
+        assert!(
+            soft_torque < 3.5,
+            "compliant landing torque {soft_torque:.2} N·m must stay under the v2 ceiling"
+        );
+        assert!(
+            soft_torque < rigid_torque,
+            "compliance must reduce equivalent joint torque ({soft_torque:.2} vs {rigid_torque:.2} N·m)"
+        );
+        assert!(
+            soft_ma < 2200,
+            "passive compliant landing must not spike current ({soft_ma} mA)"
+        );
+    }
+
+    #[test]
+    fn running_gate_defaults_off_and_leaves_default_plant_unchanged() {
+        let cfg = RunningConfig::default();
+        assert!(!cfg.enabled, "running gate must default OFF (v1 unaffected)");
+        let mut plant = SimulatedServoPlant::new(6, [0.0; MAX_JOINTS]);
+        plant.set_running_config(cfg);
+        assert!(!plant.running_enabled());
+        assert!(!plant.in_flight());
+
+        let mut cmd = RawServoCommand::default();
+        cmd.torque_mask = 0b11_1111;
+        cmd.raw_target_rad[0] = 0.8;
+        for _ in 0..20 {
+            plant.write_command(&cmd);
+            let _ = plant.step_plant(0.01);
+        }
+        assert!(
+            plant.raw_angles()[0] > 0.1,
+            "default position-servo plant must still track targets when running is off"
+        );
+        assert!((plant.com_height_m() - cfg.leg_rest_length_m).abs() < 1e-6);
     }
 }

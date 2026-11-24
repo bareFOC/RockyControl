@@ -217,6 +217,10 @@ The earlier "20 cm hop" is arithmetically correct ($v=\sqrt{2g(0.20)}=1.98$ m/s)
 
 ## 6. Staged roadmap — split by actuator generation (critique §5)
 
+> **P3 STATUS (2026-11-25): IMPLEMENTED (software).** `p3-dynamic-running` added SLIP thrust control (`rk-control/src/slip.rs`, k=670 N/m, 2–4 cm hops, stance ~149 ms), flight detection (current + IMU free-fall, 12 ms debounce), 30 ms landing impedance ramp, scalar CBF safety (`cbf.rs`), and a `RunningConfig` wire field (`PROTOCOL_VERSION=4`). Running is gated OFF by default (v1 unaffected); real running requires v2 torque hardware + ESP32-P4 bring-up. Sim plant validated hop height/flight/landing.
+
+> **P2 STATUS (2026-11-25): IMPLEMENTED.** `p2-robust-walking` added a continuous phase-locked gait clock, Raibert/capture foot placement from support-relative DCM, Khadiv step-timing adaptation, and a gait/estimator telemetry HUD. Optional LIPM-MPC deferred.
+
 > **P1 STATUS (2026-11-25): IMPLEMENTED.** `p1-mass-weighted-com-estimator` replaced the IMU-tilt proxy with mass-weighted FK CoM (`rk-control/src/com_fk.rs` + generated `mass_table.rs` from URDF `<inertial>` tags, total 1.487 kg), analytic $J_{com}\dot q$ from measured joint velocity, support-relative DCM with fixed configurable `h_com_m` (default 0.25 m, `PROTOCOL_VERSION=3`), proxy fallback for non-21-DoF rigs, and bias-compensated attitude sharing. All shove/fall/replay tests pass; replay verified bit-exact with nonzero joint velocities. UI gap (no estimator telemetry display) is addressed in the P2 HUD task.
 
 **P0 (done):** fall detection, classified get-up library, recovery state machine, red alarm.

@@ -12,18 +12,27 @@
 //!
 //! Strictly single-precision `f32` everywhere for RP2350 Cortex-M33 FPU numeric parity.
 
+pub mod cbf;
 pub mod com_fk;
 pub mod estimator;
 pub mod mass_table;
+pub mod slip;
 pub mod uvc;
 
 use core::f32::consts::{FRAC_PI_2, PI, TAU};
 
+use libm::sqrtf;
+
+pub use cbf::{
+    CbfConfig, project_capture_point, project_com_velocity, project_tilt_rate,
+    project_tilt_torque, shield_torque,
+};
 pub use estimator::{DcmSwingHint, KinematicEstimator};
+pub use slip::{FlightDetector, SlipConfig, SlipController, SlipInputs, SlipOutput, SlipPhase};
 use rk_proto::{
     BalanceGains, BalanceTelemetry, ConfigCmd, ControlMode, FaultFlags, HostToMcu, ImuState,
-    JointCommandMode, MAX_JOINTS, McuToHost, PROTOCOL_VERSION, WATCHDOG_TIMEOUT_MS, WalkCmd,
-    classify_fall, fall_orientation, uvc_phase,
+    JointCommandMode, MAX_JOINTS, McuToHost, PROTOCOL_VERSION, RunningConfig,
+    WATCHDOG_TIMEOUT_MS, WalkCmd, classify_fall, fall_orientation, uvc_phase,
 };
 use serde::{Deserialize, Serialize};
 pub use uvc::{LegGeometry, LegIkAngles, UvcController, UvcPhase, UvcStepOutput, solve_leg_ik};
@@ -223,6 +232,12 @@ pub struct DirectServoKernel {
     /// Cumulative MCU wire drop counters forwarded into `McuToHost`.
     rx_crc_errors: u16,
     rx_version_mismatches: u16,
+    // P3 running overlay: SLIP template + scalar CBF safety shield. The flag
+    // is OFF by default so every v1 build keeps its exact walking/balance path.
+    /// Authoritative runtime gate for the SLIP running overlay.
+    running_enabled: bool,
+    /// Stateful SLIP controller (holds its own sanitized configuration).
+    slip: SlipController,
 }
 
 impl DirectServoKernel {
@@ -257,6 +272,10 @@ impl DirectServoKernel {
             fall_orientation: fall_orientation::UNKNOWN,
             rx_crc_errors: 0,
             rx_version_mismatches: 0,
+            running_enabled: false,
+            slip: SlipController::new(SlipConfig::from_nominal_height(
+                LegGeometry::rocky_mk1().nominal_height,
+            )),
         }
     }
 
@@ -291,6 +310,72 @@ impl DirectServoKernel {
 
     pub fn flash_commit_count(&self) -> u32 {
         self.flash_commit_count
+    }
+
+    /// True when the SLIP running overlay is active. Always `false` by default.
+    pub const fn running_enabled(&self) -> bool {
+        self.running_enabled
+    }
+
+    /// Current SLIP running phase (useful for telemetry added by the wire work).
+    pub const fn slip_phase(&self) -> SlipPhase {
+        self.slip.phase()
+    }
+
+    /// Debounced flight flag of the running detector.
+    pub const fn slip_in_flight(&self) -> bool {
+        self.slip.in_flight()
+    }
+
+    /// Enables or disables the running overlay. Disabling also resets its
+    /// internal phase/debounce/landing state so re-enabling starts cleanly.
+    pub fn set_running_enabled(&mut self, enabled: bool) {
+        self.running_enabled = enabled;
+        self.slip.config.enabled = enabled;
+        if !enabled {
+            self.slip.reset();
+        }
+    }
+
+    /// Replaces the SLIP parameter set. `cfg.enabled` is authoritative, so
+    /// this also toggles the kernel gate.
+    pub fn set_slip_config(&mut self, cfg: SlipConfig) {
+        self.running_enabled = cfg.enabled;
+        self.slip = SlipController::new(cfg);
+    }
+
+    /// Read-only copy of the active SLIP parameters.
+    pub const fn slip_config(&self) -> SlipConfig {
+        self.slip.config
+    }
+
+    /// Maps the wire `RunningConfig` (Group 2) onto the kernel's local
+    /// `SlipConfig`. The running crate stays `rk-proto`-agnostic; only this
+    /// integrator knows the wire layout. Invalid numeric fields force the
+    /// gate off. State is preserved when gains are unchanged.
+    fn apply_running_config(&mut self, wire: RunningConfig) {
+        if !wire.all_finite() {
+            if self.running_enabled {
+                self.set_running_enabled(false);
+            }
+            return;
+        }
+        let cfg = SlipConfig {
+            enabled: wire.enabled,
+            mass_kg: wire.mass_kg,
+            spring_k_n_per_m: wire.leg_spring_n_m,
+            rest_length_m: wire.leg_rest_length_m,
+            target_hop_m: wire.hop_height_m,
+            cbf_kappa: wire.cbf_kappa,
+            landing_k0_n_per_m: wire.landing_stiffness_touchdown_n_m,
+            landing_k1_n_per_m: wire.landing_stiffness_nominal_n_m,
+            landing_damping_n_s_per_m: wire.landing_damping_n_s_m,
+            landing_ramp_s: wire.landing_ramp_s,
+            ..Default::default()
+        };
+        if cfg != self.slip.config {
+            self.set_slip_config(cfg);
+        }
     }
 
     pub fn step(
@@ -417,6 +502,7 @@ impl DirectServoKernel {
                     self.uvc.reset();
                     self.estimator.reset();
                     self.uvc_blend = 0.0;
+                    self.slip.reset();
                     self.fall_orientation = fall_orientation::UNKNOWN;
                     cleared_faults_this_tick = true;
                 }
@@ -425,6 +511,7 @@ impl DirectServoKernel {
             self.last_host_speed_pct = cmd.speed_limit_pct.clamp(1, 100);
             self.last_host_torque_mask = cmd.torque_mask;
             self.last_walk_cmd = cmd.walk;
+            self.apply_running_config(cmd.walk.running);
             for i in 0..self.joint_count {
                 if cmd.target_rad[i].is_finite() {
                     self.last_host_target_rad[i] = cmd.target_rad[i];
@@ -499,7 +586,7 @@ impl DirectServoKernel {
             estimator_imu.roll_rad = comp_roll;
         }
 
-        let (estimator_telem, dcm_hint) = self.estimator.step(
+        let (mut estimator_telem, dcm_hint) = self.estimator.step(
             dt,
             self.joint_count,
             &measured_rad,
@@ -610,6 +697,9 @@ impl DirectServoKernel {
                     foot_dy_m: uvc_out.foot_dy_m,
                     hip_height_m: uvc_out.hip_height_m,
                     fall_orientation: fall_orientation::UNKNOWN,
+                    running_active: false,
+                    flight_detected: false,
+                    running_com_height_m: 0.0,
                 };
             } else {
                 self.uvc.reset();
@@ -619,10 +709,102 @@ impl DirectServoKernel {
         } else {
             self.uvc.reset();
             self.uvc_blend = 0.0;
+            self.slip.reset();
             balance_telem.uvc_phase = uvc_phase::IDLE;
         }
 
         balance_telem.fall_orientation = self.fall_orientation;
+
+        // 5c. P3 running overlay (SLIP + CBF). Gated OFF by default: with the
+        // flag false, `slip_active` stays false and the step-6 loop below is
+        // byte-for-byte identical to v1 behavior.
+        let mut slip_active = false;
+        let mut slip_torque_nm = 0.0_f32;
+        if self.running_enabled
+            && self.slip.config.enabled
+            && self.active_mode == ControlMode::Drive
+            && humanoid_legs_available
+            && has_6dof_legs
+        {
+            let cfg = self.slip.config;
+            let geom = self.uvc.geometry();
+            // Virtual leg length proxy from measured knee bend. The torque-capable
+            // simulation plant (Group 2) can later supply the true leg length;
+            // this estimate is deterministic and uses only f32 encoder inputs.
+            let knee_rad = 0.5_f32
+                * (measured_rad[J21_L_KNEE_PITCH] + measured_rad[J21_R_KNEE_PITCH]);
+            let hip_height = (geom.nominal_height
+                - geom.thigh_len * (knee_rad - 0.35_f32))
+                .clamp(geom.min_height, geom.nominal_height + 0.06_f32);
+            let leg_length_m = cfg.rest_length_m * (hip_height / geom.nominal_height);
+            // Shortening the leg (negative knee rate) compresses the virtual spring.
+            let leg_length_rate_m_s = -0.5_f32
+                * (measured_vel_rad_s[J21_L_KNEE_PITCH] + measured_vel_rad_s[J21_R_KNEE_PITCH])
+                * geom.thigh_len;
+
+            let leg_idx = [
+                J21_L_HIP_PITCH, J21_L_KNEE_PITCH, J21_L_ANKLE_PITCH,
+                J21_R_HIP_PITCH, J21_R_KNEE_PITCH, J21_R_ANKLE_PITCH,
+            ];
+            let mut leg_current_ma = 0.0_f32;
+            for &i in &leg_idx {
+                leg_current_ma += feedback.current_ma[i] as f32;
+            }
+            let specific_force_m_s2 = sqrtf(
+                imu.gravity[0] * imu.gravity[0]
+                    + imu.gravity[1] * imu.gravity[1]
+                    + imu.gravity[2] * imu.gravity[2],
+            );
+
+            let slip_out = self.slip.step(SlipInputs {
+                dt_s: dt,
+                leg_length_m,
+                leg_length_rate_m_s,
+                leg_current_ma,
+                specific_force_m_s2,
+                imu_available: imu.available,
+            });
+
+            // Scalar CBF shield: a command that would violate the torso-tilt,
+            // CoM-velocity or support-relative capture-point safe set is
+            // minimally modified before the existing torque ceiling is applied.
+            let tilt = if imu.pitch_rad.abs() >= imu.roll_rad.abs() {
+                imu.pitch_rad
+            } else {
+                imu.roll_rad
+            };
+            let tilt_rate = if imu.pitch_rad.abs() >= imu.roll_rad.abs() {
+                imu.pitch_rate_rad_s
+            } else {
+                imu.roll_rate_rad_s
+            };
+            // `foot_margin_m` is the estimator's *support-relative* signed
+            // remaining margin: margin - |xi_rel - p|. Converting it back to
+            // a distance keeps the CBF capture set relative to support rather
+            // than to the world origin (which would falsely trip on a CoM
+            // offset inherent to a crouched pose).
+            let capture_err = (0.028_f32 - estimator_telem.foot_margin_m).max(0.0_f32);
+            let cbf_cfg = CbfConfig {
+                kappa: cfg.cbf_kappa,
+                ..Default::default()
+            };
+            slip_torque_nm = shield_torque(
+                slip_out.joint_torque_nm,
+                tilt,
+                tilt_rate,
+                estimator_telem.com_vel_m_s[2],
+                capture_err,
+                &cbf_cfg,
+                4.0_f32, // approximate tilt authority: rad/s² per N·m
+                dt,
+            );
+            slip_active = true;
+            balance_telem.running_active = true;
+            balance_telem.flight_detected = slip_out.in_flight;
+            balance_telem.running_com_height_m = estimator_telem.com_pos_m[1];
+            // Mark the running telemetry channels valid for consumers.
+            estimator_telem.valid_mask |= rk_proto::estimator_valid::RUNNING;
+        }
 
         // 6. Compute torque mask, soft-stopped slew-clamped targets, and explicit physical
         //    torque / velocity ceilings (Safety ALWAYS downstream of balance & host commands).
@@ -708,6 +890,16 @@ impl DirectServoKernel {
                             sign * req_t.clamp(-effective_ceiling, effective_ceiling)
                         }
                     };
+
+                    // P3 running overlay: the SLIP/CBF torque replaces the host
+                    // torque on leg joints only, still subject to the very same
+                    // effective ceiling (compliance/ukemi) computed above.
+                    if slip_active && i >= J21_L_HIP_YAW && i <= J21_R_ANKLE_ROLL {
+                        cmd_mode_out[i] = JointCommandMode::Torque.to_wire();
+                        raw_vel_out[i] = 0.0;
+                        torque_nm_out[i] =
+                            sign * slip_torque_nm.clamp(-effective_ceiling, effective_ceiling);
+                    }
                 }
                 raw_target_rad[i] =
                     calibrated_to_raw(self.applied_target_rad[i], &self.calibration[i]);
@@ -1195,5 +1387,167 @@ mod tests {
         assert_eq!(mask & rk_proto::estimator_valid::LSM6DSV_OK, 0);
         assert_eq!(mask & rk_proto::estimator_valid::GRF, 0);
         assert_eq!(mask & rk_proto::estimator_valid::MOMENTUM, 0);
+    }
+
+    // ---- Group 1 (P3): SLIP running overlay + CBF shield -----------------
+
+    #[test]
+    fn running_disabled_by_default_leaves_servo_output_unchanged() {
+        let cal = [JointCalibration {
+            min_rad: -2.2,
+            max_rad: 2.2,
+            ..Default::default()
+        }; 21];
+        let mut kernel = DirectServoKernel::new(21, &cal);
+        assert!(!kernel.running_enabled());
+        assert_eq!(kernel.slip_phase(), SlipPhase::Stance);
+
+        let fb = RawServoFeedback::default();
+        let mut cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: (1u32 << 21) - 1,
+            torque_limit_nm: [1.8; MAX_JOINTS],
+            walk: WalkCmd {
+                balance_enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cmd.command_mode[11] = JointCommandMode::Torque.to_wire();
+        cmd.torque_limit_nm[11] = 0.7;
+
+        let out = kernel.step(10, 0.005, Some(&cmd), &fb);
+        assert!(!out.telemetry.balance.running_active);
+        assert!(!out.telemetry.balance.flight_detected);
+        // Host torque passes through verbatim when the gate is off.
+        assert_eq!(out.servo_cmd.command_mode[11], JointCommandMode::Torque.to_wire());
+        assert!((out.servo_cmd.torque_nm[11] - 0.7_f32).abs() < 1e-6);
+
+        // Explicitly disabling twice is a no-op and yields identical commands.
+        let mut disabled = DirectServoKernel::new(21, &cal);
+        disabled.set_running_enabled(false);
+        let out2 = disabled.step(10, 0.005, Some(&cmd), &fb);
+        assert_eq!(out.servo_cmd.torque_nm, out2.servo_cmd.torque_nm);
+        assert_eq!(out.servo_cmd.command_mode, out2.servo_cmd.command_mode);
+        assert_eq!(out.servo_cmd.raw_target_rad, out2.servo_cmd.raw_target_rad);
+    }
+
+    #[test]
+    fn running_enabled_modulates_leg_torque_behind_the_gate() {
+        let cal = [JointCalibration {
+            min_rad: -2.2,
+            max_rad: 2.2,
+            ..Default::default()
+        }; 21];
+        let mut kernel = DirectServoKernel::new(21, &cal);
+        kernel.set_running_enabled(true);
+        assert!(kernel.running_enabled());
+
+        let mut fb = RawServoFeedback::default();
+        fb.imu.available = true;
+        fb.imu.gravity = [0.0, -9.81, 0.0];
+        // Symmetric crouch: knee bends 0.7 rad with hip/ankle at -0.35 rad
+        // keeps the sole flat and the CoM over the support, while the proxy
+        // leg length still compresses the SLIP spring below L0.
+        fb.raw_angle_rad[J21_L_HIP_PITCH] = -0.35;
+        fb.raw_angle_rad[J21_L_KNEE_PITCH] = 0.7;
+        fb.raw_angle_rad[J21_L_ANKLE_PITCH] = -0.35;
+        fb.raw_angle_rad[J21_R_HIP_PITCH] = -0.35;
+        fb.raw_angle_rad[J21_R_KNEE_PITCH] = 0.7;
+        fb.raw_angle_rad[J21_R_ANKLE_PITCH] = -0.35;
+
+        let mut cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: (1u32 << 21) - 1,
+            torque_limit_nm: [1.8; MAX_JOINTS],
+            walk: WalkCmd {
+                balance_enabled: false,
+                running: RunningConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Host torque is deliberately lower than the SLIP thrust so the two
+        // paths produce distinguishable commands.
+        cmd.torque_limit_nm[J21_L_KNEE_PITCH] = 0.7;
+
+        let out = kernel.step(10, 0.005, Some(&cmd), &fb);
+        assert!(out.telemetry.balance.running_active);
+        assert!(!out.telemetry.balance.flight_detected);
+        assert_eq!(kernel.slip_phase(), SlipPhase::Stance);
+        // Leg joints switch to torque mode and receive SLIP thrust.
+        assert_eq!(out.servo_cmd.command_mode[J21_L_KNEE_PITCH], JointCommandMode::Torque.to_wire());
+        let leg_torque = out.servo_cmd.torque_nm[J21_L_KNEE_PITCH];
+        assert!(leg_torque > 0.0_f32, "compressed leg must push off: {leg_torque}");
+        assert!(leg_torque <= 1.8_f32 + 1e-6, "existing torque ceiling must hold: {leg_torque}");
+        // A non-leg joint keeps the host's command mode/value.
+        cmd.seq = 2;
+        assert_eq!(out.servo_cmd.raw_velocity_rad_s[J21_L_KNEE_PITCH], 0.0);
+
+        // Replaying the same tick with the gate off restores host behavior.
+        let mut off_cmd = cmd;
+        off_cmd.walk.running.enabled = false;
+        let mut off = DirectServoKernel::new(21, &cal);
+        let out_off = off.step(10, 0.005, Some(&off_cmd), &fb);
+        assert!(!out_off.telemetry.balance.running_active);
+        assert_ne!(out_off.servo_cmd.torque_nm[J21_L_KNEE_PITCH], leg_torque);
+    }
+
+    #[test]
+    fn cbf_shield_reduces_running_torque_when_tilt_violates_the_safe_set() {
+        let cal = [JointCalibration {
+            min_rad: -2.2,
+            max_rad: 2.2,
+            ..Default::default()
+        }; 21];
+        let mut base_fb = RawServoFeedback::default();
+        base_fb.imu.available = true;
+        base_fb.imu.gravity = [0.0, -9.81, 0.0];
+        base_fb.raw_angle_rad[J21_L_HIP_PITCH] = -0.35;
+        base_fb.raw_angle_rad[J21_L_KNEE_PITCH] = 0.7;
+        base_fb.raw_angle_rad[J21_L_ANKLE_PITCH] = -0.35;
+        base_fb.raw_angle_rad[J21_R_HIP_PITCH] = -0.35;
+        base_fb.raw_angle_rad[J21_R_KNEE_PITCH] = 0.7;
+        base_fb.raw_angle_rad[J21_R_ANKLE_PITCH] = -0.35;
+
+        let cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: (1u32 << 21) - 1,
+            torque_limit_nm: [1.8; MAX_JOINTS],
+            walk: WalkCmd {
+                balance_enabled: false,
+                running: RunningConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut upright = DirectServoKernel::new(21, &cal);
+        upright.set_running_enabled(true);
+        let quiet = upright.step(10, 0.005, Some(&cmd), &base_fb);
+        let torque_upright = quiet.servo_cmd.torque_nm[J21_L_KNEE_PITCH];
+
+        let mut leaning_fb = base_fb;
+        // 0.499 rad is inside ukemi (0.56) but beyond the 0.5 rad CBF limit.
+        leaning_fb.imu.pitch_rad = 0.499;
+        let mut leaning = DirectServoKernel::new(21, &cal);
+        leaning.set_running_enabled(true);
+        let tilted = leaning.step(10, 0.005, Some(&cmd), &leaning_fb);
+        let torque_tilted = tilted.servo_cmd.torque_nm[J21_L_KNEE_PITCH];
+
+        assert!(torque_upright > 0.0_f32, "baseline thrust required: {torque_upright}");
+        assert!(
+            torque_tilted < torque_upright,
+            "CBF must minimally reduce the command: {torque_tilted} >= {torque_upright}"
+        );
     }
 }
