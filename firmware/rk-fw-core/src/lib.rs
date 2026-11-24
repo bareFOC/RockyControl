@@ -11,6 +11,15 @@ pub mod i3c_bus;
 pub mod imu;
 pub mod lsm6dsv;
 pub mod model_store;
+#[cfg(feature = "std")]
+pub mod replay;
 pub mod servo_bus;
 pub mod status_led;
 pub mod transport;
+
+// Host+MCU single-source control application entry points.
+pub use copper::{ControlTask, ControlTick, current_led_mode};
+#[cfg(feature = "std")]
+pub use replay::{
+    CopperListTick, CopperReplayLog, ReplayVerification, verify_deterministic_replay,
+};

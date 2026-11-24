@@ -11,6 +11,27 @@
 //! Until a transport is registered the adapter uses a safe no-hardware stub
 //! that reports a failed transaction for each joint. The control loop keeps
 //! running (each joint is isolated, watchdog still fed) — no panic, no hang.
+//!
+//! # Embassy guideline compliance (critical-section boundary)
+//!
+//! The write hook is split into three phases so no hardware I/O ever happens
+//! with interrupts disabled:
+//!
+//! 1. **Short critical section** — snapshot the command, clone the tracker and
+//!    *take* the transport pointer out of the shared state.
+//! 2. **Interrupts enabled** — all 21 `I3cTransport::transaction` calls, frame
+//!    encoding, reply decoding, per-joint timeout accounting and the
+//!    edge-triggered `degraded` warning run on the local copies.
+//! 3. **Short critical section** — put the transport back, commit the tracker
+//!    and publish the feedback snapshot.
+//!
+//! No `embassy_sync` channel/`i3c_io` task is needed: [`I3cTransport`] is a
+//! synchronous trait and the hook itself is a plain `fn`, not an async task,
+//! so there is no await point to hand off. The external PIO driver can remain
+//! synchronous (poll/DMA-complete) as long as it does not disable interrupts;
+//! if a future driver requires an await, the channel handoff and task must be
+//! wired from `main.rs` (outside this module's ownership) — see the report
+//! accompanying the `embassy-guidelines` change.
 
 #![cfg(feature = "i3c-servo-bus")]
 
@@ -25,6 +46,13 @@ use rk_fw_core::i3c_bus::{
 };
 use rk_fw_core::imu::IMU_SLOT;
 use rk_fw_core::servo_bus::{SERVO_BUS_SLOT, ServoBusHooks};
+
+/// Joints actually driven by this adapter (clamped to the wire-protocol maximum).
+const JOINT_COUNT: usize = if DEFAULT_JOINT_COUNT < rk_proto::MAX_JOINTS {
+    DEFAULT_JOINT_COUNT
+} else {
+    rk_proto::MAX_JOINTS
+};
 
 /// Low-level boundary the external RP2350 PIO I3C master plugs into.
 ///
@@ -103,66 +131,93 @@ pub fn set_i3c_transport(transport: &'static mut (dyn I3cTransport + 'static)) {
     info!("External PIO I3C transport registered with SimpleFOC servo adapter");
 }
 
-/// Hook called by `SERVO_BUS_SLOT` every `copper-rs` write phase.
+/// Hook called by `SERVO_BUS_SLOT` every write phase.
 ///
 /// Encodes each joint command with `I3cBusTracker::encode_joint_cmd`, performs
-/// one timeout-bounded transaction, decodes the reply with
-/// `unpack_i3c_joint_reply`, and records a per-joint timeout on any failure.
+/// one timeout-bounded transaction **with interrupts enabled**, decodes the
+/// reply with `unpack_i3c_joint_reply`, and records a per-joint timeout on any
+/// failure. Only the snapshot/restore of shared state uses critical sections.
 fn i3c_write_command(cmd: &RawServoCommand) {
-    critical_section::with(|cs| {
+    // ----- Phase 1: short critical section — snapshot shared state ---------
+    // Clone the tracker (it is `Clone` + `Copy`-cheap arrays) so encoding,
+    // sequencing and result recording can run entirely outside the lock. Take
+    // the transport out so the exclusive `&mut` can be used without holding
+    // `I3C_STATE.borrow_ref_mut(cs)` across any hardware access.
+    let (mut tracker, mut taken_transport) = critical_section::with(|cs| {
         let mut st = I3C_STATE.borrow_ref_mut(cs);
         st.last_cmd = *cmd;
+        (st.tracker.clone(), st.transport.take())
+    });
 
-        for joint in 0..DEFAULT_JOINT_COUNT.min(rk_proto::MAX_JOINTS) {
-            let seq = st.tracker.next_seq();
-            let frame = st.tracker.encode_joint_cmd(joint, seq, cmd);
-            let addr = I3C_JOINT_BASE_ADDR.saturating_add(joint as u8);
-            let mut reply_buf = [0u8; I3C_FB_FRAME_BYTES];
+    // ----- Phase 2: interrupts enabled — all hardware I/O and accounting ---
+    let mut stub = NoHardwareTransport;
+    let transport: &mut dyn I3cTransport = match taken_transport.as_deref_mut() {
+        Some(t) => t,
+        None => &mut stub,
+    };
 
-            let was_degraded = st.tracker.degraded_mask();
-            let mut stub = NoHardwareTransport;
-            let tx_result = match st.transport.as_deref_mut() {
-                Some(t) => t.transaction(addr, &frame, &mut reply_buf),
-                None => stub.transaction(addr, &frame, &mut reply_buf),
-            };
-            let reply = tx_result.ok().and_then(|()| unpack_i3c_joint_reply(&reply_buf));
+    for joint in 0..JOINT_COUNT {
+        let seq = tracker.next_seq();
+        let frame = tracker.encode_joint_cmd(joint, seq, cmd);
+        let addr = I3C_JOINT_BASE_ADDR.saturating_add(joint as u8);
+        let mut reply_buf = [0u8; I3C_FB_FRAME_BYTES];
 
-            match reply {
-                Some(decoded) => st.tracker.record_reply(joint, decoded),
-                None => {
-                    st.tracker.record_timeout(joint);
-                    let now_degraded = st.tracker.degraded_mask();
-                    // Log only the transition into degraded, not every transient timeout.
-                    if was_degraded == 0 && now_degraded != 0 {
-                        warn!(
-                            "I3C servo bus degraded on joint {} (mask=0x{:08x}, timeouts={})",
-                            joint,
-                            now_degraded,
-                            st.tracker.total_timeout_count()
-                        );
-                    }
+        let was_degraded = tracker.degraded_mask();
+        let tx_result = transport.transaction(addr, &frame, &mut reply_buf);
+        let decoded = tx_result
+            .ok()
+            .and_then(|()| unpack_i3c_joint_reply(&reply_buf));
+
+        match decoded {
+            Some(decoded) => tracker.record_reply(joint, decoded),
+            None => {
+                tracker.record_timeout(joint);
+                let now_degraded = tracker.degraded_mask();
+                // Log only the transition into degraded, not every transient timeout.
+                if was_degraded == 0 && now_degraded != 0 {
+                    warn!(
+                        "I3C servo bus degraded on joint {} (mask=0x{:08x}, timeouts={})",
+                        joint,
+                        now_degraded,
+                        tracker.total_timeout_count()
+                    );
                 }
             }
         }
+    }
 
-        // Merge the async IMU mailbox into the feedback returned to the host.
-        let mut fb = st.tracker.snapshot();
-        if let Some(imu) = IMU_SLOT.latest() {
-            fb.imu = imu;
-            fb.imu_source_mask = IMU_SLOT.latest_source_mask();
+    // Merge the async IMU mailbox into the feedback returned to the host.
+    // `IMU_SLOT` self-protects with its own critical section, so this can stay
+    // outside the `I3C_STATE` lock.
+    let mut fb = tracker.snapshot();
+    if let Some(imu) = IMU_SLOT.latest() {
+        fb.imu = imu;
+        fb.imu_source_mask = IMU_SLOT.latest_source_mask();
+    }
+
+    // ----- Phase 3: short critical section — commit results ----------------
+    critical_section::with(|cs| {
+        let mut st = I3C_STATE.borrow_ref_mut(cs);
+        // Put the transport back, unless a new one was registered while the
+        // transactions were in flight — a fresh registration must win.
+        if let Some(t) = taken_transport {
+            if st.transport.is_none() {
+                st.transport = Some(t);
+            }
         }
+        st.tracker = tracker;
         st.last_feedback = fb;
     });
 }
 
-/// Hook called by `SERVO_BUS_SLOT` every `copper-rs` read phase.
+/// Hook called by `SERVO_BUS_SLOT` every read phase.
 fn i3c_read_feedback(_dt_sec: f32) -> RawServoFeedback {
     critical_section::with(|cs| I3C_STATE.borrow_ref(cs).last_feedback)
 }
 
 /// Initializes the SimpleFOC I3C servo adapter and registers its board hooks.
 ///
-/// Call from `main()` before starting the `copper-rs` runtime. The hooks remain
+/// Call from `main()` before starting the control loop. The hooks remain
 /// active for the whole lifetime of the firmware; the external PIO driver can
 /// be attached at any time via [`set_i3c_transport`].
 pub fn init_i3c_servo_bus() {

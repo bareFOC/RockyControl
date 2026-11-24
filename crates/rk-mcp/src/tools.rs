@@ -6,8 +6,8 @@ use craft_mcp_server::{Contents, Info, Options, Reference, Server, Tools, text_r
 use rk_link::TransportKind;
 use rk_model::nalgebra::Point3;
 use rk_model::{AssetBundle, samples};
+use rk_fw_core::replay::verify_deterministic_replay;
 use rk_proto::{ControlMode, FallOrientation, ModelRequest, ModelResponse, uvc_phase};
-use rk_sim::verify_deterministic_replay;
 use serde_json::{Value, json};
 
 use crate::host::{McpActivityEntry, McpCallOutcome, McpHost};

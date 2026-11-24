@@ -60,13 +60,17 @@ compile_error!(
     "Enable either `imu-bno055` or `imu-lsm6dsv`, not both. The LSM6DSV replaces the BNO055 in the control path."
 );
 
-// --- RP2350 Interrupt Bindings ---
-#[cfg(not(all(feature = "imu-bno055", not(feature = "imu-lsm6dsv"))))]
-bind_interrupts!(struct Irqs {
-    USBCTRL_IRQ => UsbInterruptHandler<USB>;
-});
+// Both servo-bus transports register hooks in SERVO_BUS_SLOT; enabling both
+// would let call order silently decide the winner. Reject the conflict instead.
+#[cfg(all(feature = "uart-servo-bus", feature = "i3c-servo-bus"))]
+compile_error!(
+    "Enable either `uart-servo-bus` or `i3c-servo-bus`, not both: they are mutually exclusive servo-bus hooks."
+);
 
-#[cfg(all(feature = "imu-bno055", not(feature = "imu-lsm6dsv")))]
+// --- RP2350 Interrupt Bindings ---
+// A single binding covers every feature combination: USB is always active, and
+// I2C0 is only consumed by the optional BNO055 IMU (binding it when unused is
+// harmless). This replaces the previously duplicated `Irqs` cfg predicates.
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
     I2C0_IRQ => embassy_rp::i2c::InterruptHandler<embassy_rp::peripherals::I2C0>;
@@ -104,9 +108,10 @@ async fn control_task(mut led: Output<'static>, watchdog: Peri<'static, WATCHDOG
 
         let now_ms = Instant::now().as_millis() as u32;
 
-        // Latest-wins host command. The mailbox also carries the wire error
-        // counters consumed inside `ControlTask::step`.
+        // Latest-wins host command. Read the transport wire error counters explicitly
+        // and pass them into the pure control step (no hidden global mailbox read).
         let cmd = HOST_LINK_MAILBOX.take_rx_cmd();
+        let wire_errors = HOST_LINK_MAILBOX.wire_error_counts();
 
         // Servo feedback from the active bus. Merge the hardware IMU snapshot into
         // the feedback exactly as the old `ServoBusBridge` did (the I3C adapter also
@@ -117,7 +122,7 @@ async fn control_task(mut led: Output<'static>, watchdog: Peri<'static, WATCHDOG
             fb.imu_source_mask = IMU_SLOT.latest_source_mask();
         }
 
-        let step = control.step(now_ms, CONTROL_DT_SEC, cmd.as_ref(), &fb);
+        let step = control.step(now_ms, CONTROL_DT_SEC, cmd.as_ref(), &fb, wire_errors);
 
         // Fan the atomic step output out to the servo bus (write phase) and the
         // host link (telemetry TX mailbox).
@@ -165,6 +170,8 @@ async fn main(spawner: Spawner) {
         p.PIN_11,
         p.PIN_8,
         p.PIN_9,
+        p.DMA_CH0,
+        p.DMA_CH1,
     );
 
     // 2d. Optional SimpleFOC I3C servo bus adapter (external RP2350 PIO I3C driver plugs

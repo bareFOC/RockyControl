@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 rk-proto.workspace = true
 rk-control.workspace = true
+rk-fw-core.workspace = true
 rk-sim.workspace = true
 rk-model.workspace = true
 rk-link.workspace = true

@@ -2,9 +2,9 @@
 resolver = "3"
 members = [
     "xtask",
+    "firmware/rk-fw-core",
     "crates/rk-proto",
     "crates/rk-control",
-    "crates/rk-cu-nodes",
     "crates/rk-sim",
     "crates/rk-model",
     "crates/rk-link",
@@ -15,7 +15,6 @@ members = [
     "apps/rk-web",
 ]
 exclude = [
-    "firmware/rk-fw-core",
     "firmware/rk-rp2350",
     "firmware/rk-esp32p4",
 ]
@@ -29,7 +28,10 @@ license = "Apache-2.0"
 # Internal layered crates
 rk-proto = { path = "crates/rk-proto", default-features = false }
 rk-control = { path = "crates/rk-control", default-features = false }
-rk-cu-nodes = { path = "crates/rk-cu-nodes", default-features = false }
+# Shared host+MCU control application. Lives in the firmware workspace on disk; it is
+# a workspace dependency here so host crates can use `rk-fw-core = { workspace = true }`
+# and stay no_std-compatible via its default feature flags.
+rk-fw-core = { path = "firmware/rk-fw-core", features = ["std"] }
 rk-sim = { path = "crates/rk-sim" }
 rk-model = { path = "crates/rk-model" }
 rk-link = { path = "crates/rk-link" }

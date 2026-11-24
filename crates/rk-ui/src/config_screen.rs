@@ -4,8 +4,8 @@
 
 use egui::{Color32, CornerRadius, Margin, Rect, RichText, Stroke, UiBuilder, Vec2, pos2, vec2};
 use egui_plot::{Legend, Line, Plot, PlotPoints};
+use rk_fw_core::replay::verify_deterministic_replay;
 use rk_proto::{BalanceGains, ConfigCmd, ControlMode};
-use rk_sim::verify_deterministic_replay;
 use rk_viewport::{DragMode, ViewportOptions};
 
 use crate::{ConfigDrawerTab, RockyStudioApp};

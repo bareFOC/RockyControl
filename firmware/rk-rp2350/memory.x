@@ -1,4 +1,4 @@
-/* RP2350 (Pico 2 / RP2350A) linker script compatible with both embassy-rp and copper-rs (cu29). */
+/* RP2350 (Pico 2 / RP2350A) linker script for the Embassy-only firmware runtime. */
 MEMORY {
     /* Pico 2 ships with 4 MiB QSPI flash; 2 MiB is a conservative universal default. */
     FLASH : ORIGIN = 0x10000000, LENGTH = 2048K
@@ -22,7 +22,7 @@ SECTIONS {
 _stext = ALIGN(ADDR(.start_block) + SIZEOF(.start_block), ALIGNOF(.text));
 
 SECTIONS {
-    /* Required by copper-rs (cu29) startup constructors / reflection registration. */
+    /* C/C++ startup constructors (kept for toolchain compatibility; no runtime use). */
     .init_array : ALIGN(4)
     {
         KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))

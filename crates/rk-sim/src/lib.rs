@@ -5,12 +5,16 @@
 //! verifies exact output parity under replay.
 
 use rk_control::{JointCalibration, RawServoCommand, RawServoFeedback};
-use rk_cu_nodes::{CopperListTick, DirectServoTask, HostLinkBridge, ServoBusDriver};
+use rk_fw_core::copper::{ControlTask, ControlTick};
+pub use rk_fw_core::replay::{
+    CopperReplayLog, ReplayVerification, verify_deterministic_replay,
+};
+use rk_fw_core::servo_bus::ServoBusPort;
+use rk_fw_core::transport::{CobsStreamFramer, HostLinkMailbox, encode_telemetry_frame};
 use rk_proto::{
-    HostToMcu, MAX_COBS_FRAME_BYTES, MAX_JOINTS, MAX_MODEL_COBS_FRAME_BYTES, MODEL_CHUNK_BYTES,
-    McuToHost, ModelChunk, ModelFormat, ModelInfo, ModelRequest, ModelResponse, decode_mcu_cobs,
-    decode_model_req_cobs, decode_model_resp_cobs, encode_cobs, encode_model_req_cobs,
-    encode_model_resp_cobs,
+    HostToMcu, MAX_COBS_FRAME_BYTES, MAX_JOINTS, MAX_MODEL_COBS_FRAME_BYTES, McuToHost, ModelFormat,
+    ModelInfo, ModelRequest, ModelResponse, decode_mcu_cobs, decode_model_req_cobs,
+    decode_model_resp_cobs, encode_cobs, encode_model_req_cobs, encode_model_resp_cobs,
 };
 use serde::{Deserialize, Serialize};
 
@@ -452,7 +456,7 @@ impl SimulatedServoPlant {
     }
 }
 
-impl ServoBusDriver for SimulatedServoPlant {
+impl ServoBusPort for SimulatedServoPlant {
     fn read_feedback(&mut self, dt_sec: f32) -> RawServoFeedback {
         self.step_plant(dt_sec)
     }
@@ -462,28 +466,15 @@ impl ServoBusDriver for SimulatedServoPlant {
     }
 }
 
-/// Deterministic `.copper` replay log capturing every wire tick for offline verification.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CopperReplayLog {
-    pub version: u32,
-    pub joint_count: usize,
-    pub initial_raw_pose: [f32; MAX_JOINTS],
-    pub initial_calibration: Vec<JointCalibration>,
-    pub ticks: Vec<CopperListTick>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReplayVerification {
-    pub total_ticks: usize,
-    pub matched_ticks: usize,
-    pub exact_match: bool,
-}
-
-/// End-to-end simulation runner wiring COBS framing -> `DirectServoTask` -> `SimulatedServoPlant`
-/// plus an onboard simulated MCU flash model store matching `firmware/rk-fw-core::model_store`.
+/// End-to-end simulation runner wiring the shared `rk-fw-core` COBS transport + control task
+/// -> `SimulatedServoPlant` plus an onboard simulated MCU flash model store using the shared
+/// `FlashModelStore`.
 pub struct CopperSimRunner {
-    pub task: DirectServoTask,
-    pub host_bridge: HostLinkBridge,
+    pub task: ControlTask,
+    /// Shared streaming COBS framer used for host -> MCU command decoding.
+    pub host_framer: CobsStreamFramer,
+    /// Local (non-global) shared mailbox instance so replay stays deterministic.
+    pub host_mailbox: HostLinkMailbox,
     pub plant: SimulatedServoPlant,
     uptime_ms_f: f64,
     host_decode_errors: u64,
@@ -504,8 +495,9 @@ impl CopperSimRunner {
         let mcu_model_info =
             ModelInfo::from_static("rocky_mk1", ModelFormat::UrdfXml, &mcu_model_blob, 21);
         Self {
-            task: DirectServoTask::new(joint_count, initial_cal),
-            host_bridge: HostLinkBridge::default(),
+            task: ControlTask::new(joint_count, initial_cal),
+            host_framer: CobsStreamFramer::new(),
+            host_mailbox: HostLinkMailbox::new(),
             plant: SimulatedServoPlant::new(joint_count, initial_raw_pose),
             uptime_ms_f: 0.0,
             host_decode_errors: 0,
@@ -529,54 +521,53 @@ impl CopperSimRunner {
         self.mcu_model_blob = blob;
     }
 
-    /// Executes a full COBS-framed `ModelRequest` -> `ModelResponse` round-trip against the simulated MCU flash store.
+    /// Executes a full COBS-framed `ModelRequest` -> `ModelResponse` round-trip against the
+    /// simulated MCU flash store, delegating request handling to the shared `FlashModelStore`.
     pub fn exchange_model_request(&mut self, req: ModelRequest) -> Option<ModelResponse> {
         let mut req_wire = [0u8; MAX_MODEL_COBS_FRAME_BYTES];
         let req_len = encode_model_req_cobs(&req, &mut req_wire).ok()?.len();
         let mcu_req = decode_model_req_cobs(&mut req_wire[..req_len]).ok()?;
 
-        let mcu_resp = if self.mcu_model_blob.is_empty() {
-            ModelResponse::NotAvailable
-        } else {
-            match mcu_req {
-                ModelRequest::GetInfo => ModelResponse::Info(self.mcu_model_info),
-                ModelRequest::ReadChunk { offset, max_len } => {
-                    let start = offset as usize;
-                    if start >= self.mcu_model_blob.len() {
-                        ModelResponse::Chunk(ModelChunk {
-                            offset,
-                            total_bytes: self.mcu_model_blob.len() as u32,
-                            crc32: self.mcu_model_info.crc32,
-                            format: self.mcu_model_info.format,
-                            len: 0,
-                            data: [0u8; MODEL_CHUNK_BYTES],
-                        })
-                    } else {
-                        let req_len = (max_len as usize).clamp(1, MODEL_CHUNK_BYTES);
-                        let copy_len = req_len.min(self.mcu_model_blob.len() - start);
-                        let mut data = [0u8; MODEL_CHUNK_BYTES];
-                        data[..copy_len]
-                            .copy_from_slice(&self.mcu_model_blob[start..start + copy_len]);
-                        ModelResponse::Chunk(ModelChunk {
-                            offset,
-                            total_bytes: self.mcu_model_blob.len() as u32,
-                            crc32: self.mcu_model_info.crc32,
-                            format: self.mcu_model_info.format,
-                            len: copy_len as u16,
-                            data,
-                        })
-                    }
-                }
-            }
-        };
+        let store = rk_fw_core::model_store::FlashModelStore::new(
+            self.mcu_model_info,
+            &self.mcu_model_blob,
+        );
+        let mcu_resp = store.handle_request(mcu_req);
 
         let mut resp_wire = [0u8; MAX_MODEL_COBS_FRAME_BYTES];
         let resp_len = encode_model_resp_cobs(&mcu_resp, &mut resp_wire).ok()?.len();
         decode_model_resp_cobs(&mut resp_wire[..resp_len]).ok()
     }
 
+    /// Decodes a delimited COBS `HostToMcu` frame via the shared `CobsStreamFramer`,
+    /// forwarding typed codec errors into the local shared mailbox.
+    fn decode_rx(&mut self, wire_frame: &mut [u8]) -> Option<HostToMcu> {
+        let mailbox = &self.host_mailbox;
+        let mut decoded = None;
+        self.host_framer
+            .push_bytes_with_error(wire_frame, |pkt| decoded = Some(pkt), |err| {
+                mailbox.record_rx_codec_error(err)
+            });
+        decoded
+    }
+
+    /// Encodes `McuToHost` telemetry using the shared `encode_telemetry_frame` helper.
+    fn encode_tx<'a>(
+        &mut self,
+        telem: &McuToHost,
+        buf: &'a mut [u8; MAX_COBS_FRAME_BYTES],
+    ) -> Result<&'a [u8], rk_proto::CodecError> {
+        encode_telemetry_frame(telem, buf)
+    }
+
+    /// `(rx_crc_errors, rx_version_mismatches)` from the shared mailbox for explicit injection
+    /// into `ControlTask::step_recorded`.
+    pub fn wire_error_counts(&self) -> (u16, u16) {
+        self.host_mailbox.wire_error_counts()
+    }
+
     pub fn link_errors(&self) -> u64 {
-        self.host_bridge.rx_decode_errors + self.host_decode_errors
+        u64::from(self.host_framer.rx_err) + self.host_decode_errors
     }
 
     pub fn is_recording(&self) -> bool {
@@ -637,7 +628,7 @@ impl CopperSimRunner {
             match encode_cobs(host_pkt, &mut wire) {
                 Ok(encoded) => {
                     let len = encoded.len();
-                    self.host_bridge.decode_rx(&mut wire[..len])
+                    self.decode_rx(&mut wire[..len])
                 }
                 Err(_) => {
                     self.host_decode_errors += 1;
@@ -646,12 +637,15 @@ impl CopperSimRunner {
             }
         };
 
-        // 3. Forward bridge wire drop stats and execute real #![no_std] DirectServoTask
-        self.task.kernel_mut().set_wire_error_counts(
-            self.host_bridge.rx_crc_errors,
-            self.host_bridge.rx_version_mismatches,
+        // 3. Forward shared transport wire-error counts and execute the shared control task.
+        let (rx_crc_errors, rx_version_mismatches) = self.wire_error_counts();
+        let (step_out, tick_record) = self.task.step_recorded(
+            now_ms,
+            dt,
+            rx_cmd.as_ref(),
+            &feedback,
+            (rx_crc_errors, rx_version_mismatches),
         );
-        let (step_out, tick_record) = self.task.process(now_ms, dt, rx_cmd.as_ref(), &feedback);
 
         // 4. Write servo command & MCU balance telemetry to simulated servo/LIPM plant
         self.plant.write_command(&step_out.servo_cmd);
@@ -660,6 +654,7 @@ impl CopperSimRunner {
         if self.recording {
             if let Some(log) = self.recorded_log.as_mut() {
                 if log.ticks.len() < self.max_recorded_ticks {
+                    // Shared ControlTask already produces the replay-compatible ControlTick.
                     log.ticks.push(tick_record);
                 }
             }
@@ -667,10 +662,7 @@ impl CopperSimRunner {
 
         // 5. Encode McuToHost over COBS and decode on host side
         let mut mcu_wire = [0u8; MAX_COBS_FRAME_BYTES];
-        match self
-            .host_bridge
-            .encode_tx(&step_out.telemetry, &mut mcu_wire)
-        {
+        match self.encode_tx(&step_out.telemetry, &mut mcu_wire) {
             Ok(encoded) => {
                 let len = encoded.len();
                 match decode_mcu_cobs(&mut mcu_wire[..len]) {
@@ -715,37 +707,16 @@ impl CopperSimRunner {
                 if wire[idx] == 0 {
                     wire[idx] = 0x02;
                 }
-                let _ = self.host_bridge.decode_rx(&mut wire[..len]);
-                self.task.kernel_mut().set_wire_error_counts(
-                    self.host_bridge.rx_crc_errors,
-                    self.host_bridge.rx_version_mismatches,
-                );
+                let _ = self.decode_rx(&mut wire[..len]);
+                let (rx_crc_errors, rx_version_mismatches) = self.wire_error_counts();
+                self.task
+                    .kernel_mut()
+                    .set_wire_error_counts(rx_crc_errors, rx_version_mismatches);
                 return;
             }
         }
         let mut garbage = [0x05_u8, 0xFF, 0x00, 0x12, 0x00];
-        let _ = self.host_bridge.decode_rx(&mut garbage);
-    }
-}
-
-/// Replays a recorded `.copper` log through a fresh `DirectServoTask` and asserts
-/// bit-identical `McuToHost` outputs across every tick.
-pub fn verify_deterministic_replay(log: &CopperReplayLog) -> ReplayVerification {
-    let mut replay_task = DirectServoTask::new(log.joint_count, &log.initial_calibration);
-    let mut matched = 0usize;
-
-    for tick in &log.ticks {
-        let (out, _) =
-            replay_task.process(tick.now_ms, tick.dt_sec, tick.rx_cmd.as_ref(), &tick.rx_state);
-        if out.telemetry == tick.tx_telem && out.servo_cmd == tick.tx_cmd {
-            matched += 1;
-        }
-    }
-
-    ReplayVerification {
-        total_ticks: log.ticks.len(),
-        matched_ticks: matched,
-        exact_match: !log.ticks.is_empty() && matched == log.ticks.len(),
+        let _ = self.decode_rx(&mut garbage);
     }
 }
 

@@ -63,6 +63,9 @@ Both wired transports carry the **exact same `postcard` COBS-encoded `HostToMcu`
 - **`bench-loopback`** *(default)*: Runs `BenchLoopbackBus` directly inside the MCU so you can flash RP2350, plug in a **single USB cable**, and test live 200 Hz Teach/Drive mirroring, bumpless transfer, E-Stop, and cable-pull watchdog trip with zero servos powered.
 - **`uart-servo-bus`**: Initializes RP2350 `UART0` (`GPIO0` TX / `GPIO1` RX @ `1 Mbps`) wired into `SERVO_BUS_SLOT` for physical Feetech STS3215 / Dynamixel Protocol 2.0 smart bus servos.
 
+> [!IMPORTANT]
+> **`bench-loopback` hooks are overridden whenever a hardware servo bus is enabled.** Both `uart-servo-bus` and `i3c-servo-bus` register their own `ServoBusHooks` in `SERVO_BUS_SLOT`, so the `bench-loopback` mirroring plant is not active in those builds even if the `bench-loopback` feature is still present. The two hardware bus features are mutually exclusive and enabling both is a compile error.
+
 ### Opt-in High-Rate IMU & I3C Servo Bus Features
 
 These are **off by default** — the default `bench-loopback` build is unchanged. Enable them explicitly for real-hardware bring-up:
@@ -79,7 +82,7 @@ cargo build --release --manifest-path firmware/rk-rp2350/Cargo.toml \
   --features usb-cdc,imu-lsm6dsv,i3c-servo-bus
 ```
 
-Both features also work alongside `usb-net` or `uart-servo-bus`. Enabling `imu-bno055` together with `imu-lsm6dsv` is a compile error by design.
+These features also work alongside `usb-net`. `i3c-servo-bus` and `uart-servo-bus` are mutually exclusive (enabling both is a compile error), as are `imu-bno055` and `imu-lsm6dsv`.
 
 ---
 

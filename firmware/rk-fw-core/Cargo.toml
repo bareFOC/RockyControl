@@ -13,12 +13,6 @@ std = [
     "serde/std",
     "critical-section/std",
 ]
-# Legacy no-op feature aliases retained for source compatibility with board crates that
-# still request them. copper-rs (cu29) has been removed from the MCU runtime entirely.
-copper = []
-copper-defmt = []
-copper-std = []
-
 [dependencies]
 rk-proto = { path = "../../crates/rk-proto", default-features = false }
 rk-control = { path = "../../crates/rk-control", default-features = false }

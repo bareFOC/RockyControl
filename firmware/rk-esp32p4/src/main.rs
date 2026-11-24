@@ -63,9 +63,11 @@ async fn main(_spawner: Spawner) {
         let now_ms = Instant::now().as_millis() as u32;
 
         // Embassy tasks own all I/O; the control step itself is pure and allocation-free.
+        // Wire error counters are an explicit input, not a hidden global read.
         let cmd = HOST_LINK_MAILBOX.take_rx_cmd();
+        let wire_errors = HOST_LINK_MAILBOX.wire_error_counts();
         let fb = SERVO_BUS_SLOT.read_feedback(CONTROL_DT_SEC);
-        let out = control.step(now_ms, CONTROL_DT_SEC, cmd.as_ref(), &fb);
+        let out = control.step(now_ms, CONTROL_DT_SEC, cmd.as_ref(), &fb, wire_errors);
 
         SERVO_BUS_SLOT.write_command(&out.servo_cmd);
         HOST_LINK_MAILBOX.publish_tx_telem(out.telemetry);
