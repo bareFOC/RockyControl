@@ -1963,6 +1963,7 @@ dependencies = [
  "critical-section",
  "cu-bincode",
  "cu29",
+ "libm",
  "rk-control",
  "rk-proto",
  "serde",

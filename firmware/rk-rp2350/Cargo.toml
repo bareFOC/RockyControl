@@ -15,6 +15,11 @@ usb-net = ["dep:embassy-net"]
 bench-loopback = []
 uart-servo-bus = []
 imu-bno055 = []
+# Opt-in high-rate ST LSM6DSV16X IMU on dedicated SPI1 (FIFO burst @ 200 Hz).
+# Mutually exclusive with `imu-bno055`: BNO055 is not spawned when this is enabled.
+imu-lsm6dsv = []
+# Opt-in SimpleFOC I3C servo bus adapter (external PIO I3C driver via ServoBusHooks).
+i3c-servo-bus = []
 
 [dependencies]
 rk-proto = { path = "../../crates/rk-proto", default-features = false }

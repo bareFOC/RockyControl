@@ -234,9 +234,18 @@ impl Lsm6dsvFilter {
         let dt = dt_sec.clamp(0.0005_f32, 0.05_f32);
 
         if self.settled_samples < SETTLING_SAMPLES {
-            self.settled_samples = self.settled_samples.saturating_add(sample_count.max(1));
-            self.last_good_ms = Some(now_ms);
-            return self.last_state;
+            let samples = sample_count.max(1);
+            let settling_left = SETTLING_SAMPLES - self.settled_samples;
+            if samples <= settling_left {
+                // Entire batch falls inside the settling window: discard it wholesale.
+                self.settled_samples = self.settled_samples.saturating_add(samples);
+                self.last_good_ms = Some(now_ms);
+                return self.last_state;
+            }
+            // This batch crosses the settling boundary. Count the remaining settling
+            // samples as consumed, then still process the whole (valid) batch so the
+            // sensor transitions to available on this burst rather than the next one.
+            self.settled_samples = SETTLING_SAMPLES;
         }
 
         let gx = gyro_rad_s[0] - self.bias_pitch_rad_s;

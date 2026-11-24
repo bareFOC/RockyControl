@@ -1128,7 +1128,11 @@ mod tests {
     fn v1_valid_mask_marks_grf_and_momentum_unavailable() {
         let cal = [JointCalibration::default(); 21];
         let mut kernel = DirectServoKernel::new(21, &cal);
-        let fb = RawServoFeedback::default();
+        // COM/DCM are IMU-derived: provide a live sensor with a valid source tag so the
+        // estimator is allowed to publish those channels for this validity-mask test.
+        let mut fb = RawServoFeedback::default();
+        fb.imu.available = true;
+        fb.imu_source_mask = rk_proto::estimator_valid::LSM6DSV_OK;
         let cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Teach,
@@ -1139,6 +1143,34 @@ mod tests {
         assert_ne!(mask & rk_proto::estimator_valid::COM, 0);
         assert_ne!(mask & rk_proto::estimator_valid::DCM, 0);
         assert_ne!(mask & rk_proto::estimator_valid::LSM6DSV_OK, 0);
+        assert_eq!(mask & rk_proto::estimator_valid::GRF, 0);
+        assert_eq!(mask & rk_proto::estimator_valid::MOMENTUM, 0);
+    }
+
+    #[test]
+    fn imu_outage_invalidates_com_dcm_until_sensor_returns() {
+        let cal = [JointCalibration::default(); 21];
+        let mut kernel = DirectServoKernel::new(21, &cal);
+        let cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Teach,
+            ..Default::default()
+        };
+        let mut fb = RawServoFeedback::default();
+        // Sensor absent: no channel derived from live attitude may be marked valid.
+        fb.imu.available = false;
+        let outage = kernel.step(10, 0.01, Some(&cmd), &fb);
+        assert_eq!(outage.telemetry.estimator.valid_mask, 0);
+
+        // Sensor returns with a BNO055 source tag: COM/DCM and that source become valid.
+        fb.imu.available = true;
+        fb.imu_source_mask = rk_proto::estimator_valid::BNO055_OK;
+        let live = kernel.step(11, 0.01, Some(&cmd), &fb);
+        let mask = live.telemetry.estimator.valid_mask;
+        assert_ne!(mask & rk_proto::estimator_valid::COM, 0);
+        assert_ne!(mask & rk_proto::estimator_valid::DCM, 0);
+        assert_ne!(mask & rk_proto::estimator_valid::BNO055_OK, 0);
+        assert_eq!(mask & rk_proto::estimator_valid::LSM6DSV_OK, 0);
         assert_eq!(mask & rk_proto::estimator_valid::GRF, 0);
         assert_eq!(mask & rk_proto::estimator_valid::MOMENTUM, 0);
     }

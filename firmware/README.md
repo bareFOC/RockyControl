@@ -59,6 +59,24 @@ Both wired transports carry the **exact same `postcard` COBS-encoded `HostToMcu`
 - **`bench-loopback`** *(default)*: Runs `BenchLoopbackBus` directly inside the MCU so you can flash RP2350, plug in a **single USB cable**, and test live 200 Hz Teach/Drive mirroring, bumpless transfer, E-Stop, and cable-pull watchdog trip with zero servos powered.
 - **`uart-servo-bus`**: Initializes RP2350 `UART0` (`GPIO0` TX / `GPIO1` RX @ `1 Mbps`) wired into `SERVO_BUS_SLOT` for physical Feetech STS3215 / Dynamixel Protocol 2.0 smart bus servos.
 
+### Opt-in High-Rate IMU & I3C Servo Bus Features
+
+These are **off by default** — the default `bench-loopback` build is unchanged. Enable them explicitly for real-hardware bring-up:
+
+| Feature | Hardware | What it wires |
+| :--- | :--- | :--- |
+| `imu-lsm6dsv` | ST LSM6DSV16X on dedicated **SPI1** (SCK `GPIO10`, MOSI `GPIO11`, MISO `GPIO8`, CS `GPIO9`) | 960 Hz hardware FIFO burst-read at 200 Hz, complementary filter publishes `ImuState` to `IMU_SLOT` tagged `LSM6DSV_OK`. **Mutually exclusive with `imu-bno055`** — the BNO055 task is not spawned when this is enabled (motor currents disturb its magnetometer). |
+| `i3c-servo-bus` | RP2350 PIO I3C master (external driver, *not* implemented here) | Registers `ServoBusHooks` in `SERVO_BUS_SLOT` using `encode_joint_cmd` / `unpack_i3c_joint_reply`, per-joint timeout accounting, and a `defmt::warn!` on transition to degraded. The external PIO driver plugs in via `set_i3c_transport()`; until then a safe stub records timeouts without stalling the loop. |
+
+Example — LSM6DSV + I3C hardware with USB CDC transport:
+
+```bash
+cargo build --release --manifest-path firmware/rk-rp2350/Cargo.toml \
+  --features usb-cdc,imu-lsm6dsv,i3c-servo-bus
+```
+
+Both features also work alongside `usb-net` or `uart-servo-bus`. Enabling `imu-bno055` together with `imu-lsm6dsv` is a compile error by design.
+
 ---
 
 ## 3. Building & Flashing RP2350

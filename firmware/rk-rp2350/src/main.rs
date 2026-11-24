@@ -17,8 +17,12 @@
 
 extern crate alloc;
 
-#[cfg(feature = "imu-bno055")]
+#[cfg(all(feature = "imu-bno055", not(feature = "imu-lsm6dsv")))]
 mod imu_bno055;
+#[cfg(feature = "imu-lsm6dsv")]
+mod imu_lsm6dsv;
+#[cfg(feature = "i3c-servo-bus")]
+mod i3c_simplefoc;
 mod servo_uart;
 mod usb_cdc;
 mod usb_net;
@@ -57,13 +61,21 @@ fn init_heap() {
     }
 }
 
+// The high-rate LSM6DSV (SPI1) and legacy BNO055 (I2C0) IMUs are mutually
+// exclusive: motor-current disturbance makes the BNO055 magnetometer untrustworthy
+// whenever the LSM6DSV is the active control source.
+#[cfg(all(feature = "imu-bno055", feature = "imu-lsm6dsv"))]
+compile_error!(
+    "Enable either `imu-bno055` or `imu-lsm6dsv`, not both. The LSM6DSV replaces the BNO055 in the control path."
+);
+
 // --- RP2350 Interrupt Bindings ---
-#[cfg(not(feature = "imu-bno055"))]
+#[cfg(not(all(feature = "imu-bno055", not(feature = "imu-lsm6dsv"))))]
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
 
-#[cfg(feature = "imu-bno055")]
+#[cfg(all(feature = "imu-bno055", not(feature = "imu-lsm6dsv")))]
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
     I2C0_IRQ => embassy_rp::i2c::InterruptHandler<embassy_rp::peripherals::I2C0>;
@@ -109,9 +121,26 @@ async fn main(spawner: Spawner) {
     #[cfg(feature = "uart-servo-bus")]
     servo_uart::init_uart_servo_bus(p.UART0, p.PIN_0, p.PIN_1);
 
-    // 2b. Optional Bosch BNO055 9-Axis IMU over I2C0 (GPIO4 SDA / GPIO5 SCL @ 400 kHz)
-    #[cfg(feature = "imu-bno055")]
+    // 2b. Optional Bosch BNO055 9-Axis IMU over I2C0 (GPIO4 SDA / GPIO5 SCL @ 400 kHz).
+    // Suppressed when the high-rate LSM6DSV is enabled (magnetometer disturbed by motor currents).
+    #[cfg(all(feature = "imu-bno055", not(feature = "imu-lsm6dsv")))]
     imu_bno055::spawn_bno055(&spawner, p.I2C0, p.PIN_5, p.PIN_4, Irqs);
+
+    // 2c. Optional ST LSM6DSV16X 6-axis IMU over dedicated SPI1 @ 960 Hz FIFO / 200 Hz bursts.
+    #[cfg(feature = "imu-lsm6dsv")]
+    imu_lsm6dsv::spawn_lsm6dsv(
+        &spawner,
+        p.SPI1,
+        p.PIN_10,
+        p.PIN_11,
+        p.PIN_8,
+        p.PIN_9,
+    );
+
+    // 2d. Optional SimpleFOC I3C servo bus adapter (external RP2350 PIO I3C driver plugs
+    // into the board hooks registered here; no PIO reimplementation in this module).
+    #[cfg(feature = "i3c-servo-bus")]
+    i3c_simplefoc::init_i3c_servo_bus();
 
     // 3. Bring up wired USB transport (CDC-ACM serial OR CDC-NCM Ethernet-over-USB)
     let usb_driver = UsbDriver::new(p.USB, Irqs);

@@ -185,6 +185,34 @@ mod tests {
     }
 
     #[test]
+    fn imu_slot_publish_with_source_tags_bno055_legacy_imu() {
+        let slot = ImuSlot::new();
+        let state = ImuState {
+            available: true,
+            pitch_rad: 0.05,
+            roll_rad: -0.03,
+            yaw_rad: 0.2,
+            pitch_rate_rad_s: 0.1,
+            roll_rate_rad_s: 0.0,
+            yaw_rate_rad_s: 0.0,
+            gravity: [0.0, -9.81, 0.0],
+        };
+        // Default `publish()` must keep tagging LSM6DSV_OK (high-rate IMU).
+        slot.publish(state, ImuHealth::Healthy, 10);
+        assert_eq!(slot.latest_source_mask(), rk_proto::estimator_valid::LSM6DSV_OK);
+
+        // Legacy BNO055 task must explicitly tag BNO055_OK, never claim LSM6DSV.
+        slot.publish_with_source(
+            state,
+            ImuHealth::Healthy,
+            rk_proto::estimator_valid::BNO055_OK,
+            20,
+        );
+        assert_eq!(slot.latest_source_mask(), rk_proto::estimator_valid::BNO055_OK);
+        assert_ne!(slot.latest_source_mask(), rk_proto::estimator_valid::LSM6DSV_OK);
+    }
+
+    #[test]
     fn imu_slot_rejects_nan_gravity_and_retains_last_good_state() {
         let slot = ImuSlot::new();
         let valid = ImuState {

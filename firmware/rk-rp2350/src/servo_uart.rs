@@ -13,9 +13,9 @@ use defmt::info;
 use embassy_rp::Peri;
 use embassy_rp::peripherals::{PIN_0, PIN_1, UART0};
 use embassy_rp::uart::{Blocking, Config as UartConfig, Uart};
-use rk_control::{RawServoCommand, RawServoFeedback};
+use rk_control::{DEFAULT_MAX_TORQUE_NM, RawServoCommand, RawServoFeedback};
 use rk_fw_core::servo_bus::{SERVO_BUS_SLOT, ServoBusHooks};
-use rk_proto::MAX_JOINTS;
+use rk_proto::{JointCommandMode, MAX_JOINTS};
 
 struct UartBusState {
     uart: Option<Uart<'static, Blocking>>,
@@ -27,6 +27,7 @@ static UART_BUS: Mutex<RefCell<UartBusState>> = Mutex::new(RefCell::new(UartBusS
     uart: None,
     last_feedback: RawServoFeedback {
         raw_angle_rad: [0.0_f32; MAX_JOINTS],
+        velocity_rad_s: [0.0_f32; MAX_JOINTS],
         current_ma: [0u16; MAX_JOINTS],
         temp_c: [28u8; MAX_JOINTS],
         bus_voltage_mv: 12_000,
@@ -41,10 +42,15 @@ static UART_BUS: Mutex<RefCell<UartBusState>> = Mutex::new(RefCell::new(UartBusS
             yaw_rate_rad_s: 0.0,
             gravity: [0.0, -9.81, 0.0],
         },
+        i3c_timeout_count: 0,
+        imu_source_mask: rk_proto::estimator_valid::LSM6DSV_OK,
     },
     last_cmd: RawServoCommand {
         torque_mask: 0,
         raw_target_rad: [0.0_f32; MAX_JOINTS],
+        command_mode: [JointCommandMode::Position as u8; MAX_JOINTS],
+        raw_velocity_rad_s: [0.0_f32; MAX_JOINTS],
+        torque_nm: [DEFAULT_MAX_TORQUE_NM; MAX_JOINTS],
     },
 }));
 

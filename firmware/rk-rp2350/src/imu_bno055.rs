@@ -28,7 +28,7 @@ use embassy_rp::i2c::{Async, Config as I2cConfig, I2c, InterruptHandler as I2cIn
 use embassy_rp::peripherals::{I2C0, PIN_4, PIN_5};
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use rk_fw_core::imu::{IMU_SLOT, ImuHealth};
-use rk_proto::ImuState;
+use rk_proto::{ImuState, estimator_valid};
 
 const BNO055_ADDR: u8 = 0x28;
 const REG_CHIP_ID: u8 = 0x00;
@@ -342,7 +342,12 @@ async fn bno055_task(mut i2c: I2c<'static, I2C0, Async>) {
                 gravity,
             };
             let now_ms = Instant::now().as_millis() as u32;
-            IMU_SLOT.publish(state, ImuHealth::Healthy, now_ms);
+            IMU_SLOT.publish_with_source(
+                state,
+                ImuHealth::Healthy,
+                now_ms,
+                estimator_valid::BNO055_OK,
+            );
         } else {
             err_streak = err_streak.saturating_add(1);
             IMU_SLOT.set_health(ImuHealth::Fault);

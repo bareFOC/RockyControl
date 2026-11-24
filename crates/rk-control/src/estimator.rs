@@ -11,8 +11,9 @@
 //!   triggers a recovery step.
 //! - Strict DOF partitioning: outputs [`DcmSwingHint`] exclusively for swing-foot
 //!   placement modulation — never double-driving the stance hip UVC integrator.
-//! - Explicit `valid_mask` (`estimator_valid::*`): v1 sets `COM | DCM | imu_source`,
-//!   leaving `GRF` and `MOMENTUM` unset so disabled sensors never read as `0.0 N` free-fall.
+//! - Explicit `valid_mask` (`estimator_valid::*`): v1 sets `COM | DCM | imu_source` only
+//!   when the IMU is live; `GRF` and `MOMENTUM` are never set so disabled sensors never
+//!   read as `0.0 N` free-fall, and a sensor dropout never publishes stale kinematics.
 
 use libm::{cosf, sinf, sqrtf};
 use rk_proto::{BalanceGains, EstimatorTelemetry, ImuState, MAX_JOINTS, estimator_valid};
@@ -220,6 +221,9 @@ impl KinematicEstimator {
         };
 
         // 7. Explicit channel validity bitmask: v1 NEVER sets GRF or MOMENTUM!
+        //    CoM & DCM are derived from live IMU attitude/rate, so they are only valid
+        //    while the sensor is actually reporting; a dropout must not publish stale
+        //    kinematic state as authoritative (sensor-fusion contract).
         let imu_bits = if imu.available {
             let masked = imu_source_mask & (estimator_valid::LSM6DSV_OK | estimator_valid::BNO055_OK);
             if masked != 0 {
@@ -230,7 +234,11 @@ impl KinematicEstimator {
         } else {
             0
         };
-        let valid_mask = estimator_valid::COM | estimator_valid::DCM | imu_bits;
+        let valid_mask = if imu.available {
+            estimator_valid::COM | estimator_valid::DCM | imu_bits
+        } else {
+            0
+        };
 
         let telemetry = EstimatorTelemetry {
             com_pos_m: com_pos,
