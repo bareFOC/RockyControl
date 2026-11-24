@@ -3,7 +3,7 @@ name = "rk-esp32p4"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Rocky Humanoid ESP32-P4 RISC-V board-support crate sharing 100% of rk-fw-core, copper-rs graph, and Embassy USB transport"
+description = "Rocky Humanoid ESP32-P4 RISC-V board-support crate sharing 100% of rk-fw-core, Embassy runtime, and USB transport"
 
 [workspace]
 
@@ -18,10 +18,8 @@ uart-servo-bus = []
 [dependencies]
 rk-proto = { path = "../../crates/rk-proto", default-features = false }
 rk-control = { path = "../../crates/rk-control", default-features = false }
-rk-fw-core = { path = "../rk-fw-core", default-features = false, features = ["copper"] }
+rk-fw-core = { path = "../rk-fw-core", default-features = false }
 
-cu29 = { version = "1.3", default-features = false, features = ["log-level-info", "textlogs"] }
-bincode = { package = "cu-bincode", version = "2.2", default-features = false, features = ["derive", "alloc"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 
 # Espressif ESP32-P4 HAL + Embassy executor (RISC-V RV32IMAFC hardware FPU)
@@ -38,9 +36,6 @@ embassy-net = { version = "0.9", optional = true, features = ["proto-ipv4", "udp
 static_cell = "2.1"
 critical-section = "1.2"
 spin = "0.12"
-
-[build-dependencies]
-cu29-build = "1.3"
 
 [profile.release]
 opt-level = "s"

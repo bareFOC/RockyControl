@@ -1,21 +1,25 @@
-//! Rocky Humanoid RP2350 Firmware (`copper-rs` + `embassy-rp` + `embassy-usb`).
+//! Rocky Humanoid RP2350 Firmware (`embassy-rp` + `embassy-usb`).
 //!
 //! # Architecture
-//! - **Control Runtime:** Real `copper-rs` (`#[copper_runtime(config = "copperconfig.ron")]`)
-//!   executing `DirectServoCuTask` + `HostLinkBridge` + `ServoBusBridge` at deterministic 200 Hz.
+//! - **Control Runtime:** A dedicated Embassy `control` task drives
+//!   `rk_fw_core::copper::ControlTask` (a plain, allocation-free wrapper over
+//!   `DirectServoKernel::step()`) at a deterministic 200 Hz (`Ticker`, 5 ms period).
+//!   There is no copper-rs (`cu29`) runtime on the MCU: a single scheduler (Embassy)
+//!   owns all timing, I/O and task orchestration.
 //! - **Async I/O & Scheduling:** `embassy-rp` + `embassy-executor` concurrently servicing:
 //!   1. Wired USB transport:
 //!      - Default (`--features usb-cdc`): USB CDC-ACM virtual serial (`postcard` COBS frames)
 //!      - Wired USB Networking (`--no-default-features --features usb-net,bench-loopback`):
 //!        USB CDC-NCM Ethernet (`10.42.0.2/24`, UDP port `7777`)
-//!   2. 200 Hz `copper-rs` control loop calling `app.run_one_iteration()`
+//!   2. 200 Hz `control` task reading the latest host command from `HOST_LINK_MAILBOX`
+//!      (latest-wins), servo feedback from `SERVO_BUS_SLOT` with the hardware IMU
+//!      snapshot from `IMU_SLOT` merged in, and publishing servo commands + telemetry
+//!      back to the mailbox.
 //!   3. Hardware RP2350 `Watchdog` (250 ms timeout, fed only after each healthy control tick)
 //!   4. Status LED (`GPIO25`) reflecting `Teach` (1 Hz blink), `Drive` (solid), `EStop` (8 Hz strobe)
 
 #![no_std]
 #![no_main]
-
-extern crate alloc;
 
 #[cfg(all(feature = "imu-bno055", not(feature = "imu-lsm6dsv")))]
 mod imu_bno055;
@@ -27,39 +31,26 @@ mod servo_uart;
 mod usb_cdc;
 mod usb_net;
 
-use alloc::sync::Arc;
-use alloc::vec;
-use core::mem::MaybeUninit;
-
-use buddy_system_allocator::LockedHeap;
-use cu29::prelude::*;
-use defmt::{error, info};
+use defmt::info;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::USB;
+use embassy_rp::Peri;
+use embassy_rp::peripherals::{USB, WATCHDOG};
 use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbInterruptHandler};
 use embassy_rp::watchdog::Watchdog;
 use embassy_time::{Duration, Instant, Ticker};
-use rk_fw_core::config::{CONTROL_PERIOD_MS, HW_WATCHDOG_TIMEOUT_MS};
-use rk_fw_core::copper::current_led_mode;
+use rk_control::JointCalibration;
+use rk_fw_core::config::{
+    CONTROL_DT_SEC, CONTROL_PERIOD_MS, DEFAULT_JOINT_COUNT, HW_WATCHDOG_TIMEOUT_MS,
+};
+use rk_fw_core::copper::{ControlTask, current_led_mode};
+use rk_fw_core::imu::IMU_SLOT;
+use rk_fw_core::servo_bus::SERVO_BUS_SLOT;
+use rk_fw_core::transport::HOST_LINK_MAILBOX;
+use rk_proto::MAX_JOINTS;
 use panic_probe as _;
-use spin::Mutex;
-
-// --- Internal SRAM Heap for Copper-rs (cu29) ---
-const HEAP_BYTES: usize = 64 * 1024;
-static mut HEAP_MEM: [MaybeUninit<u8>; HEAP_BYTES] = [MaybeUninit::uninit(); HEAP_BYTES];
-
-#[global_allocator]
-static ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
-
-fn init_heap() {
-    unsafe {
-        let start = core::ptr::addr_of_mut!(HEAP_MEM) as usize;
-        ALLOCATOR.lock().init(start, HEAP_BYTES);
-    }
-}
 
 // The high-rate LSM6DSV (SPI1) and legacy BNO055 (I2C0) IMUs are mutually
 // exclusive: motor-current disturbance makes the BNO055 magnetometer untrustworthy
@@ -81,10 +72,6 @@ bind_interrupts!(struct Irqs {
     I2C0_IRQ => embassy_rp::i2c::InterruptHandler<embassy_rp::peripherals::I2C0>;
 });
 
-// --- Compile-Time Generated Copper-rs Task Graph ---
-#[copper_runtime(config = "../copperconfig.ron")]
-struct RockyRp2350App {}
-
 #[cfg(all(feature = "usb-cdc", feature = "usb-net"))]
 compile_error!(
     "Enable either `usb-cdc` (USB serial) or `usb-net` (USB CDC-NCM networking), not both simultaneously."
@@ -93,29 +80,72 @@ compile_error!(
 #[cfg(not(any(feature = "usb-cdc", feature = "usb-net")))]
 compile_error!("Enable one wired transport feature: `usb-cdc` or `usb-net`.");
 
-/// Builds a monotonic nanosecond `copper-rs` `RobotClock` backed by `embassy-time`.
-fn make_embassy_robot_clock() -> RobotClock {
-    RobotClock::new_with_rtc(
-        || Instant::now().as_micros().saturating_mul(1_000),
-        |ns| {
-            let wait_us = ns / 1_000;
-            let start = Instant::now().as_micros();
-            while Instant::now().as_micros().saturating_sub(start) < wait_us {
-                core::hint::spin_loop();
-            }
-        },
-    )
+/// Deterministic 200 Hz control loop: reads the latest host command and servo/IMU
+/// feedback snapshot, steps `ControlTask`, publishes the servo command and host
+/// telemetry, drives the safety LED, and feeds the hardware watchdog only after a
+/// clean iteration.
+#[embassy_executor::task]
+async fn control_task(mut led: Output<'static>, watchdog: Peri<'static, WATCHDOG>) -> ! {
+    let mut ticker = Ticker::every(Duration::from_millis(CONTROL_PERIOD_MS));
+
+    // Identity calibration: board-specific zero offsets/inversions are normally
+    // loaded from the flash model store at bring-up; default to unity here.
+    let calibration = [JointCalibration::default(); MAX_JOINTS];
+    let mut control = ControlTask::new(DEFAULT_JOINT_COUNT, &calibration);
+
+    let mut hw_watchdog = Watchdog::new(watchdog);
+    let wd_timeout = Duration::from_millis(HW_WATCHDOG_TIMEOUT_MS);
+    hw_watchdog.start(wd_timeout);
+
+    info!("Embassy control runtime started @ 200 Hz (5 ms period) in Teach mode");
+
+    loop {
+        ticker.next().await;
+
+        let now_ms = Instant::now().as_millis() as u32;
+
+        // Latest-wins host command. The mailbox also carries the wire error
+        // counters consumed inside `ControlTask::step`.
+        let cmd = HOST_LINK_MAILBOX.take_rx_cmd();
+
+        // Servo feedback from the active bus. Merge the hardware IMU snapshot into
+        // the feedback exactly as the old `ServoBusBridge` did (the I3C adapter also
+        // does this internally, so re-merging is idempotent for that bus).
+        let mut fb = SERVO_BUS_SLOT.read_feedback(CONTROL_DT_SEC);
+        if let Some(hw_imu) = IMU_SLOT.latest() {
+            fb.imu = hw_imu;
+            fb.imu_source_mask = IMU_SLOT.latest_source_mask();
+        }
+
+        let step = control.step(now_ms, CONTROL_DT_SEC, cmd.as_ref(), &fb);
+
+        // Fan the atomic step output out to the servo bus (write phase) and the
+        // host link (telemetry TX mailbox).
+        SERVO_BUS_SLOT.write_command(&step.servo_cmd);
+        HOST_LINK_MAILBOX.publish_tx_telem(step.telemetry);
+
+        // Physical safety mode LED.
+        let led_mode = current_led_mode();
+        if led_mode.is_lit(now_ms) {
+            led.set_high();
+        } else {
+            led.set_low();
+        }
+
+        // Feed hardware watchdog only after a clean control cycle. A panic or
+        // stall before this point leaves the watchdog to force a safe reset.
+        hw_watchdog.feed(wd_timeout);
+    }
 }
 
 #[embassy_executor::main(executor = "embassy_rp::executor::Executor", entry = "cortex_m_rt::entry")]
 async fn main(spawner: Spawner) {
-    init_heap();
     let p = embassy_rp::init(Default::default());
 
-    info!("Rocky Humanoid RP2350 Firmware booting (copper-rs + embassy-rp)");
+    info!("Rocky Humanoid RP2350 Firmware booting (embassy-rp)");
 
-    // 1. Status LED (Pico 2 onboard LED on GPIO25)
-    let mut status_led = Output::new(p.PIN_25, Level::Low);
+    // 1. Status LED (Pico 2 onboard LED on GPIO25) owned by the control task.
+    let status_led = Output::new(p.PIN_25, Level::Low);
 
     // 2. Bind Servo Bus (Milestone 2.1: BenchLoopbackBus default; Milestone 2.2: UART0 1 Mbps)
     #[cfg(feature = "uart-servo-bus")]
@@ -155,43 +185,6 @@ async fn main(spawner: Spawner) {
         usb_net::spawn_usb_net(&spawner, usb_driver);
     }
 
-    // 4. Construct & start the Copper-rs deterministic application graph
-    let clock = make_embassy_robot_clock();
-    let noop_logger = Arc::new(Mutex::new(NoopLogger::new()));
-    let app = RockyRp2350App::builder()
-        .with_clock(clock)
-        .with_logger::<NoopSectionStorage, NoopLogger>(noop_logger)
-        .build()
-        .expect("Failed to build RockyRp2350App copper runtime");
-
-    let mut running_app = app.start().expect("Failed to start RockyRp2350App tasks");
-    info!("Copper-rs runtime started @ 200 Hz (5 ms period) in Teach mode");
-
-    // 5. Arm RP2350 hardware watchdog (resets MCU if control task stalls > 250 ms)
-    let mut hw_watchdog = Watchdog::new(p.WATCHDOG);
-    let wd_timeout = Duration::from_millis(HW_WATCHDOG_TIMEOUT_MS);
-    hw_watchdog.start(wd_timeout);
-
-    // 6. Deterministic 200 Hz Embassy control loop driving `copper-rs` iterations
-    let mut ticker = Ticker::every(Duration::from_millis(CONTROL_PERIOD_MS));
-    loop {
-        ticker.next().await;
-
-        if let Err(err) = running_app.run_one_iteration() {
-            error!("Copper iteration error: {:?}", defmt::Debug2Format(&err));
-            // Do NOT feed hardware watchdog on fatal runtime error -> forces safe hardware reset
-            continue;
-        }
-
-        // Update physical safety mode LED
-        let now_ms = Instant::now().as_millis() as u32;
-        if current_led_mode().is_lit(now_ms) {
-            status_led.set_high();
-        } else {
-            status_led.set_low();
-        }
-
-        // Feed hardware watchdog only after a clean control cycle
-        hw_watchdog.feed(wd_timeout);
-    }
+    // 4. Spawn the single deterministic control task. Embassy owns all scheduling.
+    spawner.spawn(control_task(status_led, p.WATCHDOG).expect("spawn control_task"));
 }

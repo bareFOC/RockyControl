@@ -1,14 +1,9 @@
-//! Real `copper-rs` (`cu29 1.3`) `no_std` tasks, bridges, and messages for Rocky MCU firmware.
+//! Plain control-loop message structs and a no-alloc `ControlTask` helper for Rocky MCU firmware.
 //!
-//! Graph topology (defined identically in `copperconfig.ron` for RP2350 and ESP32-P4):
-//!
-//! ```text
-//!   host_link/rx_cmd  ──(HostCmdMsg)───────┐
-//!                                          ▼
-//!                                   [servo_ctrl] ──(ControlStepMsg)──┬──▶ servo_bus/tx_cmd
-//!                                          ▲                         └──▶ host_link/tx_telem
-//!   servo_bus/rx_state ─(ServoFeedbackMsg)─┘
-//! ```
+//! All scheduling, timing, USB, IMU, and watchdog work is handled by Embassy on the board crates.
+//! This module intentionally contains no copper-rs (`cu29`) glue: it only defines the message
+//! structs exchanged between tasks and [`ControlTask`], a thin helper that calls
+//! [`DirectServoKernel::step`] directly and publishes the status LED mode.
 //!
 //! All safety invariants live inside `rk_control::DirectServoKernel` (`f32` only):
 //! - Boots strictly in `Teach` mode (`torque_mask = 0`)
@@ -18,37 +13,40 @@
 
 use core::cell::RefCell;
 
-use bincode::{Decode, Encode};
 use critical_section::Mutex;
-use cu29::prelude::*;
-use rk_control::{DirectServoKernel, JointCalibration, RawServoCommand, RawServoFeedback};
+use rk_control::{DirectServoKernel, JointCalibration, KernelStepOutput, RawServoCommand, RawServoFeedback};
 use rk_proto::{
     ConfigCmd, ControlMode, EstimatorTelemetry, FaultFlags, HostToMcu, MAX_JOINTS, McuToHost,
     PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::config::{CONTROL_DT_SEC, DEFAULT_JOINT_COUNT};
-use crate::imu::IMU_SLOT;
-use crate::servo_bus::SERVO_BUS_SLOT;
 use crate::status_led::StatusLedMode;
 use crate::transport::HOST_LINK_MAILBOX;
 
-/// Latest firmware safety snapshot published by `DirectServoCuTask` for the board status LED.
+/// Latest firmware safety snapshot published by [`ControlTask::step`] for the board status LED.
 static LATEST_LED_MODE: Mutex<RefCell<StatusLedMode>> =
     Mutex::new(RefCell::new(StatusLedMode::TeachHeartbeat));
 
-/// Returns the live status LED pattern computed from the most recent `copper-rs` control tick.
+/// Returns the live status LED pattern computed from the most recent control tick.
 pub fn current_led_mode() -> StatusLedMode {
     critical_section::with(|cs| *LATEST_LED_MODE.borrow_ref(cs))
 }
 
+/// Updates the cached status LED mode from the kernel's safety snapshot.
+fn update_led_from_state(mode: ControlMode, faults: FaultFlags) {
+    let led_mode = StatusLedMode::from_state(mode, faults);
+    critical_section::with(|cs| {
+        *LATEST_LED_MODE.borrow_ref_mut(cs) = led_mode;
+    });
+}
+
 // ---------------------------------------------------------------------------
-// Copper-rs Message Types (`Encode + Decode + Reflect + Serialize + Deserialize`)
+// Plain Message Types
 // ---------------------------------------------------------------------------
 
-/// Decoded host command delivered from `host_link/rx_cmd` into `servo_ctrl`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
+/// Decoded host command delivered into the control step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct HostCmdMsg {
     pub present: bool,
     pub protocol_version: u16,
@@ -215,8 +213,8 @@ impl HostCmdMsg {
     }
 }
 
-/// Raw servo bus + IMU sensor feedback delivered from `servo_bus/rx_state` into `servo_ctrl`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
+/// Raw servo bus + IMU sensor feedback delivered into the control step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServoFeedbackMsg {
     pub raw_rad: [f32; MAX_JOINTS],
     pub velocity_rad_s: [f32; MAX_JOINTS],
@@ -288,8 +286,8 @@ impl From<&ServoFeedbackMsg> for RawServoFeedback {
     }
 }
 
-/// Atomic output emitted by `DirectServoCuTask` and fanned out to both `servo_bus` and `host_link`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, Encode, Decode, Reflect)]
+/// Atomic control-step output, fanned out to the servo bus and host link by the board tasks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ControlStepMsg {
     // Outbound actuator command
     pub cmd_torque_mask: u32,
@@ -426,299 +424,43 @@ impl ControlStepMsg {
 }
 
 // ---------------------------------------------------------------------------
-// Copper-rs Control Task: `DirectServoCuTask`
+// Control Task: plain `DirectServoKernel` wrapper
 // ---------------------------------------------------------------------------
 
-/// Deterministic `copper-rs` `CuTask` executing [`DirectServoKernel`].
-#[derive(Reflect)]
-#[reflect(from_reflect = false)]
-pub struct DirectServoCuTask {
-    #[reflect(ignore)]
+/// Owns a [`DirectServoKernel`] and drives one control tick per [`Self::step`] call.
+///
+/// This replaces the former copper-rs `DirectServoCuTask`. It performs no I/O itself:
+/// the Embassy board tasks supply `now_ms`, `dt_sec`, the optional host command, and the
+/// current servo feedback snapshot.
+pub struct ControlTask {
     kernel: DirectServoKernel,
-    last_now_ms: u32,
-    tick_count: u64,
 }
 
-impl Freezable for DirectServoCuTask {}
-
-impl CuTask for DirectServoCuTask {
-    type Resources<'r> = ();
-    type Input<'m> = input_msg!('m, HostCmdMsg, ServoFeedbackMsg);
-    type Output<'m> = output_msg!(ControlStepMsg);
-
-    fn new(config: Option<&ComponentConfig>, _resources: Self::Resources<'_>) -> CuResult<Self> {
-        let joint_count = config
-            .and_then(|c| c.get::<u32>("joint_count").ok().flatten())
-            .map(|n| (n as usize).clamp(1, MAX_JOINTS))
-            .unwrap_or(DEFAULT_JOINT_COUNT);
-        let default_cal = [JointCalibration::default(); MAX_JOINTS];
-        Ok(Self {
-            kernel: DirectServoKernel::new(joint_count, &default_cal[..joint_count]),
-            last_now_ms: 0,
-            tick_count: 0,
-        })
+impl ControlTask {
+    pub fn new(joint_count: usize, initial_cal: &[JointCalibration]) -> Self {
+        Self {
+            kernel: DirectServoKernel::new(joint_count, initial_cal),
+        }
     }
 
-    fn process(
+    /// Runs one deterministic control tick and returns the kernel's raw output.
+    ///
+    /// Equivalent to the former `DirectServoCuTask::process()`: wire error counters are
+    /// refreshed from the host-link mailbox, the kernel is stepped with the supplied
+    /// timing and I/O snapshots, and the status LED mode is updated from telemetry.
+    pub fn step(
         &mut self,
-        ctx: &CuContext,
-        input: &Self::Input<'_>,
-        output: &mut Self::Output<'_>,
-    ) -> CuResult<()> {
-        let now_ns = ctx.now().as_nanos();
-        let now_ms = (now_ns / 1_000_000) as u32;
-        let dt_sec = if self.tick_count == 0 {
-            CONTROL_DT_SEC
-        } else {
-            let delta_ms = now_ms.wrapping_sub(self.last_now_ms);
-            if delta_ms == 0 {
-                CONTROL_DT_SEC
-            } else {
-                (delta_ms as f32 * 0.001_f32).clamp(0.001_f32, 0.05_f32)
-            }
-        };
-        self.last_now_ms = now_ms;
-        self.tick_count = self.tick_count.saturating_add(1);
-
-        let rx_cmd = input.0.payload().and_then(HostCmdMsg::to_host);
-        let rx_fb: RawServoFeedback = input
-            .1
-            .payload()
-            .map(RawServoFeedback::from)
-            .unwrap_or_default();
-
+        now_ms: u32,
+        dt_sec: f32,
+        cmd: Option<&HostToMcu>,
+        fb: &RawServoFeedback,
+    ) -> KernelStepOutput {
         let (crc_errs, ver_errs) = HOST_LINK_MAILBOX.wire_error_counts();
         self.kernel.set_wire_error_counts(crc_errs, ver_errs);
-        let step = self.kernel.step(now_ms, dt_sec, rx_cmd.as_ref(), &rx_fb);
 
-        let led_mode = StatusLedMode::from_state(step.telemetry.active_mode, step.telemetry.faults);
-        critical_section::with(|cs| {
-            *LATEST_LED_MODE.borrow_ref_mut(cs) = led_mode;
-        });
-
-        let active_mode_u8 = match step.telemetry.active_mode {
-            ControlMode::Teach => 0,
-            ControlMode::Drive => 1,
-            ControlMode::EStop => 2,
-        };
-
-        output.tov = Tov::Time(ctx.now());
-        output.set_payload(ControlStepMsg {
-            cmd_torque_mask: step.servo_cmd.torque_mask,
-            cmd_raw_target_rad: step.servo_cmd.raw_target_rad,
-            cmd_mode: step.servo_cmd.command_mode,
-            cmd_raw_velocity_rad_s: step.servo_cmd.raw_velocity_rad_s,
-            cmd_torque_nm: step.servo_cmd.torque_nm,
-            telem_seq_ack: step.telemetry.seq_ack,
-            telem_uptime_ms: step.telemetry.uptime_ms,
-            telem_active_mode: active_mode_u8,
-            telem_faults_bits: step.telemetry.faults.bits(),
-            telem_torque_state_mask: step.telemetry.torque_state_mask,
-            telem_bus_voltage_mv: step.telemetry.bus_voltage_mv,
-            telem_measured_rad: step.telemetry.measured_rad,
-            telem_applied_target_rad: step.telemetry.applied_target_rad,
-            telem_velocity_rad_s: step.telemetry.velocity_rad_s,
-            telem_current_ma: step.telemetry.current_ma,
-            telem_temp_c: step.telemetry.temp_c,
-            telem_imu_available: step.telemetry.imu.available,
-            telem_imu_pitch_rad: step.telemetry.imu.pitch_rad,
-            telem_imu_roll_rad: step.telemetry.imu.roll_rad,
-            telem_imu_yaw_rad: step.telemetry.imu.yaw_rad,
-            telem_imu_pitch_rate: step.telemetry.imu.pitch_rate_rad_s,
-            telem_imu_roll_rate: step.telemetry.imu.roll_rate_rad_s,
-            telem_imu_yaw_rate: step.telemetry.imu.yaw_rate_rad_s,
-            telem_imu_gravity_x: step.telemetry.imu.gravity[0],
-            telem_imu_gravity_y: step.telemetry.imu.gravity[1],
-            telem_imu_gravity_z: step.telemetry.imu.gravity[2],
-            telem_gait_phase_rad: step.telemetry.balance.gait_phase_rad,
-            telem_pitch_corr_rad: step.telemetry.balance.pitch_corr_rad,
-            telem_roll_corr_rad: step.telemetry.balance.roll_corr_rad,
-            telem_balance_active: step.telemetry.balance.balance_active,
-            telem_walk_active: step.telemetry.balance.walk_active,
-            telem_uvc_phase: step.telemetry.balance.uvc_phase,
-            telem_support_foot: step.telemetry.balance.support_foot,
-            telem_foot_dx_m: step.telemetry.balance.foot_dx_m,
-            telem_foot_dy_m: step.telemetry.balance.foot_dy_m,
-            telem_hip_height_m: step.telemetry.balance.hip_height_m,
-            telem_fall_orientation: step.telemetry.balance.fall_orientation,
-            est_com_pos_m: step.telemetry.estimator.com_pos_m,
-            est_com_vel_m_s: step.telemetry.estimator.com_vel_m_s,
-            est_dcm_xy_m: step.telemetry.estimator.dcm_xy_m,
-            est_zmp_xy_m: step.telemetry.estimator.zmp_xy_m,
-            est_foot_margin_m: step.telemetry.estimator.foot_margin_m,
-            est_grf_left_n: step.telemetry.estimator.grf_left_n,
-            est_grf_right_n: step.telemetry.estimator.grf_right_n,
-            est_contact_mask: step.telemetry.estimator.contact_mask,
-            est_ukemi_active: step.telemetry.estimator.ukemi_active,
-            est_valid_mask: step.telemetry.estimator.valid_mask,
-            telem_rx_crc_errors: step.telemetry.rx_crc_errors,
-            telem_rx_version_mismatches: step.telemetry.rx_version_mismatches,
-            telem_i3c_timeout_count: step.telemetry.i3c_timeout_count,
-        });
-
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Copper-rs Bridge 1: `HostLinkBridge` (USB CDC-ACM or USB-NCM UDP via mailbox)
-// ---------------------------------------------------------------------------
-
-rx_channels! {
-    pub struct HostLinkRxChannels : HostLinkRxId {
-        rx_cmd => HostCmdMsg = "host_link/rx_cmd",
-    }
-}
-
-tx_channels! {
-    pub struct HostLinkTxChannels : HostLinkTxId {
-        tx_telem => ControlStepMsg = "host_link/tx_telem",
-    }
-}
-
-#[derive(Default, Reflect)]
-pub struct HostLinkBridge;
-
-impl Freezable for HostLinkBridge {}
-
-impl CuBridge for HostLinkBridge {
-    type Resources<'r> = ();
-    type Tx = HostLinkTxChannels;
-    type Rx = HostLinkRxChannels;
-
-    fn new(
-        _config: Option<&ComponentConfig>,
-        _tx: &[BridgeChannelConfig<<Self::Tx as BridgeChannelSet>::Id>],
-        _rx: &[BridgeChannelConfig<<Self::Rx as BridgeChannelSet>::Id>],
-        _resources: Self::Resources<'_>,
-    ) -> CuResult<Self> {
-        Ok(Self)
-    }
-
-    fn send<'a, Payload>(
-        &mut self,
-        _ctx: &CuContext,
-        channel: &'static BridgeChannel<HostLinkTxId, Payload>,
-        msg: &CuMsg<Payload>,
-    ) -> CuResult<()>
-    where
-        Payload: CuMsgPayload + 'a,
-    {
-        if matches!(channel.id(), HostLinkTxId::TxTelem) {
-            if let Some(step) = msg.payload() {
-                if let Some(step_msg) = (step as &dyn core::any::Any).downcast_ref::<ControlStepMsg>() {
-                    HOST_LINK_MAILBOX.publish_tx_telem(step_msg.to_telemetry());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn receive<'a, Payload>(
-        &mut self,
-        ctx: &CuContext,
-        channel: &'static BridgeChannel<HostLinkRxId, Payload>,
-        msg: &mut CuMsg<Payload>,
-    ) -> CuResult<()>
-    where
-        Payload: CuMsgPayload + 'a,
-    {
-        msg.tov = Tov::Time(ctx.now());
-        if matches!(channel.id(), HostLinkRxId::RxCmd) {
-            let cmd_msg = match HOST_LINK_MAILBOX.take_rx_cmd() {
-                Some(pkt) => HostCmdMsg::from_host(&pkt),
-                None => HostCmdMsg::default(),
-            };
-            let mut slot = Some(cmd_msg);
-            if let Some(target) = (&mut slot as &mut dyn core::any::Any).downcast_mut::<Option<Payload>>() {
-                if let Some(val) = target.take() {
-                    msg.set_payload(val);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Copper-rs Bridge 2: `ServoBusBridge` (Bench loopback OR UART/PIO/TWAI bus)
-// ---------------------------------------------------------------------------
-
-rx_channels! {
-    pub struct ServoBusRxChannels : ServoBusRxId {
-        rx_state => ServoFeedbackMsg = "servo_bus/rx_state",
-    }
-}
-
-tx_channels! {
-    pub struct ServoBusTxChannels : ServoBusTxId {
-        tx_cmd => ControlStepMsg = "servo_bus/tx_cmd",
-    }
-}
-
-#[derive(Default, Reflect)]
-pub struct ServoBusBridge;
-
-impl Freezable for ServoBusBridge {}
-
-impl CuBridge for ServoBusBridge {
-    type Resources<'r> = ();
-    type Tx = ServoBusTxChannels;
-    type Rx = ServoBusRxChannels;
-
-    fn new(
-        _config: Option<&ComponentConfig>,
-        _tx: &[BridgeChannelConfig<<Self::Tx as BridgeChannelSet>::Id>],
-        _rx: &[BridgeChannelConfig<<Self::Rx as BridgeChannelSet>::Id>],
-        _resources: Self::Resources<'_>,
-    ) -> CuResult<Self> {
-        Ok(Self)
-    }
-
-    fn send<'a, Payload>(
-        &mut self,
-        _ctx: &CuContext,
-        channel: &'static BridgeChannel<ServoBusTxId, Payload>,
-        msg: &CuMsg<Payload>,
-    ) -> CuResult<()>
-    where
-        Payload: CuMsgPayload + 'a,
-    {
-        if matches!(channel.id(), ServoBusTxId::TxCmd) {
-            if let Some(step) = msg.payload() {
-                if let Some(step_msg) = (step as &dyn core::any::Any).downcast_ref::<ControlStepMsg>() {
-                    SERVO_BUS_SLOT.write_command(&step_msg.to_servo_cmd());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn receive<'a, Payload>(
-        &mut self,
-        ctx: &CuContext,
-        channel: &'static BridgeChannel<ServoBusRxId, Payload>,
-        msg: &mut CuMsg<Payload>,
-    ) -> CuResult<()>
-    where
-        Payload: CuMsgPayload + 'a,
-    {
-        msg.tov = Tov::Time(ctx.now());
-        if matches!(channel.id(), ServoBusRxId::RxState) {
-            let mut fb = SERVO_BUS_SLOT.read_feedback(CONTROL_DT_SEC);
-            if let Some(hw_imu) = IMU_SLOT.latest() {
-                fb.imu = hw_imu;
-                fb.imu_source_mask = IMU_SLOT.latest_source_mask();
-            }
-            let fb_msg = ServoFeedbackMsg::from(fb);
-            let mut slot = Some(fb_msg);
-            if let Some(target) = (&mut slot as &mut dyn core::any::Any).downcast_mut::<Option<Payload>>() {
-                if let Some(val) = target.take() {
-                    msg.set_payload(val);
-                }
-            }
-        }
-        Ok(())
+        let step = self.kernel.step(now_ms, dt_sec, cmd, fb);
+        update_led_from_state(step.telemetry.active_mode, step.telemetry.faults);
+        step
     }
 }
 
@@ -726,11 +468,11 @@ impl CuBridge for ServoBusBridge {
 mod tests {
     use super::*;
 
-    /// RP2350 stack & 64 KiB Copper heap guardrail: verifies the 3 `Copy` CopperList messages
-    /// stay compact (< 2 KiB total across all three) after adding P1a velocity, torque, and
+    /// RP2350 stack guardrail: verifies the 3 `Copy` message structs stay compact
+    /// (< 2 KiB total across all three) after adding P1a velocity, torque, and
     /// estimator fields.
     #[test]
-    fn copper_message_sizes_fit_rp2350_stack_budget() {
+    fn message_sizes_fit_rp2350_stack_budget() {
         let host_sz = core::mem::size_of::<HostCmdMsg>();
         let fb_sz = core::mem::size_of::<ServoFeedbackMsg>();
         let step_sz = core::mem::size_of::<ControlStepMsg>();
@@ -738,6 +480,19 @@ mod tests {
         assert!(host_sz <= 512, "HostCmdMsg too large for RP2350 stack: {host_sz} B");
         assert!(fb_sz <= 384, "ServoFeedbackMsg too large for RP2350 stack: {fb_sz} B");
         assert!(step_sz <= 1024, "ControlStepMsg too large for RP2350 stack: {step_sz} B");
-        assert!(total <= 1792, "Combined CopperList messages exceed 1792 B budget: {total} B");
+        assert!(total <= 1792, "Combined message structs exceed 1792 B budget: {total} B");
+    }
+
+    /// `ControlTask::step()` must boot into `Teach` mode and never panic on default inputs.
+    #[test]
+    fn control_task_step_defaults_to_teach() {
+        let cal = [JointCalibration::default(); MAX_JOINTS];
+        let mut task = ControlTask::new(MAX_JOINTS, &cal);
+        let cmd = HostToMcu::default();
+        let fb = RawServoFeedback::default();
+
+        let out = task.step(0, crate::config::CONTROL_DT_SEC, Some(&cmd), &fb);
+        assert_eq!(out.telemetry.active_mode, ControlMode::Teach);
+        assert_eq!(current_led_mode(), StatusLedMode::TeachHeartbeat);
     }
 }

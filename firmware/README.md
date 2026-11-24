@@ -1,6 +1,6 @@
-# Rocky Humanoid MCU Firmware (`copper-rs` + `embassy-rs`)
+# Rocky Humanoid MCU Firmware (`embassy-rs`)
 
-Real-time `#![no_std]` humanoid control firmware built on **`copper-rs` (`cu29 1.3`)** and **`embassy-rs`**, targeting **RP2350** first and architected for **ESP32-P4** expansion with zero control-logic duplication.
+Real-time `#![no_std]` humanoid control firmware built on **`embassy-rs`**, targeting **RP2350** first and architected for **ESP32-P4** expansion with zero control-logic duplication. A single Embassy scheduler owns all MCU work; `rk-fw-core` supplies a plain `ControlTask` that calls `DirectServoKernel::step()` directly — there is no copper-rs (`cu29`) runtime on either MCU.
 
 > [!WARNING]
 > **BREAKING telemetry wire-format change (fall-recovery):** `rk_proto::ImuState` now carries full orientation (`yaw_rad`, `yaw_rate_rad_s`, `gravity`) in every `McuToHost` frame. The COBS telemetry protocol has no version/CRC handshake, so the firmware image and the host workstation must be **rebuilt and flashed in lockstep**. A host and MCU running different `ImuState` layouts cannot communicate — update (or roll back) all sides together.
@@ -14,7 +14,7 @@ crates/rk-proto          (#![no_std])  HostToMcu / McuToHost, postcard COBS, f32
 crates/rk-control        (#![no_std])  DirectServoKernel (100 ms watchdog, soft stops, slew clamp)
   ▲
 firmware/rk-fw-core      (#![no_std])  Board-agnostic MCU core:
-  │                                          - Real cu29 DirectServoCuTask, HostLinkBridge, ServoBusBridge
+  │                                          - ControlTask: plain DirectServoKernel::step() wrapper
   │                                          - Zero-alloc CobsStreamFramer (USB CDC-ACM)
   │                                          - UDP COBS datagram codec (USB CDC-NCM networking)
   │                                          - BenchLoopbackBus (Day-1 USB-only testing) & ServoBusPort
@@ -25,23 +25,27 @@ firmware/rk-fw-core      (#![no_std])  Board-agnostic MCU core:
                                              esp-hal + esp-hal-embassy + USB-OTG HS 480 Mbps
 ```
 
-### Copper-rs Task Graph (`copperconfig.ron`, identical across MCUs)
+### Embassy-Only Runtime (identical shape across both MCUs)
 
 ```text
-host_link/rx_cmd   ──(HostCmdMsg)───────┐
-                                        ▼
-                                 [servo_ctrl] ──(ControlStepMsg)──┬──▶ servo_bus/tx_cmd
-                                        ▲                         └──▶ host_link/tx_telem
-servo_bus/rx_state ─(ServoFeedbackMsg)──┘
+embassy_time::Ticker (200 Hz)
+        │
+        ▼
+  [ControlTask::step]  ──▶ servo command  ──▶ SERVO_BUS_SLOT / hardware bus task
+        ▲                   └──▶ McuToHost  ──▶ HOST_LINK_MAILBOX / USB task
+        │
+   HOST_LINK_MAILBOX.take_rx_cmd()   (HostToMcu, latest-wins)
+   SERVO_BUS_SLOT.read_feedback(dt)  (RawServoFeedback snapshot)
 ```
 
-- **Loop Rate:** Deterministic `200 Hz` (`5 ms` `embassy_time::Ticker`) driving `app.run_one_iteration()`.
+- **Loop Rate:** Deterministic `200 Hz` (`5 ms` `embassy_time::Ticker`) driving `ControlTask::step()` directly.
 - **Numeric Parity:** Strictly single-precision `f32` everywhere (RP2350 Cortex-M33F & ESP32-P4 RV32IMAFC both have hardware single-precision FPUs).
 - **Safety by Construction:**
   - Always boots in `Teach` mode (`torque_mask = 0`).
   - `100 ms` host deadman watchdog inside `DirectServoKernel` latches `EStop` and forces torque OFF on cable pull or GUI stall.
-  - `250 ms` RP2350 hardware `Watchdog` resets the MCU if the `copper-rs` loop itself ever wedges.
+  - `250 ms` RP2350 hardware `Watchdog` resets the MCU if the control loop itself ever wedges.
   - Onboard LED (`GPIO25` on Pico 2): **1 Hz slow heartbeat** = `Teach`, **Solid ON** = `Drive`, **8 Hz rapid strobe** = `EStop` / Watchdog / Fault.
+- **Deterministic replay** remains a host-side feature (`rk-cu-nodes::DirectServoTask`, `rk-sim`, UI, MCP). It is independent of the MCU runtime: no copper-rs code or `.copper` logging runs on the firmware.
 
 ---
 
@@ -113,4 +117,4 @@ ping -c 3 10.42.0.2
 
 ## 4. Expanding to ESP32-P4
 
-`firmware/rk-esp32p4` reuses the exact same `rk-fw-core` crate and `copperconfig.ron` graph. Only board peripherals (`esp-hal` USB-OTG High-Speed 480 Mbps + `UART1`/`TWAI0` servo bus + `TIMG0` hardware watchdog) differ—keeping safety invariants and wire framing 100% identical across both MCUs.
+`firmware/rk-esp32p4` reuses the exact same `rk-fw-core` crate and Embassy-only 200 Hz `ControlTask` loop. Only board peripherals (`esp-hal` USB-OTG High-Speed 480 Mbps + `UART1`/`TWAI0` servo bus + `TIMG0` hardware watchdog) differ—keeping safety invariants and wire framing 100% identical across both MCUs. The ESP32 scaffold currently runs only the control loop; USB transport, TIMG0 watchdog arming, and LED GPIO remain bring-up TODOs.
