@@ -23,11 +23,9 @@ impl PlatformSaver for DesktopAtomicSaver {
         let dir = PathBuf::from("exports");
         let _ = std::fs::create_dir_all(&dir);
         let dest = dir.join(filename);
-        let opts = WriteOptions {
-            permissions: NewFilePermissions::PlatformDefault,
-            ..WriteOptions::default()
-        };
-        atomic_write(&dest, bytes, &opts)
+        let opts = WriteOptions::default()
+            .with_new_file_permissions(NewFilePermissions::PlatformDefault);
+        opts.atomic_write(&dest, bytes)
             .map_err(|e| format!("Atomic save failed for {}: {e}", dest.display()))?;
         Ok(format!("Saved atomically to {}", dest.display()))
     }
