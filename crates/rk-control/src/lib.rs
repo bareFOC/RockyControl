@@ -12,7 +12,9 @@
 //!
 //! Strictly single-precision `f32` everywhere for RP2350 Cortex-M33 FPU numeric parity.
 
+pub mod com_fk;
 pub mod estimator;
+pub mod mass_table;
 pub mod uvc;
 
 use core::f32::consts::{FRAC_PI_2, PI, TAU};
@@ -300,10 +302,13 @@ impl DirectServoKernel {
     ) -> KernelStepOutput {
         let dt = dt_sec.clamp(0.0001_f32, 0.1_f32);
 
-        // 1. Convert raw encoder angles -> calibrated joint space
+        // 1. Convert raw encoder angles / rates -> calibrated joint space
         let mut measured_rad = [0.0_f32; MAX_JOINTS];
+        let mut measured_vel_rad_s = [0.0_f32; MAX_JOINTS];
         for i in 0..self.joint_count {
             measured_rad[i] = raw_to_calibrated(feedback.raw_angle_rad[i], &self.calibration[i]);
+            let sign = if self.calibration[i].inverted { -1.0_f32 } else { 1.0_f32 };
+            measured_vel_rad_s[i] = sign * feedback.velocity_rad_s[i];
         }
 
         if !self.initialized_targets {
@@ -373,6 +378,7 @@ impl DirectServoKernel {
                         && g.dcm_step_gain.is_finite()
                         && g.foot_half_length_m.is_finite()
                         && g.foot_margin_m.is_finite()
+                        && g.h_com_m.is_finite()
                         && g.ukemi_tilt_rad.is_finite()
                         && g.ukemi_torque_scale.is_finite()
                         && g.compliance_scale.is_finite()
@@ -390,6 +396,7 @@ impl DirectServoKernel {
                             dcm_step_gain: g.dcm_step_gain.clamp(0.0, 1.5),
                             foot_half_length_m: foot_half,
                             foot_margin_m: g.foot_margin_m.clamp(0.010, foot_half),
+                            h_com_m: g.h_com_m.clamp(0.12, 0.60),
                             ukemi_tilt_rad: g
                                 .ukemi_tilt_rad
                                 .clamp(0.25, (fall_cutoff - 0.03).max(0.25)),
@@ -478,11 +485,26 @@ impl DirectServoKernel {
             && max_tilt >= self.balance_gains.ukemi_tilt_rad
             && max_tilt < self.balance_gains.fall_cutoff_rad;
 
+        // Share UVC's calibrated attitude with the estimator at a 1-tick lag:
+        // UVC runs *after* the estimator in this tick, so its bias accessors
+        // expose the previous tick's calibration. The validated 21-DoF FK path
+        // derives CoM from joint encoders only (no IMU tilt), but the legacy
+        // proxy fallback for non-21-DoF rigs is attitude-dependent and must see
+        // the bias-compensated sample. IMU availability/source bits are kept
+        // untouched so validity gating is unchanged.
+        let (comp_pitch, comp_roll) = self.uvc.bias_compensated_attitude(&imu);
+        let mut estimator_imu = imu;
+        if imu.available {
+            estimator_imu.pitch_rad = comp_pitch;
+            estimator_imu.roll_rad = comp_roll;
+        }
+
         let (estimator_telem, dcm_hint) = self.estimator.step(
             dt,
             self.joint_count,
             &measured_rad,
-            imu,
+            &measured_vel_rad_s,
+            estimator_imu,
             self.uvc.geometry().nominal_height,
             self.uvc.contact_mask(),
             feedback.imu_source_mask,
@@ -604,15 +626,6 @@ impl DirectServoKernel {
         let mut cmd_mode_out = [JointCommandMode::Position as u8; MAX_JOINTS];
         let mut raw_vel_out = [0.0_f32; MAX_JOINTS];
         let mut torque_nm_out = [0.0_f32; MAX_JOINTS];
-        let mut measured_vel_rad_s = [0.0_f32; MAX_JOINTS];
-        for i in 0..self.joint_count {
-            let sign = if self.calibration[i].inverted {
-                -1.0_f32
-            } else {
-                1.0_f32
-            };
-            measured_vel_rad_s[i] = sign * feedback.velocity_rad_s[i];
-        }
 
         if self.active_mode == ControlMode::Drive {
             let valid_mask = if self.joint_count >= 32 {
@@ -1034,10 +1047,14 @@ mod tests {
             quiet.telemetry.estimator.foot_margin_m
         );
 
-        // Apply forward pitch velocity impulse while angle is still small (inside static deadband)
-        // -> Capture Point xi = c + c_dot / omega leaves ±2.8 cm and triggers ActiveCatchStep.
-        fb.imu.pitch_rad = 0.025;
-        fb.imu.pitch_rate_rad_s = 1.6;
+        // Apply a joint-velocity impulse on both hip pitch joints (11, 17)
+        // while angles remain near zero. The mass-weighted CoM Jacobian turns
+        // this into a support-relative CoM velocity, so Capture Point
+        // xi = c_rel + v_rel / omega leaves the ±2.8 cm margin and triggers
+        // ActiveCatchStep. IMU rate alone no longer drives DCM (analytic FK).
+        fb.velocity_rad_s[11] = -2.5;
+        fb.velocity_rad_s[17] = -2.5;
+        fb.imu.available = true; // keep estimator valid bits asserted
         let mut pushed = quiet;
         for tick in 2..=12 {
             cmd.seq = tick;

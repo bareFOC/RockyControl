@@ -324,6 +324,29 @@ impl UvcController {
         self.phase
     }
 
+    /// Auto-zeroed sagittal IMU bias in radians (clamped to `[-0.08, 0.08]`).
+    ///
+    /// Exposed so the kernel can share the calibrated attitude with the estimator
+    /// with a one-tick lag (the estimator runs before UVC in each control tick).
+    pub const fn pitch_bias(&self) -> f32 {
+        self.pitch_bias
+    }
+
+    /// Auto-zeroed lateral IMU bias in radians (clamped to `[-0.08, 0.08]`).
+    pub const fn roll_bias(&self) -> f32 {
+        self.roll_bias
+    }
+
+    /// Bias-compensated torso attitude `(pitch_rad, roll_rad)` derived from an
+    /// IMU sample using the most recently calibrated bias.
+    ///
+    /// The estimator runs before UVC in each tick, so this reflects the bias
+    /// computed on the previous tick — the intended 1-tick-lagged sharing from
+    /// the P1 design. No state-machine refactor is required.
+    pub fn bias_compensated_attitude(&self, imu: &ImuState) -> (f32, f32) {
+        (imu.pitch_rad - self.pitch_bias, imu.roll_rad - self.roll_bias)
+    }
+
     /// Foot contact bitmask (`bit 0 = Right stance`, `bit 1 = Left stance`) for air-gating CoM velocity.
     pub const fn contact_mask(&self) -> u8 {
         match self.phase {
@@ -891,6 +914,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn bias_compensated_attitude_subtracts_calibrated_bias() {
+        let ctrl = UvcController::new(LegGeometry::rocky_mk1());
+        assert_eq!(ctrl.pitch_bias(), 0.0);
+        assert_eq!(ctrl.roll_bias(), 0.0);
+        let imu = ImuState {
+            pitch_rad: 0.06,
+            roll_rad: -0.04,
+            ..Default::default()
+        };
+        assert_eq!(ctrl.bias_compensated_attitude(&imu), (0.06, -0.04));
     }
 
     #[test]

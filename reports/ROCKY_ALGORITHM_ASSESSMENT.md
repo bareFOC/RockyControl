@@ -217,6 +217,8 @@ The earlier "20 cm hop" is arithmetically correct ($v=\sqrt{2g(0.20)}=1.98$ m/s)
 
 ## 6. Staged roadmap — split by actuator generation (critique §5)
 
+> **P1 STATUS (2026-11-25): IMPLEMENTED.** `p1-mass-weighted-com-estimator` replaced the IMU-tilt proxy with mass-weighted FK CoM (`rk-control/src/com_fk.rs` + generated `mass_table.rs` from URDF `<inertial>` tags, total 1.487 kg), analytic $J_{com}\dot q$ from measured joint velocity, support-relative DCM with fixed configurable `h_com_m` (default 0.25 m, `PROTOCOL_VERSION=3`), proxy fallback for non-21-DoF rigs, and bias-compensated attitude sharing. All shove/fall/replay tests pass; replay verified bit-exact with nonzero joint velocities. UI gap (no estimator telemetry display) is addressed in the P2 HUD task.
+
 **P0 (done):** fall detection, classified get-up library, recovery state machine, red alarm.
 
 **P1a — v1 firmware foundation + kinematic/UVC balance (N20 + RP2350):**

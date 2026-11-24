@@ -1,7 +1,21 @@
 <?xml version="1.0"?>
 <robot name="rocky_mk1">
+  <!--
+    Per-link mass properties (authored BOM estimates, 2026-11-24).
+    Rocky Mk1 is a ~45 cm, ~1.5 kg 1/4-scale humanoid. Total mass of all
+    22 <inertial> blocks below: 1.487 kg. Torso/pelvis dominate; limbs
+    taper distally. COM origins are near each link's geometric center.
+    These URDF tags are the single source of truth; the checked-in table
+    crates/rk-control/src/mass_table.rs is generated from them and verified
+    by crates/rk-model/tests/mass_table_test.rs.
+  -->
   <!-- Pelvis / Root -->
   <link name="pelvis">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <mass value="0.380" />
+      <inertia ixx="0.00100" ixy="0" ixz="0" iyy="0.00080" iyz="0" izz="0.00070" />
+    </inertial>
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry><box size="0.22 0.11 0.14" /></geometry>
@@ -11,6 +25,11 @@
 
   <!-- Torso & Head -->
   <link name="torso">
+    <inertial>
+      <origin xyz="0 0.16 0" rpy="0 0 0" />
+      <mass value="0.480" />
+      <inertia ixx="0.00330" ixy="0" ixz="0" iyy="0.00210" iyz="0" izz="0.00250" />
+    </inertial>
     <visual>
       <origin xyz="0 0.16 0" rpy="0 0 0" />
       <geometry><box size="0.28 0.30 0.17" /></geometry>
@@ -26,6 +45,11 @@
   </joint>
 
   <link name="neck">
+    <inertial>
+      <origin xyz="0 0.03 0" rpy="0 0 0" />
+      <mass value="0.014" />
+      <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001" />
+    </inertial>
     <visual>
       <origin xyz="0 0.03 0" rpy="0 0 0" />
       <geometry><cylinder radius="0.042" length="0.06" /></geometry>
@@ -41,6 +65,11 @@
   </joint>
 
   <link name="head">
+    <inertial>
+      <origin xyz="0 0.08 0.01" rpy="0 0 0" />
+      <mass value="0.065" />
+      <inertia ixx="0.00017" ixy="0" ixz="0" iyy="0.00017" iyz="0" izz="0.00014" />
+    </inertial>
     <visual>
       <origin xyz="0 0.08 0.01" rpy="0 0 0" />
       <geometry><box size="0.14 0.14 0.15" /></geometry>
@@ -57,6 +86,11 @@
 
   <!-- Left Arm -->
   <link name="l_shoulder">
+    <inertial>
+      <origin xyz="0.03 0 0" rpy="0 0 0" />
+      <mass value="0.028" />
+      <inertia ixx="0.00003" ixy="0" ixz="0" iyy="0.00003" iyz="0" izz="0.00003" />
+    </inertial>
     <visual>
       <origin xyz="0.03 0 0" rpy="0 0 0" />
       <geometry><cylinder radius="0.052" length="0.08" /></geometry>
@@ -72,6 +106,11 @@
   </joint>
 
   <link name="l_upper_arm">
+    <inertial>
+      <origin xyz="0 -0.12 0" rpy="0 0 0" />
+      <mass value="0.026" />
+      <inertia ixx="0.00010" ixy="0" ixz="0" iyy="0.00010" iyz="0" izz="0.00004" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.12 0" rpy="0 0 0" />
       <geometry><box size="0.082 0.22 0.082" /></geometry>
@@ -87,6 +126,11 @@
   </joint>
 
   <link name="l_forearm">
+    <inertial>
+      <origin xyz="0 -0.13 0" rpy="0 0 0" />
+      <mass value="0.018" />
+      <inertia ixx="0.00009" ixy="0" ixz="0" iyy="0.00009" iyz="0" izz="0.00004" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.13 0" rpy="0 0 0" />
       <geometry><box size="0.095 0.24 0.10" /></geometry>
@@ -103,6 +147,11 @@
 
   <!-- Right Arm -->
   <link name="r_shoulder">
+    <inertial>
+      <origin xyz="-0.03 0 0" rpy="0 0 0" />
+      <mass value="0.028" />
+      <inertia ixx="0.00003" ixy="0" ixz="0" iyy="0.00003" iyz="0" izz="0.00003" />
+    </inertial>
     <visual>
       <origin xyz="-0.03 0 0" rpy="0 0 0" />
       <geometry><cylinder radius="0.052" length="0.08" /></geometry>
@@ -118,6 +167,11 @@
   </joint>
 
   <link name="r_upper_arm">
+    <inertial>
+      <origin xyz="0 -0.12 0" rpy="0 0 0" />
+      <mass value="0.026" />
+      <inertia ixx="0.00010" ixy="0" ixz="0" iyy="0.00010" iyz="0" izz="0.00004" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.12 0" rpy="0 0 0" />
       <geometry><box size="0.082 0.22 0.082" /></geometry>
@@ -133,6 +187,11 @@
   </joint>
 
   <link name="r_forearm">
+    <inertial>
+      <origin xyz="0 -0.13 0" rpy="0 0 0" />
+      <mass value="0.018" />
+      <inertia ixx="0.00009" ixy="0" ixz="0" iyy="0.00009" iyz="0" izz="0.00004" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.13 0" rpy="0 0 0" />
       <geometry><box size="0.095 0.24 0.10" /></geometry>
@@ -149,6 +208,11 @@
 
   <!-- Left Leg (6-DoF: Hip Yaw -> Hip Roll -> Hip Pitch -> Knee Pitch -> Ankle Pitch -> Ankle Roll) -->
   <link name="l_hip_yaw_link">
+    <inertial>
+      <origin xyz="0 -0.015 0" rpy="0 0 0" />
+      <mass value="0.018" />
+      <inertia ixx="0.00002" ixy="0" ixz="0" iyy="0.00002" iyz="0" izz="0.00002" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.015 0" rpy="0 0 0" />
       <geometry><cylinder radius="0.048" length="0.03" /></geometry>
@@ -164,6 +228,11 @@
   </joint>
 
   <link name="l_hip_roll_link">
+    <inertial>
+      <origin xyz="0 -0.015 0" rpy="0 0 0" />
+      <mass value="0.022" />
+      <inertia ixx="0.00002" ixy="0" ixz="0" iyy="0.00002" iyz="0" izz="0.00002" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.015 0" rpy="0 0 0" />
       <geometry><cylinder radius="0.052" length="0.04" /></geometry>
@@ -179,6 +248,11 @@
   </joint>
 
   <link name="l_thigh">
+    <inertial>
+      <origin xyz="0 -0.16 0" rpy="0 0 0" />
+      <mass value="0.062" />
+      <inertia ixx="0.00044" ixy="0" ixz="0" iyy="0.00044" iyz="0" izz="0.00011" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.16 0" rpy="0 0 0" />
       <geometry><box size="0.105 0.30 0.11" /></geometry>
@@ -194,6 +268,11 @@
   </joint>
 
   <link name="l_shin">
+    <inertial>
+      <origin xyz="0 -0.16 0" rpy="0 0 0" />
+      <mass value="0.042" />
+      <inertia ixx="0.00031" ixy="0" ixz="0" iyy="0.00031" iyz="0" izz="0.00008" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.16 0" rpy="0 0 0" />
       <geometry><box size="0.092 0.30 0.10" /></geometry>
@@ -209,6 +288,11 @@
   </joint>
 
   <link name="l_ankle_link">
+    <inertial>
+      <origin xyz="0 -0.015 0" rpy="0 0 0" />
+      <mass value="0.016" />
+      <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.015 0" rpy="0 0 0" />
       <geometry><cylinder radius="0.044" length="0.035" /></geometry>
@@ -224,6 +308,11 @@
   </joint>
 
   <link name="l_foot">
+    <inertial>
+      <origin xyz="0 -0.025 0.04" rpy="0 0 0" />
+      <mass value="0.042" />
+      <inertia ixx="0.00017" ixy="0" ixz="0" iyy="0.00045" iyz="0" izz="0.00040" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.025 0.04" rpy="0 0 0" />
       <geometry><box size="0.11 0.05 0.22" /></geometry>
@@ -240,6 +329,11 @@
 
   <!-- Right Leg (6-DoF: Hip Yaw -> Hip Roll -> Hip Pitch -> Knee Pitch -> Ankle Pitch -> Ankle Roll) -->
   <link name="r_hip_yaw_link">
+    <inertial>
+      <origin xyz="0 -0.015 0" rpy="0 0 0" />
+      <mass value="0.018" />
+      <inertia ixx="0.00002" ixy="0" ixz="0" iyy="0.00002" iyz="0" izz="0.00002" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.015 0" rpy="0 0 0" />
       <geometry><cylinder radius="0.048" length="0.03" /></geometry>
@@ -255,6 +349,11 @@
   </joint>
 
   <link name="r_hip_roll_link">
+    <inertial>
+      <origin xyz="0 -0.015 0" rpy="0 0 0" />
+      <mass value="0.022" />
+      <inertia ixx="0.00002" ixy="0" ixz="0" iyy="0.00002" iyz="0" izz="0.00002" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.015 0" rpy="0 0 0" />
       <geometry><cylinder radius="0.052" length="0.04" /></geometry>
@@ -270,6 +369,11 @@
   </joint>
 
   <link name="r_thigh">
+    <inertial>
+      <origin xyz="0 -0.16 0" rpy="0 0 0" />
+      <mass value="0.062" />
+      <inertia ixx="0.00044" ixy="0" ixz="0" iyy="0.00044" iyz="0" izz="0.00011" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.16 0" rpy="0 0 0" />
       <geometry><box size="0.105 0.30 0.11" /></geometry>
@@ -285,6 +389,11 @@
   </joint>
 
   <link name="r_shin">
+    <inertial>
+      <origin xyz="0 -0.16 0" rpy="0 0 0" />
+      <mass value="0.042" />
+      <inertia ixx="0.00031" ixy="0" ixz="0" iyy="0.00031" iyz="0" izz="0.00008" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.16 0" rpy="0 0 0" />
       <geometry><box size="0.092 0.30 0.10" /></geometry>
@@ -300,6 +409,11 @@
   </joint>
 
   <link name="r_ankle_link">
+    <inertial>
+      <origin xyz="0 -0.015 0" rpy="0 0 0" />
+      <mass value="0.016" />
+      <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.015 0" rpy="0 0 0" />
       <geometry><cylinder radius="0.044" length="0.035" /></geometry>
@@ -315,6 +429,11 @@
   </joint>
 
   <link name="r_foot">
+    <inertial>
+      <origin xyz="0 -0.025 0.04" rpy="0 0 0" />
+      <mass value="0.042" />
+      <inertia ixx="0.00017" ixy="0" ixz="0" iyy="0.00045" iyz="0" izz="0.00040" />
+    </inertial>
     <visual>
       <origin xyz="0 -0.025 0.04" rpy="0 0 0" />
       <geometry><box size="0.11 0.05 0.22" /></geometry>

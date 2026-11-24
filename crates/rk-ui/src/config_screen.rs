@@ -454,6 +454,13 @@ impl RockyStudioApp {
         changed |= ui
             .add(egui::Slider::new(&mut g.arm_assist, 0.0..=1.5).text("Arm Assist"))
             .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut g.h_com_m, 0.12..=0.60)
+                    .suffix(" m")
+                    .text("CoM Height (DCM/ZMP)"),
+            )
+            .changed();
         let mut cutoff_deg = g.fall_cutoff_rad.to_degrees();
         if ui
             .add(

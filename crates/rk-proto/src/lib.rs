@@ -13,7 +13,9 @@ pub const WATCHDOG_TIMEOUT_MS: u32 = 100;
 /// estimator telemetry, protocol version, and pre-COBS IEEE CRC-32 with headroom.
 pub const MAX_COBS_FRAME_BYTES: usize = 1024;
 /// Compile-time wire protocol version checked on every decoded HostToMcu / McuToHost frame.
-pub const PROTOCOL_VERSION: u16 = 2;
+///
+/// v3 adds [`BalanceGains::h_com_m`] (fixed CoM height for support-relative DCM/ZMP).
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MODEL_CHUNK_BYTES: usize = 256;
 pub const MAX_MODEL_NAME_BYTES: usize = 32;
 pub const MAX_MODEL_COBS_FRAME_BYTES: usize = 384;
@@ -317,6 +319,10 @@ pub struct BalanceGains {
     pub foot_half_length_m: f32,
     /// Usable sagittal ankle/CoP authority margin in meters (~80% of 3.5 cm = `0.028` m = ±2.8 cm).
     pub foot_margin_m: f32,
+    /// Fixed CoM height above the support sole in meters for the LIPM natural
+    /// frequency `omega = sqrt(g / h_com_m)` and the kinematic ZMP estimate.
+    /// Independent of UVC's IK `hip_height_m` (~0.62 m); default `0.25` m.
+    pub h_com_m: f32,
     /// Ukemi pre-fall torque relaxation threshold in radians (default ~32 deg = `0.56` rad < `fall_cutoff_rad`).
     pub ukemi_tilt_rad: f32,
     /// Ukemi compliant torque ceiling scale in `[0.05, 0.50]` applied when tilt exceeds `ukemi_tilt_rad`.
@@ -338,6 +344,7 @@ impl Default for BalanceGains {
             dcm_step_gain: 0.65,
             foot_half_length_m: 0.035,
             foot_margin_m: 0.028,
+            h_com_m: 0.25,
             ukemi_tilt_rad: 0.56,
             ukemi_torque_scale: 0.15,
             compliance_scale: 1.0,
@@ -980,6 +987,7 @@ pub fn validate_host_packet(pkt: &HostToMcu) -> Result<(), CodecError> {
                 || !g.dcm_step_gain.is_finite()
                 || !g.foot_half_length_m.is_finite()
                 || !g.foot_margin_m.is_finite()
+                || !g.h_com_m.is_finite()
                 || !g.ukemi_tilt_rad.is_finite()
                 || !g.ukemi_torque_scale.is_finite()
                 || !g.compliance_scale.is_finite() =>
@@ -1217,6 +1225,30 @@ mod tests {
             decode_mcu_cobs(&mut wire[..len3]).unwrap_err(),
             CodecError::VersionMismatch
         );
+    }
+
+    #[test]
+    fn nonfinite_h_com_gain_is_rejected() {
+        let mut gains = BalanceGains::default();
+        gains.h_com_m = f32::NAN;
+        let pkt = HostToMcu {
+            config: ConfigCmd::SetBalanceGains(gains),
+            ..Default::default()
+        };
+        assert_eq!(validate_host_packet(&pkt), Err(CodecError::NonFiniteFloat));
+
+        // The wire field survives a COBS round-trip with the default value.
+        let ok = HostToMcu {
+            config: ConfigCmd::SetBalanceGains(BalanceGains::default()),
+            ..Default::default()
+        };
+        let mut wire = [0u8; MAX_COBS_FRAME_BYTES];
+        let n = encode_cobs(&ok, &mut wire).expect("encode").len();
+        let decoded = decode_host_cobs(&mut wire[..n]).expect("decode");
+        match decoded.config {
+            ConfigCmd::SetBalanceGains(g) => assert_eq!(g.h_com_m, 0.25),
+            _ => panic!("expected SetBalanceGains"),
+        }
     }
 
     #[test]

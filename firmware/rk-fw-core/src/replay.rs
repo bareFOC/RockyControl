@@ -119,6 +119,45 @@ mod tests {
     }
 
     #[test]
+    fn replay_is_bit_exact_with_nonzero_joint_velocities() {
+        // Exercise the P1 mass-weighted FK path: 21 joints with nonzero rates.
+        let joint_count = 21usize;
+        let cal = vec![JointCalibration::default(); joint_count];
+        let mut task = ControlTask::new(joint_count, &cal);
+        let mut ticks = Vec::new();
+        for i in 0..5u32 {
+            let cmd = HostToMcu {
+                seq: i,
+                mode: ControlMode::Drive,
+                ..Default::default()
+            };
+            let mut fb = RawServoFeedback::default();
+            for j in 0..joint_count {
+                fb.raw_angle_rad[j] = 0.02 * (j as f32) + 0.01 * (i as f32);
+                fb.velocity_rad_s[j] = 0.15 * ((j % 3) as f32) - 0.1;
+            }
+            let (_, tick) = task.step_recorded(
+                i * 10,
+                CONTROL_DT_SEC,
+                Some(&cmd),
+                &fb,
+                (i as u16, 0),
+            );
+            ticks.push(tick);
+        }
+        let log = CopperReplayLog {
+            version: 1,
+            joint_count,
+            initial_raw_pose: [0.0; MAX_JOINTS],
+            initial_calibration: cal,
+            ticks,
+        };
+        let check = verify_deterministic_replay(&log);
+        assert!(check.exact_match, "FK-based estimator telemetry must replay bit-exactly");
+        assert_eq!(check.matched_ticks, 5);
+    }
+
+    #[test]
     fn replay_detects_behavioral_difference_in_recorded_output() {
         let mut log = sample_log();
         // Tamper with a recorded output: replay through the real ControlTask must

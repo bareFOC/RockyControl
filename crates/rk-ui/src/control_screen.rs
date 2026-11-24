@@ -757,6 +757,13 @@ impl RockyStudioApp {
                         changed |= ui
                             .add(egui::Slider::new(&mut gains.arm_assist, 0.0..=1.4).text("Arm Assist"))
                             .changed();
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut gains.h_com_m, 0.12..=0.60)
+                                    .suffix(" m")
+                                    .text("CoM Height"),
+                            )
+                            .changed();
                         if changed {
                             self.model.update_balance_gains(gains);
                         }
