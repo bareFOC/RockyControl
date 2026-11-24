@@ -11,8 +11,11 @@
 
 use core::f32::consts::PI;
 
-use libm::{acosf, asinf, atan2f, cosf, sinf, sqrtf};
-use rk_proto::{BalanceGains, ImuState, WalkCmd, classify_fall, fall_orientation, uvc_phase};
+use libm::{acosf, asinf, atan2f, cosf, logf, sinf, sqrtf};
+use rk_proto::{
+    BalanceGains, EstimatorTelemetry, ImuState, WalkCmd, classify_fall, estimator_valid,
+    fall_orientation, uvc_phase,
+};
 
 use crate::estimator::DcmSwingHint;
 
@@ -22,6 +25,8 @@ const REF_TICK_SEC: f32 = 0.010_f32;
 const FALL_TUCK_DURATION_SEC: f32 = 0.040_f32;
 /// Maximum knee-triangle half-angle (`60 deg` = `PI / 3`, matching ai2001 `k > 60*PI/180`).
 const MAX_HALF_KNEE_RAD: f32 = 1.047_197_6_f32;
+/// Gravitational acceleration for the LIPM natural frequency `ω = sqrt(g / h_com)`.
+const GRAVITY_M_S2: f32 = 9.81_f32;
 
 /// Parameterized 6-DoF bipedal leg geometry in meters.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -273,6 +278,11 @@ pub struct UvcController {
     cal_samples: u32,
     /// Filtered step progress phase for telemetry.
     gait_phase_rad: f32,
+    /// Continuous P2 gait clock in `[0, 2π)`. Advanced by `2π·cadence·dt`
+    /// whenever `walk.walk_enabled`; its half-cycle selects the support foot
+    /// (right in `[0, π)`, left in `[π, 2π)`). Phase-locked to the synthetic
+    /// catch-step phase on `ActiveCatchStep` entry.
+    phase_accum_rad: f32,
     /// Smoothly blends leg stance when UVC engages.
     initialized: bool,
     /// Snapshot of initial offsets when entering `ReturnToNeutral`.
@@ -306,6 +316,7 @@ impl UvcController {
             cal_sum_roll: 0.0,
             cal_samples: 0,
             gait_phase_rad: 0.0,
+            phase_accum_rad: 0.0,
             initialized: false,
             ret_start_dxi: 0.0,
             ret_start_dyi: 0.0,
@@ -322,6 +333,16 @@ impl UvcController {
 
     pub const fn phase(&self) -> UvcPhase {
         self.phase
+    }
+
+    /// Swing-foot landing target `(dxis, dyis)` in meters for the most recent tick.
+    ///
+    /// Exposed for deterministic replay/unit tests so the capture law can be inspected
+    /// directly without inferring it through the leg IK. The stance hip is still reported
+    /// by [`UvcStepOutput::foot_dx_m`] / [`UvcStepOutput::foot_dy_m`] and is never written
+    /// by the capture law.
+    pub const fn swing_targets(&self) -> (f32, f32) {
+        (self.dxis, self.dyis)
     }
 
     /// Auto-zeroed sagittal IMU bias in radians (clamped to `[-0.08, 0.08]`).
@@ -380,6 +401,7 @@ impl UvcController {
         self.cal_sum_roll = 0.0;
         self.cal_samples = 0;
         self.gait_phase_rad = 0.0;
+        self.phase_accum_rad = 0.0;
         self.initialized = false;
     }
 
@@ -391,13 +413,25 @@ impl UvcController {
         walk: WalkCmd,
         gains: BalanceGains,
     ) -> UvcStepOutput {
-        self.step_with_dcm(dt, imu, walk, gains, DcmSwingHint::default())
+        self.step_with_dcm(
+            dt,
+            imu,
+            walk,
+            gains,
+            DcmSwingHint::default(),
+            EstimatorTelemetry::default(),
+        )
     }
 
     /// Executes one deterministic `#![no_std]` UVC control cycle with P1a strict DOF partitioning:
     /// - Stance torso verticality -> UVC I-only (`dxi`/`dyi` spherical integration).
     /// - High-frequency vibration damping -> decoupled ankle rate-gyro P-term.
-    /// - Capturability / stepping -> `dcm` modulates swing-foot landing (`dxis`/`dyis`) ONLY.
+    /// - Capturability / stepping -> the estimator's capture point drives swing-foot landing
+    ///   (`dxis`/`dyis`) ONLY; the stance hip is never touched by the capture law.
+    ///
+    /// `estimator` must carry a valid `estimator_valid::DCM` channel for the capture law to run;
+    /// otherwise the legacy `DcmSwingHint` fallback is used. The lossy hint is deliberately
+    /// never reverse-engineered back into a capture point.
     pub fn step_with_dcm(
         &mut self,
         dt: f32,
@@ -405,6 +439,7 @@ impl UvcController {
         walk: WalkCmd,
         gains: BalanceGains,
         dcm: DcmSwingHint,
+        estimator: EstimatorTelemetry,
     ) -> UvcStepOutput {
         let dt = dt.clamp(0.0005_f32, 0.05_f32);
         let tick_scale = dt / REF_TICK_SEC;
@@ -479,14 +514,69 @@ impl UvcController {
         let tilt_trigger = walk.balance_enabled
             && (roll_eff.abs() > 0.001_f32 || pitch_eff.abs() > 0.004_f32 || dcm_step_trigger);
 
+        // Capture-point landing law (swing foot only). ξ and ċ come straight from the
+        // estimator's authoritative telemetry — never reconstructed from the lossy hint.
+        //   p = ξ_rel + K_v * (v_des - v_com) / ω,  ω = sqrt(g / h_com),  v_des = v_cmd * 0.5 m/s
+        // Default gains give h_com = 0.25 m -> ω ≈ 6.26 rad/s and K_v = dcm_step_gain.
+        let h_com = if gains.h_com_m.is_finite() {
+            gains.h_com_m.clamp(0.12_f32, 0.60_f32)
+        } else {
+            0.25_f32
+        };
+        let omega = sqrtf(GRAVITY_M_S2 / h_com);
+        let capture_valid = estimator.valid_mask & estimator_valid::DCM != 0;
+        let (capture_sag, capture_lat, capture_error) = if capture_valid {
+            let k_v = gains.dcm_step_gain.clamp(0.0_f32, 1.5_f32);
+            // `dcm_xy_m = [xi_lat (right +), xi_sag (forward +)]`; `com_vel_m_s = [lat, up, sag]`.
+            let xi_sag = estimator.dcm_xy_m[1];
+            let xi_lat = estimator.dcm_xy_m[0];
+            let p_sag = xi_sag + k_v * (vx * 0.5_f32 - estimator.com_vel_m_s[2]) / omega;
+            let p_lat = xi_lat + k_v * (vy * 0.5_f32 - estimator.com_vel_m_s[0]) / omega;
+            let err_sag = xi_sag - p_sag;
+            let err_lat = xi_lat - p_lat;
+            (p_sag, p_lat, sqrtf(err_sag * err_sag + err_lat * err_lat))
+        } else {
+            (0.0_f32, 0.0_f32, 0.0_f32)
+        };
+
         let step_h_scale = walk.step_height.clamp(0.1_f32, 1.0_f32);
         let cadence = walk.cadence_hz.clamp(0.6_f32, 2.8_f32);
         // ai2001 catch-step duration: 18 ticks @ 10 ms = 0.18 s; walk cadence modulates step speed
-        let step_dur = if wants_walk {
+        let step_dur_nom = if wants_walk {
             (0.5_f32 / cadence).clamp(0.16_f32, 0.45_f32)
         } else {
             0.18_f32
         };
+        // Khadiv step-time adaptation: shorten the (timer-driven) recovery step when the
+        // capture error exceeds the usable foot margin. The phase-locked walking cadence
+        // remains the single gait clock; only the synthetic catch-step duration is scaled.
+        //   T = clamp(0.8 * ln(1 + margin / |xi - p|) / omega, 0.16, T_nom)
+        let foot_half = gains.foot_half_length_m.clamp(0.015_f32, 0.12_f32);
+        let margin = if gains.foot_margin_m.is_finite() {
+            gains.foot_margin_m.clamp(0.010_f32, foot_half)
+        } else {
+            0.028_f32
+        };
+        let step_dur = if capture_valid && capture_error > margin {
+            let ratio = margin / capture_error.max(1e-6_f32);
+            (0.8_f32 * logf(1.0_f32 + ratio) / omega).clamp(0.16_f32, step_dur_nom)
+        } else {
+            step_dur_nom
+        };
+
+        // P2 phase-locked gait clock. `step_dur` is one half gait cycle, so
+        // `2π·cadence·dt` advances exactly π per step. The accumulator is the
+        // single source of truth for walking phase and runs through every
+        // state while walking is engaged; the `dt`/`cadence` clamps guarantee
+        // a single subtraction is enough to wrap into `[0, 2π)`.
+        const TWO_PI: f32 = 2.0_f32 * PI;
+        let walking_clock = walk.walk_enabled;
+        if walking_clock {
+            self.phase_accum_rad += TWO_PI * cadence * dt;
+            if self.phase_accum_rad >= TWO_PI {
+                self.phase_accum_rad -= TWO_PI;
+            }
+        }
 
         let mut swing_lift_m = 0.0_f32;
 
@@ -564,8 +654,33 @@ impl UvcController {
                 }
             }
             UvcPhase::ActiveCatchStep => {
-                let progress = (self.phase_elapsed_sec / step_dur).clamp(0.0_f32, 1.0_f32);
-                self.gait_phase_rad = if self.support_foot == 0 {
+                let progress = if walking_clock {
+                    // The free-running phase clock drives support swaps: which
+                    // half of the cycle the accumulator occupies is the stance
+                    // foot, and progress is the position within that half.
+                    let phase_support = if self.phase_accum_rad >= PI { 1_u8 } else { 0_u8 };
+                    if phase_support != self.support_foot {
+                        // Half-cycle boundary crossed -> foot landing. Apply
+                        // the same CoP bleed as the timer-driven landing path.
+                        self.support_foot = phase_support;
+                        self.phase_elapsed_sec = 0.0;
+                        self.dxi *= 0.65_f32;
+                        self.dyi *= 0.65_f32;
+                        self.dxis = -self.dxi;
+                        self.dyis = self.dyi;
+                    }
+                    let p = if self.support_foot == 0 {
+                        self.phase_accum_rad / PI
+                    } else {
+                        (self.phase_accum_rad - PI) / PI
+                    };
+                    p.clamp(0.0_f32, 1.0_f32)
+                } else {
+                    (self.phase_elapsed_sec / step_dur).clamp(0.0_f32, 1.0_f32)
+                };
+                self.gait_phase_rad = if walking_clock {
+                    self.phase_accum_rad
+                } else if self.support_foot == 0 {
                     progress * PI
                 } else {
                     PI + progress * PI
@@ -596,13 +711,20 @@ impl UvcController {
                         .clamp(0.0_f32, self.geom.max_dy);
                 }
 
-                // Mirror swing foot (`uvcSub()`) + Kinematic DCM swing-foot placement modulation ONLY
-                // (never double-drives the stance hip integrator `dxi`/`dyi`).
+                // Swing-foot landing ONLY. With a valid DCM channel the capture target
+                // (ξ + K_v·(v_des − v_com)/ω) is authoritative; the legacy hint is a fallback.
+                // `dxi`/`dyi` (stance hip) are never written here — UVC remains I-only.
                 let swing_lat_sign = if self.support_foot == 0 { -1.0_f32 } else { 1.0_f32 };
-                let dcm_swing_y = (dcm.swing_dy_m * swing_lat_sign).max(0.0_f32);
-                self.dxis = (-self.dxi + dcm.swing_dx_m)
-                    .clamp(-self.geom.max_swing_dx, self.geom.max_swing_dx);
-                self.dyis = (self.dyi + dcm_swing_y).clamp(0.0_f32, self.geom.max_swing_dy);
+                if capture_valid {
+                    self.dxis = capture_sag.clamp(-self.geom.max_swing_dx, self.geom.max_swing_dx);
+                    // Right-positive world lateral -> outward-from-pelvis on the swing side.
+                    self.dyis = (capture_lat * swing_lat_sign).clamp(0.0_f32, self.geom.max_swing_dy);
+                } else {
+                    let dcm_swing_y = (dcm.swing_dy_m * swing_lat_sign).max(0.0_f32);
+                    self.dxis = (-self.dxi + dcm.swing_dx_m)
+                        .clamp(-self.geom.max_swing_dx, self.geom.max_swing_dx);
+                    self.dyis = (self.dyi + dcm_swing_y).clamp(0.0_f32, self.geom.max_swing_dy);
+                }
                 let anti_collide = self.dyi + self.dyis;
                 if anti_collide < 0.0_f32 {
                     self.dyis -= anti_collide;
@@ -625,8 +747,10 @@ impl UvcController {
                 self.waist_yaw = (wt_geom + yaw_cmd * 0.24_f32).clamp(-0.45_f32, 0.45_f32);
                 self.wk = (self.dxi.abs() * 0.33_f32).min(self.geom.max_dx * 0.33_f32);
 
-                // Step landing -> swap support/swing foot
-                if progress >= 1.0_f32 {
+                // Step landing -> swap support/swing foot. While walking the
+                // accumulator already performed the swap at the half-cycle
+                // boundary above, so the timer-driven path is for catch steps only.
+                if progress >= 1.0_f32 && !walking_clock {
                     self.support_foot ^= 1;
                     // Preserve landed CoP shift in the lean direction across support swap
                     let prev_dxi = self.dxi;
@@ -721,6 +845,12 @@ impl UvcController {
             UvcPhase::FallTuck => {}
         }
 
+        // Telemetry always exposes the continuous accumulator while walking,
+        // even in non-stepping states, so the phase never jumps between states.
+        if walking_clock {
+            self.gait_phase_rad = self.phase_accum_rad;
+        }
+
         // 5. Solve 6-DoF Analytic Leg IK for support and swing legs
         let sup_x = self.dxi;
         let sup_y = (self.dyi - self.sway).max(0.0_f32);
@@ -803,6 +933,15 @@ impl UvcController {
         }
         self.phase = UvcPhase::ActiveCatchStep;
         self.phase_elapsed_sec = 0.0;
+        // Phase-lock the free-running clock to the synthetic catch-step phase:
+        // a catch step always starts at progress 0, so its accumulator value is
+        // the start of the selected support foot's half-cycle (0 or π). This
+        // makes `gait_phase_rad` continuous across the state/clock handoff.
+        self.phase_accum_rad = if self.support_foot == 0 {
+            0.0_f32
+        } else {
+            PI
+        };
     }
 
     /// Core ai2001 spherical-projection UVC integration (`uvc()` in `main.c`) with
@@ -987,5 +1126,346 @@ mod tests {
             tuck_end = ctrl.step(0.01, imu_fall, walk, gains);
         }
         assert!(tuck_end.fall_cutoff_ready, "cutoff must fire after 40 ms tuck");
+    }
+
+    /// Group 1 (P2): phase advances by exactly one fixed-dt increment every
+    /// tick while walking, including across 2π wraps and support swaps.
+    #[test]
+    fn walking_gait_phase_advances_continuously() {
+        let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+        let dt = 0.005_f32;
+        let cadence = 1.55_f32;
+        let walk = WalkCmd {
+            walk_enabled: true,
+            vx: 0.5,
+            cadence_hz: cadence,
+            ..Default::default()
+        };
+        let imu = ImuState {
+            available: true,
+            ..Default::default()
+        };
+        let gains = BalanceGains::default();
+        let expected_inc: f32 = 2.0_f32 * PI * cadence * dt;
+        let mut prev: Option<f32> = None;
+        let mut wraps = 0;
+        for _ in 0..400 {
+            let out = ctrl.step(dt, imu, walk, gains);
+            assert!(out.walk_active);
+            assert!(out.gait_phase_rad >= 0.0_f32 && out.gait_phase_rad < 2.0_f32 * PI);
+            if let Some(p) = prev {
+                let mut delta = out.gait_phase_rad - p;
+                if delta < 0.0_f32 {
+                    delta += 2.0_f32 * PI;
+                    wraps += 1;
+                }
+                assert!(
+                    (delta - expected_inc).abs() < 1e-4_f32,
+                    "phase must advance by exactly one increment (delta={delta}, expected={expected_inc})"
+                );
+            }
+            prev = Some(out.gait_phase_rad);
+        }
+        assert!(wraps > 0, "2 s at 1.55 Hz must wrap the accumulator");
+    }
+
+    /// Group 1 (P2): the accumulator half-cycle selects the support foot with
+    /// a π offset, and support alternates as the clock crosses each boundary.
+    #[test]
+    fn support_foot_is_pi_offset_from_walking_phase() {
+        let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+        let dt = 0.005_f32;
+        let walk = WalkCmd {
+            walk_enabled: true,
+            vx: 0.4,
+            cadence_hz: 1.55,
+            ..Default::default()
+        };
+        let imu = ImuState {
+            available: true,
+            ..Default::default()
+        };
+        let gains = BalanceGains::default();
+        let mut swaps = 0;
+        let mut prev_support = None;
+        for _ in 0..400 {
+            let out = ctrl.step(dt, imu, walk, gains);
+            if out.phase == UvcPhase::ActiveCatchStep {
+                if out.support_foot == 0 {
+                    assert!(
+                        out.gait_phase_rad < PI + 1e-4_f32,
+                        "right support must occupy the [0, π) half, got {}",
+                        out.gait_phase_rad
+                    );
+                } else {
+                    assert!(
+                        out.gait_phase_rad >= PI - 1e-4_f32,
+                        "left support must occupy the [π, 2π) half, got {}",
+                        out.gait_phase_rad
+                    );
+                }
+                if let Some(p) = prev_support {
+                    if p != out.support_foot {
+                        swaps += 1;
+                    }
+                }
+                prev_support = Some(out.support_foot);
+            }
+        }
+        assert!(
+            swaps >= 4,
+            "support must alternate repeatedly at π offsets, got {swaps} swaps"
+        );
+    }
+
+    /// Group 1 (P2): entering a catch step phase-locks the accumulator to the
+    /// synthetic catch-step phase (progress 0 -> 0 or π) with no jump, and the
+    /// very next tick continues advancing from that locked value.
+    #[test]
+    fn catch_step_entry_phase_locks_without_discontinuity() {
+        let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+        let dt = 0.005_f32;
+        let cadence = 1.55_f32;
+        let walk = WalkCmd {
+            walk_enabled: true,
+            vx: 0.3,
+            cadence_hz: cadence,
+            ..Default::default()
+        };
+        // +roll lean selects right support via `enter_catch_step`.
+        let imu = ImuState {
+            available: true,
+            roll_rad: 0.05,
+            ..Default::default()
+        };
+        let gains = BalanceGains::default();
+        let mut entry = None;
+        for _ in 0..40 {
+            let out = ctrl.step(dt, imu, walk, gains);
+            if out.phase == UvcPhase::ActiveCatchStep {
+                entry = Some(out);
+                break;
+            }
+        }
+        let entry = entry.expect("walking must engage a catch step");
+        assert_eq!(entry.support_foot, 0, "+roll lean must select right support");
+        let locked = if entry.support_foot == 0 {
+            0.0_f32
+        } else {
+            PI
+        };
+        assert!(
+            (entry.gait_phase_rad - locked).abs() < 1e-5,
+            "catch-step entry must lock phase to synthetic progress 0 (got {}, expected {locked})",
+            entry.gait_phase_rad
+        );
+
+        let next = ctrl.step(dt, imu, walk, gains);
+        let expected_inc = 2.0_f32 * PI * cadence * dt;
+        let delta = if next.gait_phase_rad >= entry.gait_phase_rad {
+            next.gait_phase_rad - entry.gait_phase_rad
+        } else {
+            next.gait_phase_rad + 2.0_f32 * PI - entry.gait_phase_rad
+        };
+        assert!(
+            (delta - expected_inc).abs() < 1e-4_f32,
+            "phase after entry must advance by one increment, not reset (delta={delta})"
+        );
+    }
+
+    // ---- P2 capture-law tests (valid `estimator_valid::DCM` telemetry required) ----
+
+    fn capture_telemetry(xi_sag: f32, v_sag: f32, dcm_valid: bool) -> EstimatorTelemetry {
+        EstimatorTelemetry {
+            dcm_xy_m: [0.0, xi_sag],
+            com_vel_m_s: [0.0, 0.0, v_sag],
+            valid_mask: if dcm_valid {
+                estimator_valid::COM | estimator_valid::DCM
+            } else {
+                estimator_valid::COM
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Enter `ActiveCatchStep` with a forward lean using *invalid* telemetry so the
+    /// capture law cannot influence the setup phase.
+    fn enter_catch(ctrl: &mut UvcController) -> (ImuState, WalkCmd, BalanceGains) {
+        let imu = ImuState {
+            available: true,
+            pitch_rad: 0.20,
+            ..Default::default()
+        };
+        let walk = WalkCmd {
+            balance_enabled: true,
+            vx: 0.5,
+            ..Default::default()
+        };
+        let gains = BalanceGains::default();
+        let out = ctrl.step_with_dcm(
+            0.005,
+            imu,
+            walk,
+            gains,
+            DcmSwingHint::default(),
+            EstimatorTelemetry::default(),
+        );
+        assert_eq!(out.phase, UvcPhase::ActiveCatchStep);
+        (imu, walk, gains)
+    }
+
+    /// Speed tracking: at steady state (v_com == v_des == vx*0.5) the swing-foot
+    /// landing target equals the capture point ξ = v_des/ω.
+    #[test]
+    fn capture_law_tracks_commanded_speed_via_swing_foot_only() {
+        let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+        let (imu, walk, gains) = enter_catch(&mut ctrl);
+
+        let omega = sqrtf(GRAVITY_M_S2 / gains.h_com_m);
+        let v_des = walk.vx.clamp(-1.0, 1.0) * 0.5_f32;
+        let telem = capture_telemetry(v_des / omega, v_des, true);
+        let out = ctrl.step_with_dcm(
+            0.005,
+            imu,
+            walk,
+            gains,
+            DcmSwingHint::default(),
+            telem,
+        );
+
+        let (dxis, _) = ctrl.swing_targets();
+        assert!(
+            (dxis - v_des / omega).abs() < 1e-3_f32,
+            "swing target must track v_des/ω={} (got {dxis})",
+            v_des / omega
+        );
+        assert_eq!(out.phase, UvcPhase::ActiveCatchStep);
+    }
+
+    /// Disturbance recovery: a forward CoM velocity shove (ξ = v_com/ω) moves the
+    /// landing target forward relative to steady state, but the K_v velocity term
+    /// pulls it back toward the CoM instead of blindly following ξ.
+    #[test]
+    fn capture_law_recovers_from_forward_velocity_disturbance() {
+        let omega = sqrtf(GRAVITY_M_S2 / BalanceGains::default().h_com_m);
+        let v_des = 0.25_f32;
+        let shove_v = 1.0_f32;
+
+        let mut steady = UvcController::new(LegGeometry::rocky_mk1());
+        let (imu, walk, gains) = enter_catch(&mut steady);
+        steady.step_with_dcm(
+            0.005,
+            imu,
+            walk,
+            gains,
+            DcmSwingHint::default(),
+            capture_telemetry(v_des / omega, v_des, true),
+        );
+        let (steady_dxis, _) = steady.swing_targets();
+
+        let mut pushed = UvcController::new(LegGeometry::rocky_mk1());
+        let (imu, walk, gains) = enter_catch(&mut pushed);
+        pushed.step_with_dcm(
+            0.005,
+            imu,
+            walk,
+            gains,
+            DcmSwingHint::default(),
+            capture_telemetry(shove_v / omega, shove_v, true),
+        );
+        let (pushed_dxis, _) = pushed.swing_targets();
+
+        assert!(
+            pushed_dxis > steady_dxis,
+            "forward shove must place the foot farther forward ({pushed_dxis} vs {steady_dxis})"
+        );
+        assert!(
+            pushed_dxis < shove_v / omega,
+            "velocity feedback must keep the landing target behind the disturbed ξ"
+        );
+        assert!(pushed_dxis <= pushed.geometry().max_swing_dx);
+    }
+
+    /// Khadiv timing: a capture error beyond the usable foot margin shortens the
+    /// timer-driven step; the same clock must otherwise advance at the nominal rate.
+    #[test]
+    fn khadiv_timing_shortens_step_when_capture_error_exceeds_margin() {
+        let advance_phase = |telem: EstimatorTelemetry| -> f32 {
+            let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+            let (imu, walk, gains) = enter_catch(&mut ctrl);
+            let mut phase = UvcPhase::Idle;
+            for _ in 0..12 {
+                phase = ctrl
+                    .step_with_dcm(0.005, imu, walk, gains, DcmSwingHint::default(), telem)
+                    .phase;
+            }
+            assert_eq!(phase, UvcPhase::ActiveCatchStep);
+            // Non-walking telemetry reports progress*π, so larger phase == shorter T.
+            ctrl.gait_phase_rad
+        };
+
+        // ξ=0, v_com=0.25 -> p≈0.026 m, error < 0.028 m margin -> nominal T=0.18 s.
+        let nominal_phase = advance_phase(capture_telemetry(0.0, 0.25, true));
+        // ξ=0, v_com=2.0 -> p≈-0.18 m, error > margin -> T clamps to T_min=0.16 s.
+        let shortened_phase = advance_phase(capture_telemetry(0.0, 2.0, true));
+        assert!(
+            shortened_phase > nominal_phase + 0.02_f32,
+            "large capture error must shorten the step (phase {shortened_phase} vs {nominal_phase})"
+        );
+    }
+
+    /// Strict DOF partitioning: valid capture telemetry changes only the swing
+    /// target; the stance hip integrator is bit-identical to the invalid-DCM case,
+    /// and the capture law is gated off when `estimator_valid::DCM` is absent.
+    #[test]
+    fn capture_law_leaves_stance_hip_untouched_and_respects_dcm_validity_gate() {
+        let mut valid = UvcController::new(LegGeometry::rocky_mk1());
+        let mut invalid = UvcController::new(LegGeometry::rocky_mk1());
+        let (imu, walk, gains) = enter_catch(&mut valid);
+        let _ = enter_catch(&mut invalid);
+
+        // v_com == v_des -> capture error 0, so step timing is identical too.
+        let telem = capture_telemetry(0.0, 0.25, true);
+        let gated = capture_telemetry(0.0, 0.25, false);
+        let mut phase_valid = UvcPhase::Idle;
+        let mut phase_invalid = UvcPhase::Idle;
+        let mut out_valid = UvcStepOutput::default();
+        let mut out_invalid = UvcStepOutput::default();
+        for _ in 0..10 {
+            out_valid = valid.step_with_dcm(
+                0.005,
+                imu,
+                walk,
+                gains,
+                DcmSwingHint::default(),
+                telem,
+            );
+            out_invalid = invalid.step_with_dcm(
+                0.005,
+                imu,
+                walk,
+                gains,
+                DcmSwingHint::default(),
+                gated,
+            );
+            phase_valid = out_valid.phase;
+            phase_invalid = out_invalid.phase;
+        }
+        assert_eq!(phase_valid, UvcPhase::ActiveCatchStep);
+        assert_eq!(phase_invalid, UvcPhase::ActiveCatchStep);
+
+        assert_eq!(
+            out_valid.foot_dx_m, out_invalid.foot_dx_m,
+            "capture law must never write the stance sagittal hip"
+        );
+        assert_eq!(
+            out_valid.foot_dy_m, out_invalid.foot_dy_m,
+            "capture law must never write the stance lateral hip"
+        );
+        assert_ne!(
+            valid.swing_targets().0,
+            invalid.swing_targets().0,
+            "DCM validity gate must switch the capture law on/off"
+        );
     }
 }

@@ -2,7 +2,7 @@
 //! MCU Upper-Body Vertical Balance HUD, Combat Push Tests, and Quick Combat Moves).
 
 use egui::{Color32, CornerRadius, Margin, Pos2, Rect, RichText, Sense, Stroke, UiBuilder, Vec2, pos2, vec2};
-use rk_proto::{ControlMode, FaultFlags};
+use rk_proto::{ControlMode, FaultFlags, estimator_valid};
 use rk_viewport::ViewportOptions;
 
 use crate::{PushStrength, RockyStudioApp};
@@ -281,7 +281,208 @@ impl RockyStudioApp {
         });
         self.viewport_hud_rects[0] = att_resp.response.rect.expand(3.0);
 
-        // 2. Bottom-Left Floating HUD: Touch Walk Pad + Turn Buttons + Viewport Toggles
+        // Width of the right-hand column owned by the ViewCube / fall-recovery stack.
+        // Computed here so the estimator HUD can be placed strictly to its left.
+        let rec_w = 264.0_f32.min(vp_rect.width() - att_w - pad * 3.0);
+
+        // 2. Top-Center-Right Floating HUD: the shared estimator + gait telemetry the
+        //    phase-locked, capture-based controller consumes every tick. Right-aligned
+        //    against the ViewCube / recovery column without ever covering either.
+        let est_w = 250.0_f32.min(vp_rect.width() - att_w - rec_w - pad * 4.0);
+        if est_w >= 200.0 {
+            let est_left = vp_rect.right() - rec_w - pad * 2.0 - est_w;
+            let est_area =
+                Rect::from_min_size(pos2(est_left, vp_rect.top() + pad), vec2(est_w, 224.0));
+            let mut est_ui = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(est_area)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            est_ui.set_clip_rect(vp_rect);
+            let est_resp = hud_frame().show(&mut est_ui, |ui| {
+                ui.set_width(est_w - 20.0);
+                let telem = self.model.latest_telemetry;
+                let bal = telem.balance;
+                let est = telem.estimator;
+                let valid = est.valid_mask;
+                let com_ok = valid & estimator_valid::COM != 0;
+                let dcm_ok = valid & estimator_valid::DCM != 0;
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("GAIT / ESTIMATOR")
+                            .strong()
+                            .size(11.0)
+                            .color(Color32::from_rgb(138, 162, 192)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (badge, col) = if bal.walk_active {
+                            ("WALK", Color32::from_rgb(56, 208, 248))
+                        } else if bal.balance_active {
+                            ("BAL", Color32::from_rgb(74, 222, 128))
+                        } else {
+                            ("IDLE", Color32::from_rgb(156, 174, 198))
+                        };
+                        ui.label(RichText::new(badge).strong().size(10.5).color(col));
+                    });
+                });
+
+                ui.add_space(4.0);
+                let phase_deg = bal.gait_phase_rad.to_degrees().rem_euclid(360.0);
+                let phase_frac = if bal.gait_phase_rad.is_finite() {
+                    bal.gait_phase_rad.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU
+                } else {
+                    0.0
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("φ {phase_deg:5.0}°   {phase_frac:.2}"))
+                            .monospace()
+                            .size(11.5)
+                            .color(Color32::from_rgb(206, 222, 240)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let sup = if bal.support_foot == 1 {
+                            "SUP L"
+                        } else {
+                            "SUP R"
+                        };
+                        let col = if bal.support_foot == 1 {
+                            Color32::from_rgb(103, 232, 249)
+                        } else {
+                            Color32::from_rgb(251, 191, 36)
+                        };
+                        ui.label(
+                            RichText::new(sup)
+                                .strong()
+                                .monospace()
+                                .size(10.5)
+                                .color(col),
+                        );
+                    });
+                });
+                paint_gait_phase_bar(ui, phase_frac, bal.support_foot);
+
+                // No dedicated wire field for the *adapted* step duration yet, so show the
+                // commanded half-cycle period derived from the gait cadence.
+                let cadence = self.model.walk_cmd.cadence_hz;
+                let step_txt = if cadence.is_finite() && cadence > 0.1 {
+                    format!("{:.2}s", 0.5 / cadence)
+                } else {
+                    "—".to_string()
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "uvc {:>7}  ·  Tst {step_txt}",
+                        rk_proto::uvc_phase::label(bal.uvc_phase)
+                    ))
+                    .monospace()
+                    .size(10.0)
+                    .color(Color32::from_rgb(148, 166, 190)),
+                );
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(3.0);
+
+                let dim = Color32::from_rgb(112, 132, 156);
+                let bright = Color32::from_rgb(172, 194, 218);
+                let com_col = if com_ok { bright } else { dim };
+                let dcm_col = if dcm_ok { bright } else { dim };
+                ui.label(
+                    RichText::new(format!(
+                        "CoM {}/{}/{} mm",
+                        fmt_signed_mm(est.com_pos_m[0]),
+                        fmt_signed_mm(est.com_pos_m[1]),
+                        fmt_signed_mm(est.com_pos_m[2])
+                    ))
+                    .monospace()
+                    .size(10.5)
+                    .color(com_col),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Vel {}/{}/{} m/s",
+                        fmt_signed_ms(est.com_vel_m_s[0]),
+                        fmt_signed_ms(est.com_vel_m_s[1]),
+                        fmt_signed_ms(est.com_vel_m_s[2])
+                    ))
+                    .monospace()
+                    .size(10.5)
+                    .color(com_col),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "DCM {}/{} mm (lat/sag)",
+                        fmt_signed_mm(est.dcm_xy_m[0]),
+                        fmt_signed_mm(est.dcm_xy_m[1])
+                    ))
+                    .monospace()
+                    .size(10.5)
+                    .color(dcm_col),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "ZMP {}/{} mm",
+                        fmt_signed_mm(est.zmp_xy_m[0]),
+                        fmt_signed_mm(est.zmp_xy_m[1])
+                    ))
+                    .monospace()
+                    .size(10.5)
+                    .color(dcm_col),
+                );
+                let margin_col = if est.foot_margin_m < 0.0 {
+                    Color32::from_rgb(248, 113, 113)
+                } else {
+                    Color32::from_rgb(74, 222, 128)
+                };
+                ui.label(
+                    RichText::new(format!("Margin {}", fmt_signed_mm(est.foot_margin_m)))
+                        .monospace()
+                        .size(10.5)
+                        .color(if est.foot_margin_m.is_finite() {
+                            margin_col
+                        } else {
+                            dim
+                        }),
+                );
+
+                let contact = match est.contact_mask & 0b11 {
+                    0b01 => "R",
+                    0b10 => "L",
+                    0b11 => "R+L",
+                    _ => "—",
+                };
+                let mut channels = String::new();
+                if valid & estimator_valid::COM != 0 {
+                    channels.push('C');
+                }
+                if valid & estimator_valid::DCM != 0 {
+                    channels.push('D');
+                }
+                if valid & estimator_valid::GRF != 0 {
+                    channels.push('G');
+                }
+                if valid & estimator_valid::MOMENTUM != 0 {
+                    channels.push('M');
+                }
+                if valid & estimator_valid::LSM6DSV_OK != 0 {
+                    channels.push('I');
+                }
+                if channels.is_empty() {
+                    channels.push('—');
+                }
+                ui.label(
+                    RichText::new(format!("Contact {contact:<3} · Valid {channels}"))
+                        .monospace()
+                        .size(10.0)
+                        .color(Color32::from_rgb(126, 148, 174)),
+                );
+            });
+            self.viewport_hud_rects[4] = est_resp.response.rect.expand(3.0);
+        }
+
+        // 3. Bottom-Left Floating HUD: Touch Walk Pad + Turn Buttons + Viewport Toggles
         let walk_w = 246.0_f32.min(vp_rect.width() * 0.48).max(195.0);
         let walk_h = 204.0;
         let walk_area = Rect::from_min_size(
@@ -459,9 +660,8 @@ impl RockyStudioApp {
         });
         self.viewport_hud_rects[1] = walk_resp.response.rect.expand(3.0);
 
-        // 3. Mid-Right Floating HUD (cleanly BELOW the top-right ViewCube):
+        // 4. Mid-Right Floating HUD (cleanly BELOW the top-right ViewCube):
         //    Fall / Recovery status, consent-gated autonomous trigger, and directional fall test triggers.
-        let rec_w = 264.0_f32.min(vp_rect.width() - att_w - pad * 3.0);
         let rec_top = vp_rect.top() + 166.0; // Leaves the 138x158 top-right ViewCube 100% unobstructed
         let mut rec_bottom = vp_rect.top() + 166.0;
         if rec_w >= 190.0 && (vp_rect.bottom() - rec_top) >= 240.0 {
@@ -626,7 +826,7 @@ impl RockyStudioApp {
             self.viewport_hud_rects[3] = rec_resp.response.rect.expand(3.0);
         }
 
-        // 4. Bottom-Right Floating HUD: Combat Moves Quick Bar, Action Studio & Quick Balance Tuning
+        // 5. Bottom-Right Floating HUD: Combat Moves Quick Bar, Action Studio & Quick Balance Tuning
         let max_act_w = (vp_rect.width() - walk_w - pad * 3.0).max(160.0);
         let desired_act_w: f32 = if self.show_action_studio { 348.0 } else { 304.0 };
         let act_w = desired_act_w.min(max_act_w);
@@ -810,4 +1010,71 @@ fn paint_tilt_bar(ui: &mut egui::Ui, label: &str, deg: f32, max_deg: f32) {
             );
         }
     });
+}
+
+/// Signed metric-to-millimetres formatter for estimator rows. An invalid / absent
+/// wire channel renders as an em dash instead of a misleading physical `0.0`.
+fn fmt_signed_mm(v: f32) -> String {
+    if v.is_finite() {
+        format!("{:+5.0}", v * 1.0e3)
+    } else {
+        "    —".to_string()
+    }
+}
+
+/// Signed m/s formatter for the CoM velocity row (same invalid-channel convention).
+fn fmt_signed_ms(v: f32) -> String {
+    if v.is_finite() {
+        format!("{:+5.2}", v)
+    } else {
+        "    —".to_string()
+    }
+}
+
+/// Thin gait-phase progress bar with a mid-cycle support-swap tick.
+fn paint_gait_phase_bar(ui: &mut egui::Ui, phase_frac: f32, support_foot: u8) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 8.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::same(3), Color32::from_rgb(20, 28, 42));
+    p.line_segment(
+        [
+            pos2(rect.center().x, rect.top()),
+            pos2(rect.center().x, rect.bottom()),
+        ],
+        Stroke::new(1.0, Color32::from_rgb(76, 98, 128)),
+    );
+    let col = if support_foot == 1 {
+        Color32::from_rgb(103, 232, 249)
+    } else {
+        Color32::from_rgb(251, 191, 36)
+    };
+    if phase_frac.is_finite() {
+        let frac = phase_frac.clamp(0.0, 1.0);
+        let x1 = rect.left() + 1.0 + (rect.width() - 2.0) * frac;
+        if x1 > rect.left() + 1.0 {
+            p.rect_filled(
+                Rect::from_min_max(
+                    pos2(rect.left() + 1.0, rect.top() + 1.0),
+                    pos2(x1, rect.bottom() - 1.0),
+                ),
+                CornerRadius::same(2),
+                col,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod gait_hud_tests {
+    use super::{fmt_signed_mm, fmt_signed_ms};
+
+    #[test]
+    fn estimator_rows_format_finite_and_invalid_channels() {
+        assert_eq!(fmt_signed_mm(0.007), "   +7");
+        assert_eq!(fmt_signed_mm(-0.024), "  -24");
+        assert_eq!(fmt_signed_mm(f32::NAN), "    —");
+        assert_eq!(fmt_signed_ms(0.08), "+0.08");
+        assert_eq!(fmt_signed_ms(-1.5), "-1.50");
+        assert_eq!(fmt_signed_ms(f32::INFINITY), "    —");
+    }
 }

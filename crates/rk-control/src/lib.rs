@@ -528,9 +528,14 @@ impl DirectServoKernel {
             let tilt_exceeded = max_tilt >= self.balance_gains.fall_cutoff_rad;
 
             if uvc_engaged || tilt_exceeded || self.uvc.phase() == UvcPhase::FallTuck {
-                let uvc_out =
-                    self.uvc
-                        .step_with_dcm(dt, imu, walk, self.balance_gains, dcm_hint);
+                let uvc_out = self.uvc.step_with_dcm(
+                    dt,
+                    imu,
+                    walk,
+                    self.balance_gains,
+                    dcm_hint,
+                    estimator_telem,
+                );
 
                 if uvc_out.fall_cutoff_ready {
                     // Protective tuck complete -> drop torque & latch TILT_FALL_CUTOFF
