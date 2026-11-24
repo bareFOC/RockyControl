@@ -44,8 +44,9 @@ impl RockyStudioApp {
                 imu_available: telem.imu.available,
                 imu_pitch_rad: telem.imu.pitch_rad,
                 imu_roll_rad: telem.imu.roll_rad,
-                fall_event_active: telem.faults.contains(FaultFlags::TILT_FALL_CUTOFF)
-                    && telem.imu.available,
+                fall_event_active: self.fall_event_active
+                    || (telem.faults.contains(FaultFlags::TILT_FALL_CUTOFF)
+                        && telem.imu.available),
             },
         );
         self.apply_viewport_interaction(&interaction);
@@ -192,10 +193,7 @@ impl RockyStudioApp {
                     .min_size(Vec2::new(62.0, 28.0))
                     .corner_radius(CornerRadius::same(5));
                 if ui.add(reset_btn).clicked() {
-                    self.transport.reset_upright();
-                    if self.model.is_estop_active() {
-                        self.model.reset_estop();
-                    }
+                    self.manual_reset_upright_and_clear();
                     self.model.status_message = "Reset Rocky upright at 0 deg pitch/roll.".to_string();
                 }
             });
@@ -461,10 +459,186 @@ impl RockyStudioApp {
         });
         self.viewport_hud_rects[1] = walk_resp.response.rect.expand(3.0);
 
-        // 3. Bottom-Right Floating HUD: Combat Action Quick Bar & Quick Balance Tuning Popover
-        let act_w = 276.0_f32.min(vp_rect.width() - walk_w - pad * 3.0).max(160.0);
+        // 3. Mid-Right Floating HUD (cleanly BELOW the top-right ViewCube):
+        //    Fall / Recovery status, consent-gated autonomous trigger, and directional fall test triggers.
+        let rec_w = 264.0_f32.min(vp_rect.width() - att_w - pad * 3.0);
+        let rec_top = vp_rect.top() + 166.0; // Leaves the 138x158 top-right ViewCube 100% unobstructed
+        let mut rec_bottom = vp_rect.top() + 166.0;
+        if rec_w >= 190.0 && (vp_rect.bottom() - rec_top) >= 240.0 {
+            let rec_area = Rect::from_min_size(
+                pos2(vp_rect.right() - rec_w - pad, rec_top),
+                vec2(rec_w, 232.0),
+            );
+            let mut rec_ui = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(rec_area)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            rec_ui.set_clip_rect(vp_rect);
+            let rec_stroke = if self.fall_event_active {
+                Stroke::new(1.5, Color32::from_rgb(248, 113, 113))
+            } else {
+                Stroke::new(1.0, Color32::from_rgba_unmultiplied(52, 70, 96, 200))
+            };
+            let rec_frame = egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(13, 18, 28, 228))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::same(10))
+                .stroke(rec_stroke);
+
+            let rec_resp = rec_frame.show(&mut rec_ui, |ui| {
+                ui.set_width(rec_w - 20.0);
+                let (status, color) = match self.recovery_state {
+                    crate::RecoveryState::PlayingGetUp
+                    | crate::RecoveryState::ClearingFault
+                    | crate::RecoveryState::ArmingDrive => {
+                        ("RECOVERING", Color32::from_rgb(251, 191, 36))
+                    }
+                    _ if self.fall_event_active => {
+                        ("FALL DETECTED", Color32::from_rgb(248, 113, 113))
+                    }
+                    _ => ("STABLE", Color32::from_rgb(74, 222, 128)),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("FALL RECOVERY")
+                            .strong()
+                            .size(11.0)
+                            .color(Color32::from_rgb(138, 162, 192)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(status).strong().size(11.0).color(color));
+                    });
+                });
+                ui.label(
+                    RichText::new(format!(
+                        "Pose: {}  ·  {}",
+                        self.fall_orientation.label(),
+                        self.recovery_state.label()
+                    ))
+                    .monospace()
+                    .size(10.5)
+                    .color(Color32::from_rgb(172, 194, 218)),
+                );
+
+                if self.recovery_state == crate::RecoveryState::PlayingGetUp {
+                    if let Some(pb) = &self.model.playback {
+                        ui.add_space(4.0);
+                        let step_lbl = self
+                            .model
+                            .moves
+                            .get(pb.move_idx)
+                            .and_then(|mv| mv.keyframes.get(pb.active_keyframe))
+                            .map(|kf| kf.label.as_str())
+                            .unwrap_or("Standing up");
+                        ui.add(
+                            egui::ProgressBar::new(pb.progress.clamp(0.0, 1.0))
+                                .desired_height(13.0)
+                                .text(format!("{step_lbl} ({:.0}%)", pb.progress * 100.0)),
+                        );
+                    }
+                }
+
+                ui.add_space(3.0);
+                ui.checkbox(
+                    &mut self.auto_recovery_enabled,
+                    "Auto recovery (opt-in)",
+                );
+                ui.checkbox(&mut self.operator_confirmed, "Operator confirmed");
+                ui.add_space(3.0);
+
+                let can_get_up = self.fall_event_active
+                    && self.recovery_state == crate::RecoveryState::FallLatched;
+                let get_up_label = if can_get_up {
+                    format!("Get Up ({})", self.fall_orientation.label())
+                } else if self.recovery_state == crate::RecoveryState::PlayingGetUp {
+                    "Getting Up...".to_string()
+                } else {
+                    "Get Up (No Fall)".to_string()
+                };
+                let get_up = egui::Button::new(
+                    RichText::new(get_up_label)
+                        .strong()
+                        .size(12.0)
+                        .color(if can_get_up {
+                            Color32::WHITE
+                        } else {
+                            Color32::from_rgb(156, 174, 198)
+                        }),
+                )
+                .fill(if can_get_up {
+                    Color32::from_rgb(14, 132, 168)
+                } else {
+                    Color32::from_rgb(26, 36, 52)
+                })
+                .stroke(if can_get_up {
+                    Stroke::new(1.2, Color32::from_rgb(103, 232, 249))
+                } else {
+                    Stroke::NONE
+                })
+                .min_size(Vec2::new(ui.available_width(), 27.0))
+                .corner_radius(CornerRadius::same(5));
+                if ui.add_enabled(can_get_up, get_up).clicked() {
+                    self.operator_confirmed = true;
+                    self.get_up_requested = true;
+                    self.model.status_message = format!(
+                        "Get Up ({}) initiated — clearing fault and executing recovery sequence.",
+                        self.fall_orientation.label()
+                    );
+                }
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("SIM FALL")
+                            .strong()
+                            .size(9.5)
+                            .color(Color32::from_rgb(126, 148, 174)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 3.0;
+                        for (lbl, orient) in [
+                            ("R", rk_proto::FallOrientation::SideRight),
+                            ("L", rk_proto::FallOrientation::SideLeft),
+                            ("Back", rk_proto::FallOrientation::Supine),
+                            ("Front", rk_proto::FallOrientation::Prone),
+                        ] {
+                            let fb = egui::Button::new(RichText::new(lbl).size(10.0))
+                                .fill(Color32::from_rgb(54, 26, 32))
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(120, 48, 56)))
+                                .min_size(Vec2::new(0.0, 20.0))
+                                .corner_radius(CornerRadius::same(4));
+                            if ui
+                                .add_enabled(!self.fall_event_active, fb)
+                                .on_hover_text(format!(
+                                    "Simulate {} fall to test IMU alarm & get-up recovery",
+                                    orient.label()
+                                ))
+                                .clicked()
+                            {
+                                self.trigger_simulated_fall(orient);
+                            }
+                        }
+                    });
+                });
+            });
+            rec_bottom = rec_resp.response.rect.bottom();
+            self.viewport_hud_rects[3] = rec_resp.response.rect.expand(3.0);
+        }
+
+        // 4. Bottom-Right Floating HUD: Combat Moves Quick Bar, Action Studio & Quick Balance Tuning
+        let max_act_w = (vp_rect.width() - walk_w - pad * 3.0).max(160.0);
+        let desired_act_w: f32 = if self.show_action_studio { 348.0 } else { 304.0 };
+        let act_w = desired_act_w.min(max_act_w);
         if act_w >= 180.0 {
-            let pop_h = if self.show_quick_balance_tune { 226.0 } else { 78.0 };
+            let max_below_rec = (vp_rect.bottom() - rec_bottom - pad * 2.0).max(110.0);
+            let pop_h = if self.show_action_studio {
+                348.0_f32.min(max_below_rec).max(180.0)
+            } else if self.show_quick_balance_tune {
+                268.0_f32.min(max_below_rec).max(140.0)
+            } else {
+                104.0
+            };
             let act_area = Rect::from_min_size(
                 pos2(vp_rect.right() - act_w - pad, vp_rect.bottom() - pop_h - pad),
                 vec2(act_w, pop_h),
@@ -480,55 +654,93 @@ impl RockyStudioApp {
                 ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("COMBAT MOVES")
+                            RichText::new("ACTIONS & MOVES")
                                 .strong()
                                 .size(10.5)
                                 .color(Color32::from_rgb(138, 162, 192)),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
                             let tune_btn = egui::Button::new(
                                 RichText::new(if self.show_quick_balance_tune {
                                     "Hide UVC"
                                 } else {
                                     "Tune UVC"
                                 })
-                                .size(11.0),
+                                .size(10.5),
                             )
                             .fill(if self.show_quick_balance_tune {
                                 Color32::from_rgb(14, 116, 144)
                             } else {
                                 Color32::from_rgb(26, 36, 52)
                             })
-                            .min_size(Vec2::new(66.0, 22.0))
+                            .min_size(Vec2::new(60.0, 22.0))
                             .corner_radius(CornerRadius::same(4));
                             if ui.add(tune_btn).clicked() {
                                 self.show_quick_balance_tune = !self.show_quick_balance_tune;
+                                if self.show_quick_balance_tune {
+                                    self.show_action_studio = false;
+                                }
+                            }
+
+                            let studio_btn = egui::Button::new(
+                                RichText::new(if self.show_action_studio {
+                                    "Close Studio"
+                                } else {
+                                    "Action Studio"
+                                })
+                                .strong()
+                                .size(10.5)
+                                .color(if self.show_action_studio {
+                                    Color32::from_rgb(14, 18, 24)
+                                } else {
+                                    Color32::from_rgb(253, 224, 171)
+                                }),
+                            )
+                            .fill(if self.show_action_studio {
+                                Color32::from_rgb(245, 158, 11)
+                            } else {
+                                Color32::from_rgb(44, 34, 24)
+                            })
+                            .min_size(Vec2::new(82.0, 22.0))
+                            .corner_radius(CornerRadius::same(4));
+                            if ui.add(studio_btn).clicked() {
+                                self.show_action_studio = !self.show_action_studio;
+                                if self.show_action_studio {
+                                    self.show_quick_balance_tune = false;
+                                }
                             }
                         });
                     });
 
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
-                        let move_count = self.model.moves.len().min(4);
-                        for idx in 0..move_count {
-                            let name = self.model.moves[idx].name.clone();
-                            let b = egui::Button::new(RichText::new(name).strong().size(11.5))
-                                .min_size(Vec2::new(0.0, 28.0))
-                                .corner_radius(CornerRadius::same(5));
-                            if ui.add(b).clicked() {
-                                if self.model.requested_mode == ControlMode::Teach
-                                    && !self.model.is_estop_active()
-                                {
-                                    self.model.set_authority_mode(ControlMode::Drive);
+                    ui.add_space(5.0);
+
+                    if self.show_action_studio {
+                        self.render_action_studio_panel(ui, true);
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
+                            let move_count = self.model.moves.len().min(4);
+                            for idx in 0..move_count {
+                                let name = self.model.moves[idx].name.clone();
+                                let b = egui::Button::new(RichText::new(name).strong().size(11.5))
+                                    .min_size(Vec2::new(0.0, 26.0))
+                                    .corner_radius(CornerRadius::same(5));
+                                if ui.add(b).clicked() {
+                                    if self.model.requested_mode == ControlMode::Teach
+                                        && !self.model.is_estop_active()
+                                    {
+                                        self.model.set_authority_mode(ControlMode::Drive);
+                                    }
+                                    self.model.walk_cmd.walk_enabled = false;
+                                    self.model.play_move(idx);
                                 }
-                                self.model.walk_cmd.walk_enabled = false;
-                                self.model.play_move(idx);
                             }
-                        }
-                    });
+                        });
+                    }
 
                     if self.show_quick_balance_tune {
+                        ui.add_space(4.0);
                         ui.separator();
                         let mut gains = self.model.balance_gains;
                         let mut changed = false;
@@ -552,88 +764,6 @@ impl RockyStudioApp {
                 });
             });
             self.viewport_hud_rects[2] = act_resp.response.rect.expand(3.0);
-        }
-
-        // 4. Top-Right Floating HUD: Fall / Recovery status and consent controls.
-        //    Recovery is strictly opt-in: auto_recovery_enabled is OFF by default and
-        //    the watcher starts a sequence only with explicit operator confirmation.
-        let rec_w = 258.0_f32.min(vp_rect.width() - att_w - pad * 3.0);
-        if rec_w >= 190.0 {
-            let rec_area = Rect::from_min_size(
-                pos2(vp_rect.right() - rec_w - pad, vp_rect.top() + pad),
-                vec2(rec_w, 168.0),
-            );
-            let mut rec_ui = ui.new_child(
-                UiBuilder::new()
-                    .max_rect(rec_area)
-                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
-            );
-            rec_ui.set_clip_rect(vp_rect);
-            let rec_resp = hud_frame().show(&mut rec_ui, |ui| {
-                ui.set_width(rec_w - 20.0);
-                let (status, color) = if self.fall_event_active {
-                    ("FALL DETECTED", Color32::from_rgb(248, 113, 113))
-                } else {
-                    ("STABLE", Color32::from_rgb(74, 222, 128))
-                };
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("RECOVERY")
-                            .strong()
-                            .size(11.0)
-                            .color(Color32::from_rgb(138, 162, 192)),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(status).strong().size(11.0).color(color));
-                    });
-                });
-                ui.label(
-                    RichText::new(format!(
-                        "Orientation: {}  ·  {}",
-                        self.fall_orientation.label(),
-                        self.recovery_state.label()
-                    ))
-                    .monospace()
-                    .size(10.5)
-                    .color(Color32::from_rgb(172, 194, 218)),
-                );
-                ui.add_space(4.0);
-                ui.checkbox(
-                    &mut self.auto_recovery_enabled,
-                    "Auto recovery (opt-in)",
-                );
-                ui.checkbox(&mut self.operator_confirmed, "Operator confirmed");
-                ui.add_space(4.0);
-                let can_get_up = self.fall_event_active
-                    && self.recovery_state == crate::RecoveryState::FallLatched;
-                let get_up = egui::Button::new(
-                    RichText::new(if can_get_up { "Get Up" } else { "Get Up (no fall)" })
-                        .strong()
-                        .size(12.0),
-                )
-                .fill(if can_get_up {
-                    Color32::from_rgb(14, 116, 144)
-                } else {
-                    Color32::from_rgb(26, 36, 52)
-                })
-                .min_size(Vec2::new(ui.available_width(), 28.0))
-                .corner_radius(CornerRadius::same(5));
-                if ui.add(get_up).clicked() {
-                    // Explicit operator initiation: the watcher picks this up next frame
-                    // and still runs the full ordered ClearFaults -> Drive -> playback flow.
-                    self.operator_confirmed = true;
-                    self.get_up_requested = true;
-                    self.model.status_message =
-                        "Get Up requested — waiting for upright stance before recovery."
-                            .to_string();
-                }
-                ui.label(
-                    RichText::new("Open-loop keyframes · aborts on re-fall")
-                        .size(9.5)
-                        .color(Color32::from_rgb(118, 138, 162)),
-                );
-            });
-            self.viewport_hud_rects[3] = rec_resp.response.rect.expand(3.0);
         }
     }
 }

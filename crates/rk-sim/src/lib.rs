@@ -878,31 +878,89 @@ mod tests {
 
     #[test]
     fn recovery_progress_lifts_fallen_torso_back_to_upright() {
-        let mut plant = SimulatedServoPlant::new(21, [0.0; MAX_JOINTS]);
-        // Knock robot prone with torque off so it rests fallen (> 0.60 rad).
-        plant.apply_push_impulse(5.5, 0.0);
-        let mut fallen = plant.step_plant(0.016);
-        for _ in 0..80 {
-            fallen = plant.step_plant(0.016);
+        let cal = [JointCalibration {
+            min_rad: -2.6,
+            max_rad: 2.6,
+            ..Default::default()
+        }; 21];
+        let mut sim = CopperSimRunner::new(21, &cal, [0.0; MAX_JOINTS]);
+
+        let mut cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: (1u32 << 21) - 1,
+            speed_limit_pct: 100,
+            walk: WalkCmd {
+                walk_enabled: false,
+                balance_enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // 1. Warm up standing in Drive mode with default UVC balance enabled.
+        for i in 1..=30 {
+            cmd.seq = i;
+            let _ = sim.tick(0.016, &cmd);
         }
+
+        // 2. Inject a simulated prone fall shove -> must trip TILT_FALL_CUTOFF and settle prone.
+        sim.apply_push_impulse(6.0, 0.0);
+        let mut last = McuToHost::default();
+        for i in 31..=160 {
+            cmd.seq = i;
+            last = sim.tick(0.016, &cmd);
+        }
+        assert_eq!(last.active_mode, ControlMode::EStop);
+        assert!(last.faults.contains(FaultFlags::TILT_FALL_CUTOFF));
+        assert_eq!(
+            last.balance.fall_orientation,
+            rk_proto::fall_orientation::PRONE
+        );
         assert!(
-            fallen.imu.pitch_rad > 0.70,
-            "expected fallen prone pitch, got {}",
-            fallen.imu.pitch_rad
+            last.imu.pitch_rad > 0.66 && last.imu.pitch_rad < 1.32,
+            "expected fallen prone pitch in (0.66, 1.32), got {}",
+            last.imu.pitch_rad
         );
 
-        // Energize legs and sweep recovery_progress 0.0 -> 1.0.
-        plant.write_command(&RawServoCommand {
-            torque_mask: (1u32 << 21) - 1,
-            raw_target_rad: [0.0; MAX_JOINTS],
-        });
-        let mut last = fallen;
-        for step_idx in 0..=150 {
-            let progress = (step_idx as f32 / 150.0).min(1.0);
-            plant.set_recovery_progress(Some(progress));
-            last = plant.step_plant(0.016);
+        // 3. Temporarily raise fall_cutoff_rad to 1.35 and disable UVC balance, then ClearFaults.
+        let mut rec_gains = rk_proto::BalanceGains::default();
+        rec_gains.fall_cutoff_rad = 1.35;
+        cmd.mode = ControlMode::Teach;
+        cmd.walk.balance_enabled = false;
+        cmd.config = rk_proto::ConfigCmd::SetBalanceGains(rec_gains);
+        cmd.seq = 161;
+        let _ = sim.tick(0.016, &cmd);
+
+        cmd.config = rk_proto::ConfigCmd::ClearFaults;
+        cmd.seq = 162;
+        last = sim.tick(0.016, &cmd);
+        assert_eq!(last.active_mode, ControlMode::Teach);
+        assert!(!last.faults.contains(FaultFlags::TILT_FALL_CUTOFF));
+
+        // 4. Arm Drive and sweep recovery_progress 0.0 -> 1.0 -> must NOT re-trip and must lift upright.
+        cmd.config = rk_proto::ConfigCmd::None;
+        cmd.mode = ControlMode::Drive;
+        for step_idx in 0..=160 {
+            cmd.seq = 163 + step_idx;
+            let progress = (step_idx as f32 / 160.0).min(1.0);
+            sim.set_recovery_progress(Some(progress));
+            last = sim.tick(0.016, &cmd);
+            assert_eq!(
+                last.active_mode,
+                ControlMode::Drive,
+                "recovery must stay in Drive at step {step_idx} (pitch={}, faults={:?})",
+                last.imu.pitch_rad,
+                last.faults
+            );
         }
-        plant.set_recovery_progress(None);
+        sim.set_recovery_progress(None);
+
+        // 5. Restore nominal fall cutoff and return to Teach -> verify upright stance.
+        cmd.mode = ControlMode::Teach;
+        cmd.config = rk_proto::ConfigCmd::SetBalanceGains(rk_proto::BalanceGains::default());
+        cmd.seq = 400;
+        last = sim.tick(0.016, &cmd);
         assert!(
             last.imu.pitch_rad.abs() < 0.08 && last.imu.roll_rad.abs() < 0.08,
             "recovery progress must lift torso upright (pitch={}, roll={})",

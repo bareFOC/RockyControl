@@ -263,10 +263,17 @@ impl HumanoidViewport {
         self.orbit.advance(dt_sec);
 
         // 1. Interact with top-right 26-region ViewCube (dedicated camera orientation control)
-        let vc_frame = if !opts.show_view_cube || opts.hud_blocked {
+        let vc_frame = if !opts.show_view_cube {
             None
         } else {
-            interact_view_cube(ui, rect, &mut self.orbit, &mut self.view_cube, self.touch_mode)
+            interact_view_cube(
+                ui,
+                rect,
+                &mut self.orbit,
+                &mut self.view_cube,
+                self.touch_mode,
+                !opts.hud_blocked,
+            )
         };
         let cube_consumed = vc_frame.as_ref().is_some_and(|f| f.consumed);
 

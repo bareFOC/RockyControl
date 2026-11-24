@@ -206,11 +206,7 @@ impl RockyStudioApp {
                         .corner_radius(CornerRadius::same(5));
 
                         if ui.add(reset_btn).clicked() {
-                            if let Some(f) = self.transport.sim_faults_mut() {
-                                f.drop_heartbeat = false;
-                            }
-                            self.transport.reset_upright();
-                            self.model.reset_estop();
+                            self.manual_reset_upright_and_clear();
                         }
                     }
                 }
@@ -327,11 +323,7 @@ impl RockyStudioApp {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Reset Upright -> Teach").clicked() {
-                                if let Some(f) = self.transport.sim_faults_mut() {
-                                    f.drop_heartbeat = false;
-                                }
-                                self.transport.reset_upright();
-                                self.model.reset_estop();
+                                self.manual_reset_upright_and_clear();
                             }
                         });
                     });

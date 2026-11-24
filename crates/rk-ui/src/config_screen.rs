@@ -47,8 +47,9 @@ impl RockyStudioApp {
                 imu_available: telem.imu.available,
                 imu_pitch_rad: telem.imu.pitch_rad,
                 imu_roll_rad: telem.imu.roll_rad,
-                fall_event_active: telem.faults.contains(rk_proto::FaultFlags::TILT_FALL_CUTOFF)
-                    && telem.imu.available,
+                fall_event_active: self.fall_event_active
+                    || (telem.faults.contains(rk_proto::FaultFlags::TILT_FALL_CUTOFF)
+                        && telem.imu.available),
             },
         );
         self.apply_viewport_interaction(&interaction);
@@ -363,11 +364,13 @@ impl RockyStudioApp {
                     ui.set_min_size(vec2(drawer_w - 20.0, drawer_h - 20.0));
                     ui.set_max_size(vec2(drawer_w - 20.0, drawer_h - 20.0));
 
-                    // 3-Tab Header: Walk & Balance | Joints | Setup
+                    // 4-Tab Header: Balance | Actions | Joints | Setup
                     ui.horizontal(|ui| {
-                        let tab_w = ((ui.available_width() - 8.0) / 3.0).floor();
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let tab_w = ((ui.available_width() - 12.0) / 4.0).floor();
                         for tab in [
                             ConfigDrawerTab::BalanceGait,
+                            ConfigDrawerTab::Actions,
                             ConfigDrawerTab::Joints,
                             ConfigDrawerTab::Setup,
                         ] {
@@ -375,7 +378,7 @@ impl RockyStudioApp {
                             let btn = egui::Button::new(
                                 RichText::new(tab.label())
                                     .strong()
-                                    .size(11.5)
+                                    .size(11.0)
                                     .color(if active {
                                         Color32::WHITE
                                     } else {
@@ -399,6 +402,7 @@ impl RockyStudioApp {
 
                     egui::ScrollArea::vertical().show(ui, |ui| match self.config_drawer_tab {
                         ConfigDrawerTab::BalanceGait => self.render_balance_gait_tab(ui),
+                        ConfigDrawerTab::Actions => self.render_action_studio_panel(ui, false),
                         ConfigDrawerTab::Joints => self.render_calibration_panel(ui),
                         ConfigDrawerTab::Setup => self.render_setup_tab(ui),
                     });

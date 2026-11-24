@@ -309,7 +309,11 @@ impl RockyStudioApp {
                 ui.separator();
 
                 // Keyframe timeline list with one-click pose preview
-                let max_h = if compact { 122.0 } else { 210.0 };
+                let max_h = if compact {
+                    ui.available_height().clamp(52.0, 128.0)
+                } else {
+                    210.0
+                };
                 egui::ScrollArea::vertical()
                     .id_salt(if compact {
                         "action_studio_kf_compact"

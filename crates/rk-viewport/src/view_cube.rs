@@ -238,6 +238,7 @@ pub fn interact_view_cube(
     orbit: &mut OrbitState,
     state: &mut ViewCubeState,
     touch_mode: bool,
+    interactive: bool,
 ) -> Option<ViewCubeFrame> {
     let widget_size = if touch_mode { 138.0 } else { 118.0 };
     let margin = if touch_mode { 12.0 } else { 14.0 };
@@ -255,6 +256,30 @@ pub fn interact_view_cube(
     let scale = widget_size / 118.0;
     let center = pos2(box_rect.center().x, box_rect.top() + widget_size * 0.50);
     let cube_radius = 30.0 * scale;
+    let home_size = if touch_mode { 28.0 } else { 22.0 };
+    let home_rect = Rect::from_center_size(
+        center + vec2(-42.0, -40.0) * scale,
+        vec2(home_size, home_size),
+    );
+
+    if !interactive {
+        state.dragging_cube = false;
+        state.drag_accum_px = 0.0;
+        state.pressed_region_id = None;
+        let regions = build_view_cube_regions();
+        let visible = project_regions(&regions, &orbit.orientation, center, cube_radius);
+        return Some(ViewCubeFrame {
+            consumed: false,
+            scale,
+            box_rect,
+            home_rect,
+            home_hovered: false,
+            widget_hot: touch_mode,
+            hovered_id: None,
+            visible,
+            orientation: orbit.orientation,
+        });
+    }
 
     let (pointer_pos, primary_pressed, primary_down, primary_released, pointer_delta) =
         ui.ctx().input(|i| {
@@ -274,11 +299,6 @@ pub fn interact_view_cube(
     let mut consumed = false;
 
     // 1. Home button (top-left of cube)
-    let home_size = if touch_mode { 28.0 } else { 22.0 };
-    let home_rect = Rect::from_center_size(
-        center + vec2(-42.0, -40.0) * scale,
-        vec2(home_size, home_size),
-    );
     let home_resp = ui
         .interact(
             home_rect,
