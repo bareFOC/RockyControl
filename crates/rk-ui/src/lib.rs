@@ -27,7 +27,9 @@ use action_studio::ActionCategoryFilter;
 use craft_keymap::{Active, Bindable, Binding, Keymap, Scope, Scopes};
 use craft_ui::theme::WidgetPalette;
 use egui::{Color32, CornerRadius, Key, RichText, Stroke, Vec2};
-use mcp_bridge::McpUiState;
+pub use mcp_bridge::McpUiState;
+#[cfg(not(target_arch = "wasm32"))]
+pub use mcp_bridge::NativeMcpListenerStatus;
 use rk_link::{RobotTransport, SimTransport, TransportKind};
 use rk_model::{AssetBundle, StudioModel};
 use rk_fw_core::replay::ReplayVerification;
@@ -249,6 +251,9 @@ pub struct RockyStudioApp {
     pub(crate) saver: Box<dyn PlatformSaver>,
     pub(crate) selected_transport_ui: TransportKind,
     pub mcp: McpUiState,
+    /// Native-only consumer half of the HTTP→egui MCP bridge.
+    #[cfg(not(target_arch = "wasm32"))]
+    mcp_bridge_rx: Option<rk_mcp::McpBridgeRx>,
     /// Visual alarm / latch state for the most recent fall event.
     pub fall_event_active: bool,
     /// Classification captured from telemetry when the fall latched.
@@ -331,6 +336,8 @@ impl RockyStudioApp {
             saver,
             selected_transport_ui: TransportKind::SimKernel,
             mcp: McpUiState::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            mcp_bridge_rx: None,
             fall_event_active: false,
             fall_orientation: FallOrientation::Unknown,
             auto_recovery_enabled: false,
@@ -709,7 +716,9 @@ impl RockyStudioApp {
             self.active_screen = AppScreen::Dashboard;
         }
 
-        // 3b. Pump live Streamable HTTP MCP bridge requests into RockyStudioApp
+        // 3b. WASM polls the host bridge here. On native the bridge is drained
+        // from DesktopWrapper::logic so hidden windows still service requests.
+        #[cfg(target_arch = "wasm32")]
         self.pump_mcp_bridge(&ctx);
 
         // 4. Contextual Top Toolbar
@@ -1435,3 +1444,49 @@ mod fall_recovery_tests {
 #[cfg(test)]
 #[path = "e2e_fall_recovery_test.rs"]
 mod e2e_fall_recovery_test;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod native_mcp_bridge_tests {
+    use std::thread;
+    use std::time::Duration;
+
+    use egui::Context;
+    use rk_mcp::mcp_bridge_channel;
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn attached_bridge_replies_to_tools_list() {
+        let mut app = RockyStudioApp::new(Box::new(NoopSaver));
+        let (tx, rx) = mcp_bridge_channel(|| {});
+        app.attach_mcp_bridge(rx);
+
+        // `submit` blocks on the oneshot reply, so enqueue from a worker thread.
+        let worker = thread::spawn(move || {
+            tx.submit(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {},
+                }),
+                Duration::from_secs(5),
+            )
+        });
+
+        // One pump drains the queue, dispatches against the live app, and replies.
+        app.pump_mcp_bridge(&Context::default());
+
+        let reply = worker
+            .join()
+            .expect("bridge submit worker panicked")
+            .expect("tools/list reply")
+            .expect("tools/list reply body");
+        assert!(reply
+            .get("result")
+            .and_then(|r| r.get("tools"))
+            .and_then(serde_json::Value::as_array)
+            .is_some());
+    }
+}

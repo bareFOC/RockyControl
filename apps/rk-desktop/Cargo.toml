@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 rk-ui.workspace = true
+rk-mcp.workspace = true
 egui.workspace = true
 eframe = { workspace = true, features = ["x11", "wayland"] }
+glow.workspace = true
 craft-atomic.workspace = true
 craft-quit.workspace = true

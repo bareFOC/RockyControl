@@ -31,6 +31,36 @@ impl McpSnippetTab {
     }
 }
 
+/// Status of the native loopback HTTP listener started by `rk-desktop`.
+///
+/// This is reported by the platform wrapper; `rk-ui` never claims a listener is
+/// live unless the wrapper has actually bound and started one.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeMcpListenerStatus {
+    /// No listener was started (e.g. `--no-mcp`).
+    NotAvailable,
+    /// Listener is bound and serving on this `127.0.0.1:port` address.
+    Running { addr: String },
+    /// Startup failed; the failure is described by `message`.
+    Failed { message: String },
+    /// The listener was started and has since been stopped.
+    Stopped,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NativeMcpListenerStatus {
+    /// Short, human-readable endpoint status used in drawer labels.
+    pub fn endpoint_status_text(&self) -> String {
+        match self {
+            Self::NotAvailable => "Endpoint /mcp unavailable".to_string(),
+            Self::Running { addr } => format!("Endpoint http://{addr}/mcp live"),
+            Self::Failed { message } => format!("Endpoint /mcp unavailable ({message})"),
+            Self::Stopped => "Endpoint /mcp stopped".to_string(),
+        }
+    }
+}
+
 /// UI and bridge state for Rocky Studio's built-in MCP server.
 pub struct McpUiState {
     pub policy: McpPolicy,
@@ -38,6 +68,9 @@ pub struct McpUiState {
     pub drawer_rect: egui::Rect,
     pub snippet_tab: McpSnippetTab,
     pub bridge_connected: bool,
+    /// Set by `rk-desktop` once the native HTTP listener has started (or failed).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub native_listener_status: NativeMcpListenerStatus,
     pub activity: VecDeque<McpActivityEntry>,
     pub mcp_walk_override: Option<(f32, f32, f32, bool)>,
     pub test_preset_idx: usize,
@@ -56,6 +89,8 @@ impl Default for McpUiState {
             drawer_rect: egui::Rect::NOTHING,
             snippet_tab: McpSnippetTab::Http,
             bridge_connected: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            native_listener_status: NativeMcpListenerStatus::NotAvailable,
             activity: VecDeque::with_capacity(MAX_ACTIVITY_ENTRIES),
             mcp_walk_override: None,
             test_preset_idx: 0,
@@ -69,6 +104,37 @@ impl Default for McpUiState {
 }
 
 impl McpUiState {
+    /// Honest endpoint status text for the current platform, used by the drawer.
+    pub fn endpoint_status(&self) -> String {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.bridge_connected {
+                "Endpoint /mcp live".to_string()
+            } else {
+                "Endpoint /mcp disconnected".to_string()
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.native_listener_status.endpoint_status_text()
+        }
+    }
+
+    /// URL advertised in setup snippets; uses the actual bound address on native.
+    pub fn http_url(&self) -> String {
+        #[cfg(target_arch = "wasm32")]
+        {
+            current_mcp_http_url()
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            match &self.native_listener_status {
+                NativeMcpListenerStatus::Running { addr } => format!("http://{addr}/mcp"),
+                _ => current_mcp_http_url(),
+            }
+        }
+    }
+
     pub fn set_enabled(&mut self, enabled: bool) {
         if self.policy.enabled != enabled {
             self.policy.enabled = enabled;
@@ -239,8 +305,17 @@ mod wasm_bridge {
 }
 
 impl RockyStudioApp {
+    /// Attaches the native bridge receiver. Must be called on the egui thread;
+    /// the native platform wrapper drains it from `App::logic` so requests are
+    /// also serviced while the window is hidden.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn attach_mcp_bridge(&mut self, rx: rk_mcp::McpBridgeRx) {
+        self.mcp_bridge_rx = Some(rx);
+    }
+
     /// Pumps pending live Streamable HTTP MCP calls into `RockyStudioApp` and syncs policy toggles.
-    pub(crate) fn pump_mcp_bridge(&mut self, ctx: &egui::Context) {
+    /// On native this is driven by `DesktopWrapper::logic`, not by `update_frame`.
+    pub fn pump_mcp_bridge(&mut self, ctx: &egui::Context) {
         #[cfg(target_arch = "wasm32")]
         {
             if self.mcp.config_dirty {
@@ -272,6 +347,17 @@ impl RockyStudioApp {
         {
             let _ = ctx;
             self.mcp.config_dirty = false;
+            // Collect requests first so the mutable borrow of `mcp_bridge_rx`
+            // ends before `dispatch_json_rpc` borrows the whole app.
+            let requests = self
+                .mcp_bridge_rx
+                .as_mut()
+                .map(rk_mcp::McpBridgeRx::try_recv_all)
+                .unwrap_or_default();
+            for req in requests {
+                let response = dispatch_json_rpc(self, req.message);
+                let _ = req.reply.send(response);
+            }
         }
     }
 

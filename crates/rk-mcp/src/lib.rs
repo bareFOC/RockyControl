@@ -11,6 +11,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod bridge;
 pub mod headless;
 pub mod host;
 #[cfg(not(target_arch = "wasm32"))]
@@ -19,8 +21,15 @@ pub mod schema;
 pub mod tools;
 
 pub use craft_mcp_server::{Info, Options, Server};
+#[cfg(not(target_arch = "wasm32"))]
+pub use bridge::{
+    BridgeError, DEFAULT_BRIDGE_REPLY_TIMEOUT, McpBridgeRequest, McpBridgeRx, McpBridgeTx,
+    mcp_bridge_channel,
+};
 pub use headless::{AutomationRoots, HeadlessHost};
 pub use host::{McpActivityEntry, McpCallOutcome, McpHost, McpPolicy};
+#[cfg(not(target_arch = "wasm32"))]
+pub use http_server::{HttpServerHandle, serve_http, spawn_http_bridge};
 pub use tools::{RockyMcpTools, dispatch_json_rpc, server_info, server_options};
 
 /// Tests that step the simulator share the process-global mock clock, so they

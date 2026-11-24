@@ -5,7 +5,7 @@ use rk_mcp::McpCallOutcome;
 use serde_json::json;
 
 use crate::RockyStudioApp;
-use crate::mcp_bridge::{McpSnippetTab, current_mcp_http_url};
+use crate::mcp_bridge::McpSnippetTab;
 
 const QUICK_TEST_PRESETS: &[(&str, &str)] = &[
     ("telemetry_snapshot", "Read Telemetry"),
@@ -81,11 +81,17 @@ impl RockyStudioApp {
                         });
 
                         let sub = if !enabled {
-                            "Autonomous agent tools disabled"
-                        } else if armed {
-                            "Endpoint /mcp live · Drive ARMED (E-Stop overrides)"
+                            "Autonomous agent tools disabled".to_string()
                         } else {
-                            "Endpoint /mcp live · Safe Teach mode (no auth required)"
+                            format!(
+                                "{} · {}",
+                                self.mcp.endpoint_status(),
+                                if armed {
+                                    "Drive ARMED (E-Stop overrides)"
+                                } else {
+                                    "Safe Teach mode (no auth required)"
+                                }
+                            )
                         };
                         ui.label(
                             RichText::new(sub)
@@ -143,7 +149,7 @@ impl RockyStudioApp {
                             let next = !enabled;
                             self.mcp.set_enabled(next);
                             self.model.status_message = if next {
-                                "MCP Agent Access enabled (/mcp active).".to_string()
+                                format!("MCP Agent Access enabled · {}.", self.mcp.endpoint_status())
                             } else {
                                 "MCP Agent Access disabled. External agent calls will be rejected."
                                     .to_string()
@@ -212,9 +218,10 @@ impl RockyStudioApp {
                             });
                         });
                         ui.label(
-                            RichText::new(
-                                "craft-mcp-server (MCP 2025-06-18) · Live 3D viewport sync · No auth required",
-                            )
+                            RichText::new(format!(
+                                "craft-mcp-server (MCP 2025-06-18) · {} · No auth required",
+                                self.mcp.endpoint_status()
+                            ))
                             .size(11.0)
                             .color(Color32::from_rgb(138, 158, 184)),
                         );
@@ -305,7 +312,7 @@ impl RockyStudioApp {
                                         if ui.small_button(copy_lbl).clicked() {
                                             let snippet = build_snippet(
                                                 self.mcp.snippet_tab,
-                                                &current_mcp_http_url(),
+                                                &self.mcp.http_url(),
                                             );
                                             ui.ctx().copy_text(snippet);
                                             self.mcp.copied_notice_until = self.sim_time_sec + 2.0;
@@ -345,7 +352,7 @@ impl RockyStudioApp {
                                 });
                                 ui.add_space(4.0);
                                 let snippet_text =
-                                    build_snippet(self.mcp.snippet_tab, &current_mcp_http_url());
+                                    build_snippet(self.mcp.snippet_tab, &self.mcp.http_url());
                                 egui::Frame::new()
                                     .fill(Color32::from_rgb(10, 14, 22))
                                     .corner_radius(CornerRadius::same(6))
@@ -523,7 +530,11 @@ impl RockyStudioApp {
             3 => self.run_inline_mcp_tool("mode_set", json!({ "mode": "drive" })),
             4 => self.run_inline_mcp_tool(
                 "sim_push_shove",
-                json!({ "strength": "shove", "direction": "front" }),
+                json!({
+                    "pitch_impulse_rad_s": self.push_strength.impulse_rad_s(),
+                    "roll_impulse_rad_s": -0.9,
+                    "step_ticks": 260,
+                }),
             ),
             5 => self.run_inline_mcp_tool("safety_estop", json!({})),
             _ => {}
