@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 
-use rk_link::{RobotTransport, SimTransport, TransportKind};
+use rk_link::{FIXED_CONTROL_STEP_SEC, RobotTransport, SimTransport, TransportKind};
 use rk_model::{AssetBundle, StudioModel};
 use rk_proto::ControlMode;
 
@@ -239,11 +239,20 @@ impl McpHost for HeadlessHost {
     }
 
     fn step_ticks(&mut self, ticks: usize, dt_sec: f32) {
-        for _ in 0..ticks {
-            let pkt = self.model.build_next_host_packet(dt_sec);
-            if let Some(telem) = self.transport.step_exchange(dt_sec, &pkt) {
-                self.model.ingest_telemetry(telem);
-            }
+        if ticks == 0 {
+            return;
+        }
+        // One `step_fixed` call keeps a single deterministic harness/executor
+        // alive for all `ticks`. Stepping one tick at a time would spawn one
+        // executor per tick against the process-global Embassy mock clock and
+        // leave stale timer wakers behind. Advance playback by the same total
+        // time as the old per-tick packet building.
+        let pkt = self.model.build_next_host_packet(dt_sec * ticks as f32);
+        if let Some(telem) = self
+            .transport
+            .step_fixed(ticks, &pkt, FIXED_CONTROL_STEP_SEC * ticks as f32)
+        {
+            self.model.ingest_telemetry(telem);
         }
     }
 
@@ -293,6 +302,7 @@ impl McpHost for HeadlessHost {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::test_support::TEST_LOCK;
 
     #[test]
     fn automation_roots_confine_paths_and_block_traversal() {
@@ -310,5 +320,32 @@ mod tests {
 
         let _ = std::fs::remove_file(&inside);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn step_ticks_records_fixed_5ms_ticks_and_keeps_augmented_telemetry() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
+        host.connect(TransportKind::SimKernel).expect("sim connect");
+
+        host.transport_mut().start_recording();
+        host.step_ticks(20, 0.01);
+        let log = host
+            .transport_mut()
+            .stop_recording()
+            .expect("fixed ticks were recorded");
+
+        assert_eq!(log.ticks.len(), 20);
+        for pair in log.ticks.windows(2) {
+            assert_eq!(pair[0].dt_sec, FIXED_CONTROL_STEP_SEC);
+            assert_eq!(pair[1].now_ms - pair[0].now_ms, 5);
+        }
+        assert_eq!(log.ticks.last().unwrap().dt_sec, FIXED_CONTROL_STEP_SEC);
+
+        // Recorded ticks stay kernel-exact; the telemetry returned to the host is
+        // still augmented with the plant's WORLD/GRF channels.
+        let valid = host.model().latest_telemetry.estimator.valid_mask;
+        assert_ne!(valid & rk_proto::estimator_valid::WORLD, 0);
+        assert_ne!(valid & rk_proto::estimator_valid::GRF, 0);
     }
 }

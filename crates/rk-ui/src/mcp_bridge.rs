@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-use rk_link::{RobotTransport, TransportKind};
+use rk_link::{FIXED_CONTROL_STEP_SEC, RobotTransport, TransportKind};
 use rk_mcp::{McpActivityEntry, McpHost, McpPolicy, dispatch_json_rpc};
 use rk_model::{AssetBundle, StudioModel};
 use rk_proto::{ModelRequest, ModelResponse};
@@ -469,11 +469,19 @@ impl McpHost for RockyStudioApp {
     }
 
     fn step_ticks(&mut self, ticks: usize, dt_sec: f32) {
-        for _ in 0..ticks {
-            let pkt = self.model.build_next_host_packet(dt_sec);
-            if let Some(telem) = self.transport.step_exchange(dt_sec, &pkt) {
-                self.model.ingest_telemetry(telem);
-            }
+        if ticks == 0 {
+            return;
+        }
+        // Single batched step_fixed call: one deterministic harness/executor for
+        // all ticks (N separate calls would corrupt the global mock timer queue).
+        // Advance playback by the same total time as the old per-tick path.
+        let pkt = self.model.build_next_host_packet(dt_sec * ticks as f32);
+        if let Some(telem) = self.transport.step_fixed(
+            ticks,
+            &pkt,
+            (ticks as f32) * FIXED_CONTROL_STEP_SEC,
+        ) {
+            self.model.ingest_telemetry(telem);
         }
     }
 

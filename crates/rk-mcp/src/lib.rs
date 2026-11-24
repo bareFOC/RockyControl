@@ -22,3 +22,11 @@ pub use craft_mcp_server::{Info, Options, Server};
 pub use headless::{AutomationRoots, HeadlessHost};
 pub use host::{McpActivityEntry, McpCallOutcome, McpHost, McpPolicy};
 pub use tools::{RockyMcpTools, dispatch_json_rpc, server_info, server_options};
+
+/// Tests that step the simulator share the process-global mock clock, so they
+/// must serialize here. The fixed-step path no longer resets that clock, which
+/// would strand the persistent control task's timer alarm.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}

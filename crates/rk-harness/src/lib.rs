@@ -119,6 +119,15 @@ impl DeterministicHarness {
         (0..n).map(|_| self.step()).sum()
     }
 
+    /// Whether the executor has been started (first ticker registration done).
+    ///
+    /// Clock resets are only safe before the first `step()`/`start()`: once a
+    /// task has registered an alarm against the process-global `MockDriver`,
+    /// resetting the clock strands that alarm and its waker forever.
+    pub fn is_started(&self) -> bool {
+        self.started
+    }
+
     /// Current simulated time.
     pub fn now(&self) -> Instant {
         Instant::now()

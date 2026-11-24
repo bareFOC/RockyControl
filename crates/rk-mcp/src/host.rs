@@ -73,6 +73,12 @@ pub trait McpHost {
 
     fn apply_joint_angle(&mut self, joint_idx: usize, rad: f32) -> Result<(), String>;
     fn set_walk_override(&mut self, vx: f32, vy: f32, yaw_rate: f32, enabled: bool);
+    /// Advances the simulation by `ticks` deterministic fixed 5 ms control steps
+    /// (200 Hz), matching the GUI's shared fixed-step control path.
+    ///
+    /// `dt_sec` is the caller-provided per-tick value used to build the host
+    /// packet (`dt_sec * ticks` advances action playback by the same total time);
+    /// it does not change the fixed 5 ms control tick duration.
     fn step_ticks(&mut self, ticks: usize, dt_sec: f32);
 
     fn policy(&self) -> McpPolicy;

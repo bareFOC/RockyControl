@@ -193,19 +193,11 @@ impl SimTransport {
             cmds.extend(std::iter::repeat(later).take(steps - 1));
         }
 
-        // `run_harness` takes ownership so the runner can be borrowed 'static by
-        // the Embassy task. Swap in a throwaway runner and move the real state
-        // through the harness, then reclaim it (same pattern as `tick()`'s
-        // `mem::replace` of its `ControlTask`).
-        let kernel = self.runner.task.kernel();
-        let placeholder = CopperSimRunner::new(
-            kernel.joint_count(),
-            kernel.calibration(),
-            *self.runner.plant.raw_angles(),
-        );
-        let real = std::mem::replace(&mut self.runner, placeholder);
-        let (runner, telem) = real.run_harness_continuous(steps, &cmds);
-        self.runner = runner;
+        // The runner owns one persistent executor + spawned control task for its
+        // whole lifetime. Each call only queues commands and advances that same
+        // task; no new executor or task is created against the process-global
+        // mock clock, and kernel state / tick index keep advancing.
+        let telem = self.runner.step_harness(steps, &cmds);
 
         if dropped { None } else { Some(telem) }
     }

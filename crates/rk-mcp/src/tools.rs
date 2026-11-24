@@ -1167,14 +1167,18 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
                 let mut peak_roll_rad = 0.0_f32;
                 let mut saw_catch_step = false;
                 if ticks > 0 && self.host.is_connected() {
-                    for _ in 0..ticks {
-                        self.host.step_ticks(1, 0.01);
+                    // Keep each fixed-step run under the 100 ms deadman window;
+                    // one packet is repeated for every tick in a run.
+                    const SHOVE_BATCH_TICKS: usize = 19;
+                    let mut remaining = ticks;
+                    while remaining > 0 {
+                        let batch = remaining.min(SHOVE_BATCH_TICKS);
+                        self.host.step_ticks(batch, 0.01);
                         let t = &self.host.model().latest_telemetry;
                         peak_pitch_rad = peak_pitch_rad.max(t.imu.pitch_rad.abs());
                         peak_roll_rad = peak_roll_rad.max(t.imu.roll_rad.abs());
-                        if t.balance.uvc_phase == uvc_phase::ACTIVE_CATCH_STEP {
-                            saw_catch_step = true;
-                        }
+                        saw_catch_step |= t.balance.uvc_phase == uvc_phase::ACTIVE_CATCH_STEP;
+                        remaining -= batch;
                     }
                 }
                 self.ok_json(
@@ -1289,6 +1293,7 @@ mod tests {
     use super::*;
     use crate::headless::{AutomationRoots, HeadlessHost};
     use crate::host::McpPolicy;
+    use crate::test_support::TEST_LOCK;
 
     #[test]
     fn mcp_lifecycle_resources_templates_prompts_and_completions_work() {
@@ -1338,6 +1343,7 @@ mod tests {
 
     #[test]
     fn guarded_autonomy_blocks_unarmed_drive_and_estop_disarms_drive() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
         let _ = dispatch_json_rpc(
             &mut host,
@@ -1364,7 +1370,9 @@ mod tests {
         assert_eq!(host.model().requested_mode, ControlMode::Drive);
 
         // Warm up UVC ReadyWatch and inject shove
-        host.step_ticks(30, 0.01);
+        for _ in 0..3 {
+            host.step_ticks(10, 0.01);
+        }
         let shove = dispatch_json_rpc(
             &mut host,
             json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "sim_push_shove", "arguments": {"pitch_impulse_rad_s": 1.5, "roll_impulse_rad_s": -0.9, "step_ticks": 260}}}),
@@ -1380,6 +1388,46 @@ mod tests {
         );
         assert!(host.model().is_estop_active());
         assert!(!host.policy().drive_armed);
+    }
+
+    #[test]
+    fn mcp_replay_is_bit_exact_after_fixed_steps() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
+
+        let connect = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "robot_connect", "arguments": {"transport": "sim"}}}),
+        )
+        .expect("connect reply");
+        assert!(connect["result"]["isError"].is_null());
+
+        let start = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "recording_control", "arguments": {"action": "start"}}}),
+        )
+        .expect("recording start reply");
+        assert!(start["result"]["isError"].is_null());
+
+        host.step_ticks(80, 0.005);
+
+        let stop = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "recording_control", "arguments": {"action": "stop"}}}),
+        )
+        .expect("recording stop reply");
+        let stop_body: Value = serde_json::from_str(stop["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(stop_body["recorded_ticks"], 80);
+
+        let verify = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "recording_control", "arguments": {"action": "verify_replay"}}}),
+        )
+        .expect("verify replay reply");
+        let body: Value = serde_json::from_str(verify["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["exact_match"], true, "replay result: {body}");
+        assert_eq!(body["matched_ticks"], body["total_ticks"]);
+        assert_eq!(body["total_ticks"], 80);
     }
 
     #[test]

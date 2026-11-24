@@ -5,7 +5,9 @@
 //! verifies exact output parity under replay.
 
 use core::ops::{Deref, DerefMut};
+use core::ptr::NonNull;
 
+use embassy_executor::raw;
 use embassy_time::{Duration, Instant, Ticker};
 use rk_control::{
     JointCalibration, RawServoCommand, RawServoFeedback, com_fk::compute_state,
@@ -1108,6 +1110,10 @@ pub struct SimRobotIo {
     host_decode_errors: u64,
     recording: bool,
     recorded_log: Option<CopperReplayLog>,
+    /// `tick_index` of the first tick in the current recording. The persistent
+    /// control task keeps its kernel across calls, so recorded indices are
+    /// rebased to zero to keep each replay log self-contained.
+    record_tick_base: Option<u64>,
     max_recorded_ticks: usize,
     mcu_model_info: ModelInfo,
     mcu_model_blob: Vec<u8>,
@@ -1142,6 +1148,7 @@ impl SimRobotIo {
             host_decode_errors: 0,
             recording: false,
             recorded_log: None,
+            record_tick_base: None,
             max_recorded_ticks: 2400,
             mcu_model_info,
             mcu_model_blob,
@@ -1220,6 +1227,7 @@ impl SimRobotIo {
 
     pub fn start_recording(&mut self) {
         self.recording = true;
+        self.record_tick_base = None;
         self.recorded_log = Some(CopperReplayLog {
             version: 1,
             joint_count: self.task.kernel().joint_count(),
@@ -1432,7 +1440,13 @@ impl RobotIo for SimRobotIo {
         if self.recording {
             if let Some(log) = self.recorded_log.as_mut() {
                 if log.ticks.len() < self.max_recorded_ticks {
-                    log.ticks.push(*tick);
+                    // Replay verification starts a fresh `ControlTask` at index
+                    // zero. Rebase the persistent task's running index so a log
+                    // recorded across many fixed-step calls stays replayable.
+                    let base = *self.record_tick_base.get_or_insert(tick.tick_index);
+                    let mut recorded = *tick;
+                    recorded.tick_index = tick.tick_index.saturating_sub(base);
+                    log.ticks.push(recorded);
                 }
             }
         }
@@ -1441,25 +1455,110 @@ impl RobotIo for SimRobotIo {
 
 /// Future type spawned into the deterministic harness executor. A boxed future
 /// is used instead of `#[embassy_executor::task]` because an infinite `#[task]`
-/// never releases its static pool slot: the next harness run would panic with
-/// `SpawnError::Busy`. A fresh `raw::TaskStorage` per run is reclaimed below.
+/// never releases its static pool slot. The storage is created once per session
+/// (see [`CopperSimRunner::new`]) and deliberately never reclaimed: the
+/// process-global `MockDriver` keeps a waker for the task's periodic alarm, so
+/// freeing either the task or its IO while the alarm is pending would leave a
+/// dangling waker in the timer queue.
 type HarnessFuture = core::pin::Pin<Box<dyn core::future::Future<Output = ()> + 'static>>;
 
-/// Public simulation runner. All methods and fields (most notably `plant`) are
-/// reached by auto-deref to [`SimRobotIo`], preserving the historic API used by
-/// `rk-link`, the UI and existing tests.
-pub struct CopperSimRunner(pub SimRobotIo);
+/// Raw IO handle handed to the long-lived control task.
+///
+/// The task owns only a pointer, not a `&'static mut SimRobotIo`: the runner
+/// needs `&mut` access to the same IO between polls (fault injection, replay
+/// recording, command handoff). A raw pointer avoids a long-lived exclusive
+/// reference inside the future that would alias the runner's accesses. All
+/// dereferences happen strictly inside `poll`, which this executor drives
+/// synchronously and never concurrently with the runner.
+struct PersistentIoPtr(*mut SimRobotIo);
+
+impl RobotIo for PersistentIoPtr {
+    async fn wait_tick(&mut self) {
+        // SAFETY: only this session's executor polls the future, and it is never
+        // polled while the runner holds a `&mut` to the same IO.
+        unsafe { (&mut *self.0).wait_tick().await }
+    }
+
+    fn now_ms(&self) -> u32 {
+        unsafe { (&*self.0).now_ms() }
+    }
+
+    fn dt_sec(&self) -> f32 {
+        unsafe { (&*self.0).dt_sec() }
+    }
+
+    fn joint_count(&self) -> usize {
+        unsafe { (&*self.0).joint_count() }
+    }
+
+    fn calibration(&self) -> [JointCalibration; MAX_JOINTS] {
+        unsafe { (&*self.0).calibration() }
+    }
+
+    fn take_cmd(&mut self) -> Option<HostToMcu> {
+        unsafe { (&mut *self.0).take_cmd() }
+    }
+
+    fn wire_error_counts(&self) -> (u16, u16) {
+        unsafe { (&*self.0).wire_error_counts() }
+    }
+
+    fn read_feedback(&mut self, dt_sec: f32) -> RawServoFeedback {
+        unsafe { (&mut *self.0).read_feedback(dt_sec) }
+    }
+
+    fn write_command(&mut self, cmd: &RawServoCommand) {
+        unsafe { (&mut *self.0).write_command(cmd) }
+    }
+
+    fn publish_telemetry(&mut self, telem: McuToHost) {
+        unsafe { (&mut *self.0).publish_telemetry(telem) }
+    }
+
+    fn record_tick(&mut self, tick: &ControlTick) {
+        unsafe { (&mut *self.0).record_tick(tick) }
+    }
+
+    fn post_tick(&mut self, now_ms: u32) {
+        unsafe { (&mut *self.0).post_tick(now_ms) }
+    }
+}
+
+/// Public simulation runner. One instance owns exactly one deterministic
+/// Embassy executor and one spawned shared control task for its whole lifetime.
+/// Repeated fixed-step calls reuse them instead of creating a fresh executor
+/// against the process-global `embassy_time::MockDriver`.
+///
+/// All methods and fields (most notably `plant`) are reached by auto-deref to
+/// [`SimRobotIo`], preserving the historic API used by `rk-link` and tests.
+pub struct CopperSimRunner {
+    io: NonNull<SimRobotIo>,
+    harness: DeterministicHarness,
+    // Kept alive for the session; see `HarnessFuture` docs for why it is never
+    // reclaimed in `Drop`.
+    _storage: &'static raw::TaskStorage<HarnessFuture>,
+}
+
+// SAFETY: Embassy's `raw::Executor` and our raw IO pointer are deliberately
+// !Send/!Sync because they must never be *polled* concurrently. This runner
+// is owned by exactly one `SimTransport` (itself kept behind the MCP server's
+// state mutex), and every interaction — including `harness.step_n` — requires
+// `&mut self`, so no two threads can poll the executor or touch the IO at the
+// same time. Moving the owner between threads is therefore safe: the executor
+// and IO heap allocations stay put and are never reclaimed while an alarm may
+// still reference them.
+unsafe impl Send for CopperSimRunner {}
 
 impl Deref for CopperSimRunner {
     type Target = SimRobotIo;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        unsafe { self.io.as_ref() }
     }
 }
 
 impl DerefMut for CopperSimRunner {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        unsafe { self.io.as_mut() }
     }
 }
 
@@ -1469,70 +1568,84 @@ impl CopperSimRunner {
         initial_cal: &[JointCalibration],
         initial_raw_pose: [f32; MAX_JOINTS],
     ) -> Self {
-        Self(SimRobotIo::new(joint_count, initial_cal, initial_raw_pose))
-    }
-
-    /// Drives the **shared async control task** through `rk-harness`'s
-    /// deterministic Embassy executor for exactly `steps` 5 ms ticks.
-    ///
-    /// `host_cmds` are queued in order (one per tick, `None` afterwards so the
-    /// deadman watchdog behaves as on hardware). Returns the updated runner and
-    /// the last telemetry frame decoded on the simulated host side.
-    /// Reset the global deterministic clock. Only for tests / fresh sessions;
-    /// the interactive app must NOT call this between frames.
-    pub fn reset_mock_clock(&self) {
-        embassy_time::MockDriver::get().reset();
-    }
-
-    pub fn run_harness(mut self, steps: usize, host_cmds: &[HostToMcu]) -> (Self, McuToHost) {
-        self.run_harness_impl(steps, host_cmds, true)
-    }
-
-    /// Like [`Self::run_harness`] but does NOT reset the global mock clock —
-    /// used by the interactive app so simulated time advances continuously
-    /// across frames instead of restarting at 0 every frame.
-    pub fn run_harness_continuous(mut self, steps: usize, host_cmds: &[HostToMcu]) -> (Self, McuToHost) {
-        self.run_harness_impl(steps, host_cmds, false)
-    }
-
-    fn run_harness_impl(
-        mut self,
-        steps: usize,
-        host_cmds: &[HostToMcu],
-        reset_clock: bool,
-    ) -> (Self, McuToHost) {
-        self.io_mut().pending_cmds.extend(host_cmds.iter().copied());
-        self.io_mut().use_mock_clock = true;
-        self.io_mut().dt_override = None;
-        self.io_mut().last_host_rx = None;
-        self.io_mut().ticker = None;
-
-        let mut harness = DeterministicHarness::new();
-        if reset_clock {
-            harness.reset_clock();
+        // SAFETY: the box is never freed — the long-lived task holds a raw
+        // pointer to it, and the global mock timer queue may hold a waker into
+        // that task after the last `step_n`.
+        let io = Box::into_raw(Box::new(SimRobotIo::new(
+            joint_count,
+            initial_cal,
+            initial_raw_pose,
+        )));
+        unsafe {
+            (*io).use_mock_clock = true;
+            (*io).dt_override = None;
         }
 
-        // SAFETY: `boxed` and `storage` stay alive until the harness (and the
-        // task it owns) is dropped below. The task is polled only synchronously
-        // by `step_n`, so it never accesses the IO or storage after reclamation.
-        let boxed = Box::into_raw(Box::new(self));
-        let io: &'static mut SimRobotIo = unsafe { &mut (*boxed).0 };
-        let storage: &'static embassy_executor::raw::TaskStorage<HarnessFuture> =
-            Box::leak(Box::new(embassy_executor::raw::TaskStorage::new()));
+        let harness = DeterministicHarness::new();
+        let storage: &'static raw::TaskStorage<HarnessFuture> =
+            Box::leak(Box::new(raw::TaskStorage::new()));
         let token = storage
-            .spawn(move || Box::pin(rk_fw_core::control_task::control_task(io)))
+            .spawn(move || Box::pin(rk_fw_core::control_task::control_task(PersistentIoPtr(io))))
             .expect("fresh harness task storage must be spawnable");
         harness.spawner().spawn(token);
-        harness.step_n(steps);
-        drop(harness);
-        drop(unsafe { Box::from_raw(storage as *const _ as *mut embassy_executor::raw::TaskStorage<HarnessFuture>) });
-        let mut runner = unsafe { *Box::from_raw(boxed) };
-        let telem = runner.io_mut().last_host_rx.take().unwrap_or_default();
-        (runner, telem)
+
+        Self {
+            io: NonNull::new(io).expect("Box::into_raw never returns null"),
+            harness,
+            _storage: storage,
+        }
+    }
+
+    /// Reset the global deterministic clock. Only valid before the first tick
+    /// has been stepped: once the task has registered its `Ticker`, resetting
+    /// the clock strands an alarm in the process-global queue and the control
+    /// task will never be woken again. Fixed-step sessions never call this.
+    pub fn reset_mock_clock(&self) {
+        self.harness.reset_clock();
+    }
+
+    /// Legacy test helper: run `steps` fixed ticks against the shared task.
+    ///
+    /// Resets the clock only if this session has not been started yet, so
+    /// absolute `now_ms` assertions remain valid. Never re-spawns the task.
+    pub fn run_harness(mut self, steps: usize, host_cmds: &[HostToMcu]) -> (Self, McuToHost) {
+        if !self.harness.is_started() {
+            self.reset_mock_clock();
+        }
+        let telem = self.step_harness(steps, host_cmds);
+        (self, telem)
+    }
+
+    /// Backwards-compatible consuming form that keeps simulated time running
+    /// continuously across calls (no clock reset, no re-spawn).
+    pub fn run_harness_continuous(mut self, steps: usize, host_cmds: &[HostToMcu]) -> (Self, McuToHost) {
+        let telem = self.step_harness(steps, host_cmds);
+        (self, telem)
+    }
+
+    /// Advance this session's persistent executor by exactly `steps` fixed
+    /// 5 ms ticks and return the last telemetry frame.
+    ///
+    /// Host commands are queued once per tick. The task's `Ticker`, the kernel's
+    /// internal state and the simulated clock all persist across calls; no
+    /// executor is created and no clock reset is performed here.
+    pub fn step_harness(&mut self, steps: usize, host_cmds: &[HostToMcu]) -> McuToHost {
+        if steps == 0 {
+            return self.io_mut().last_host_rx.take().unwrap_or_default();
+        }
+        {
+            let io = self.io_mut();
+            io.pending_cmds.extend(host_cmds.iter().copied());
+            io.use_mock_clock = true;
+            io.dt_override = None;
+            io.last_host_rx = None;
+        }
+        self.harness.step_n(steps);
+        self.io_mut().last_host_rx.take().unwrap_or_default()
     }
 
     fn io_mut(&mut self) -> &mut SimRobotIo {
-        &mut self.0
+        unsafe { self.io.as_mut() }
     }
 }
 
@@ -1540,11 +1653,17 @@ impl CopperSimRunner {
 mod tests {
     use super::*;
     use rk_proto::{ControlMode, FaultFlags, WalkCmd};
+    use std::sync::Mutex;
+
+    /// `embassy_time::MockDriver` is process-global. Tests that reset the clock
+    /// or step a harness must not overlap with each other.
+    static HARNESS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// The deterministic harness must drive the *shared* async control task, and
     /// replay recording must survive through `RobotIo::record_tick`.
     #[test]
     fn harness_drives_shared_control_task_and_records_replay() {
+        let _guard = HARNESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cal = [JointCalibration::default(); MAX_JOINTS];
         let mut sim = CopperSimRunner::new(6, &cal, [0.0; MAX_JOINTS]);
         sim.start_recording();
@@ -2069,6 +2188,7 @@ mod tests {
     /// that stays below the fall cutoff.
     #[test]
     fn end_to_end_walking_translates_with_alternating_contacts() {
+        let _guard = HARNESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cal = [JointCalibration {
             min_rad: -2.2,
             max_rad: 2.2,
@@ -2130,5 +2250,74 @@ mod tests {
             (last.balance.world_pos_m[2] - sim.plant.world_position_m()[2]).abs() < 1e-6_f32
         );
         assert!(last.balance.world_vel_m_s[2] > 0.0_f32, "achieved speed must be forward");
+    }
+
+    /// Many sequential fixed-step calls in one process must reuse a single
+    /// executor: no clock resets, no stale timer wakers, no panic. The recorded
+    /// `now_ms` must keep increasing and replay must stay bit-exact.
+    #[test]
+    fn persistent_harness_survives_many_fixed_step_calls() {
+        let _guard = HARNESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cal = [JointCalibration::default(); MAX_JOINTS];
+        let mut sim = CopperSimRunner::new(6, &cal, [0.0; MAX_JOINTS]);
+        sim.start_recording();
+
+        let mut last_ms = None;
+        for i in 1..=25u32 {
+            let cmd = HostToMcu {
+                seq: i,
+                mode: ControlMode::Teach,
+                ..Default::default()
+            };
+            let last = sim.step_harness(4, &[cmd]);
+            assert_eq!(last.active_mode, ControlMode::Teach);
+            let log = sim.recorded_log().expect("recording active");
+            let now_ms = log.ticks.last().expect("tick recorded").now_ms;
+            if let Some(prev) = last_ms {
+                assert!(
+                    now_ms > prev,
+                    "call {i}: clock must advance monotonically ({now_ms} after {prev})"
+                );
+            }
+            last_ms = Some(now_ms);
+        }
+
+        let log = sim.stop_recording().expect("recorded log");
+        assert_eq!(log.ticks.len(), 25 * 4);
+        let check = verify_deterministic_replay(&log);
+        assert!(check.exact_match, "replay must stay exact across calls: {check:?}");
+        assert_eq!(check.matched_ticks, check.total_ticks);
+    }
+
+    /// A late host command must be consumed by the already-running task on the
+    /// next call, proving command handoff does not require a new executor.
+    #[test]
+    fn persistent_harness_applies_commands_from_later_calls() {
+        let _guard = HARNESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cal = [JointCalibration::default(); MAX_JOINTS];
+        let mut sim = CopperSimRunner::new(6, &cal, [0.0; MAX_JOINTS]);
+        sim.start_recording();
+
+        let teach = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Teach,
+            ..Default::default()
+        };
+        let first = sim.step_harness(2, &[teach]);
+        assert_eq!(first.active_mode, ControlMode::Teach);
+
+        let drive = HostToMcu {
+            seq: 2,
+            mode: ControlMode::Drive,
+            torque_mask: 0b11_1111,
+            ..Default::default()
+        };
+        let second = sim.step_harness(2, &[drive]);
+        assert_eq!(second.active_mode, ControlMode::Drive);
+
+        let log = sim.stop_recording().expect("recorded log");
+        assert_eq!(log.ticks[0].rx_cmd.expect("cmd").mode, ControlMode::Teach);
+        assert_eq!(log.ticks[2].rx_cmd.expect("cmd").mode, ControlMode::Drive);
+        assert!(verify_deterministic_replay(&log).exact_match);
     }
 }
