@@ -28,7 +28,7 @@ use craft_keymap::{Active, Bindable, Binding, Keymap, Scope, Scopes};
 use craft_ui::theme::WidgetPalette;
 use egui::{Color32, CornerRadius, Key, RichText, Stroke, Vec2};
 pub use mcp_bridge::McpUiState;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub use mcp_bridge::NativeMcpListenerStatus;
 use rk_link::{RobotTransport, SimTransport, TransportKind};
 use rk_model::{AssetBundle, StudioModel};
@@ -275,8 +275,8 @@ pub struct RockyStudioApp {
     pub(crate) saver: Box<dyn PlatformSaver>,
     pub(crate) selected_transport_ui: TransportKind,
     pub mcp: McpUiState,
-    /// Native-only consumer half of the HTTP→egui MCP bridge.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Native-only consumer half of the HTTP→egui MCP bridge (desktop only).
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     mcp_bridge_rx: Option<rk_mcp::McpBridgeRx>,
     /// Visual alarm / latch state for the most recent fall event.
     pub fall_event_active: bool,
@@ -360,7 +360,7 @@ impl RockyStudioApp {
             saver,
             selected_transport_ui: TransportKind::SimKernel,
             mcp: McpUiState::default(),
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
             mcp_bridge_rx: None,
             fall_event_active: false,
             fall_orientation: FallOrientation::Unknown,
@@ -411,7 +411,7 @@ impl RockyStudioApp {
                 self.model.status_message =
                     "Connected to Simulated Rocky MCU Twin in safe Teach mode.".to_string();
             }
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
             TransportKind::UsbNetworkingUdp => {
                 match rk_link::UdpTransport::connect("10.42.0.2:7777") {
                     Ok(udp) => {
@@ -1503,7 +1503,7 @@ mod e2e_fall_recovery_test;
 #[path = "e2e_fixed_step_tests.rs"]
 mod e2e_fixed_step_tests;
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, not(any(target_arch = "wasm32", target_os = "android"))))]
 mod native_mcp_bridge_tests {
     use std::thread;
     use std::time::Duration;

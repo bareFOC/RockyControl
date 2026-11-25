@@ -11,24 +11,24 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub mod bridge;
 pub mod headless;
 pub mod host;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub mod http_server;
 pub mod schema;
 pub mod tools;
 
 pub use craft_mcp_server::{Info, Options, Server};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub use bridge::{
     BridgeError, DEFAULT_BRIDGE_REPLY_TIMEOUT, McpBridgeRequest, McpBridgeRx, McpBridgeTx,
     mcp_bridge_channel,
 };
 pub use headless::{AutomationRoots, HeadlessHost};
 pub use host::{McpActivityEntry, McpCallOutcome, McpHost, McpPolicy};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub use http_server::{HttpServerHandle, serve_http, spawn_http_bridge};
 pub use tools::{RockyMcpTools, dispatch_json_rpc, server_info, server_options};
 

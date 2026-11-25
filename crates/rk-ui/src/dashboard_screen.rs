@@ -84,9 +84,9 @@ impl RockyStudioApp {
                             );
                             ui.add_space(8.0);
 
-                            #[cfg(not(target_arch = "wasm32"))]
+                            #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
                             let udp_avail = true;
-                            #[cfg(target_arch = "wasm32")]
+                            #[cfg(any(target_arch = "wasm32", target_os = "android"))]
                             let udp_avail = false;
                             self.transport_option_card(
                                 ui,

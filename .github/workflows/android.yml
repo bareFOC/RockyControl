@@ -1,0 +1,80 @@
+name: Android APK
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Android target check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable + aarch64-linux-android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      # `cargo check` type-checks the whole dependency graph but never links a
+      # binary, so no NDK, clang wrapper or linker is needed here. That keeps
+      # this gate fast and independent of Android SDK availability; the
+      # best-effort `apk` job below does the full linked build.
+      - name: Cross-check rk-android for aarch64-linux-android
+        run: cargo check -p rk-android --target aarch64-linux-android
+
+  apk:
+    name: Build unsigned APK (best effort)
+    runs-on: ubuntu-latest
+    # The full APK toolchain is heavier and more brittle on hosted runners;
+    # failures here must not block the required `check` job above.
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install platform 35, build-tools 36 and NDK 27
+        run: sdkmanager "platforms;android-35" "build-tools;36.0.0" "ndk;27.1.12297006"
+
+      - name: Export ANDROID_HOME for the build script
+        run: echo "ANDROID_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Rust stable + aarch64-linux-android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-apk 0.10
+        run: cargo install cargo-apk --version 0.10.0 --locked
+
+      - name: Build APK via scripts/build-android.sh
+        run: bash scripts/build-android.sh
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocky-studio-android-apk
+          path: |
+            target/release/apk/*.apk
+            target/dev/apk/*.apk
+            target/aarch64-linux-android/**/apk/*.apk
+          if-no-files-found: warn

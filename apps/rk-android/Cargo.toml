@@ -1,0 +1,38 @@
+[package]
+name = "rk-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# cdylib is required for Android (`android_main` exported from the APK); the
+# plain lib target keeps host-side `cargo check`/`cargo test` working.
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+rk-ui.workspace = true
+egui.workspace = true
+
+# The runner and its native deps only exist for Android. Keeping them off the
+# host target also keeps winit from selecting any x11/wayland backend here, so
+# `cargo check -p rk-android` works on a plain Linux workstation.
+[target.'cfg(target_os = "android")'.dependencies]
+# The workspace eframe dep sets `default-features = false` (glow, default_fonts,
+# persistence). Add only the Android native-activity backend: no accesskit,
+# x11, wayland, wgpu or MCP services.
+eframe = { workspace = true, features = ["android-native-activity"] }
+glow.workspace = true
+# The pinned storytold fork is applied via the workspace `[patch.crates-io]`.
+# Default features are off so desktop backends are not pulled in;
+# `eframe/android-native-activity` enables `winit/android-native-activity`.
+winit = { version = "0.30", default-features = false }
+android_logger = "0.15"
+log = "0.4"
+
+[package.metadata.android]
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 23
+target_sdk_version = 35

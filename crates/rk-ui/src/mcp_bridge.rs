@@ -34,8 +34,10 @@ impl McpSnippetTab {
 /// Status of the native loopback HTTP listener started by `rk-desktop`.
 ///
 /// This is reported by the platform wrapper; `rk-ui` never claims a listener is
-/// live unless the wrapper has actually bound and started one.
-#[cfg(not(target_arch = "wasm32"))]
+/// live unless the wrapper has actually bound and started one. Android never
+/// starts a listener, so the type is absent there and the drawer reports it as
+/// unavailable.
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NativeMcpListenerStatus {
     /// No listener was started (e.g. `--no-mcp`).
@@ -48,7 +50,7 @@ pub enum NativeMcpListenerStatus {
     Stopped,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 impl NativeMcpListenerStatus {
     /// Short, human-readable endpoint status used in drawer labels.
     pub fn endpoint_status_text(&self) -> String {
@@ -69,7 +71,7 @@ pub struct McpUiState {
     pub snippet_tab: McpSnippetTab,
     pub bridge_connected: bool,
     /// Set by `rk-desktop` once the native HTTP listener has started (or failed).
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     pub native_listener_status: NativeMcpListenerStatus,
     pub activity: VecDeque<McpActivityEntry>,
     pub mcp_walk_override: Option<(f32, f32, f32, bool)>,
@@ -89,7 +91,7 @@ impl Default for McpUiState {
             drawer_rect: egui::Rect::NOTHING,
             snippet_tab: McpSnippetTab::Http,
             bridge_connected: false,
-            #[cfg(not(target_arch = "wasm32"))]
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
             native_listener_status: NativeMcpListenerStatus::NotAvailable,
             activity: VecDeque::with_capacity(MAX_ACTIVITY_ENTRIES),
             mcp_walk_override: None,
@@ -114,7 +116,11 @@ impl McpUiState {
                 "Endpoint /mcp disconnected".to_string()
             }
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(target_os = "android")]
+        {
+            "Endpoint /mcp unavailable on Android".to_string()
+        }
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
         {
             self.native_listener_status.endpoint_status_text()
         }
@@ -122,11 +128,11 @@ impl McpUiState {
 
     /// URL advertised in setup snippets; uses the actual bound address on native.
     pub fn http_url(&self) -> String {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(any(target_arch = "wasm32", target_os = "android"))]
         {
             current_mcp_http_url()
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
         {
             match &self.native_listener_status {
                 NativeMcpListenerStatus::Running { addr } => format!("http://{addr}/mcp"),
@@ -167,6 +173,7 @@ impl McpUiState {
 }
 
 /// Returns the live Streamable HTTP MCP URL for the current origin (or native default).
+/// Android never starts a listener, so it reports the endpoint as unavailable.
 pub fn current_mcp_http_url() -> String {
     #[cfg(target_arch = "wasm32")]
     {
@@ -179,7 +186,11 @@ pub fn current_mcp_http_url() -> String {
         }
         "http://127.0.0.1:3000/mcp".to_string()
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(target_os = "android")]
+    {
+        "MCP listener unavailable on Android".to_string()
+    }
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     {
         "http://127.0.0.1:7788/mcp".to_string()
     }
@@ -308,7 +319,7 @@ impl RockyStudioApp {
     /// Attaches the native bridge receiver. Must be called on the egui thread;
     /// the native platform wrapper drains it from `App::logic` so requests are
     /// also serviced while the window is hidden.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     pub fn attach_mcp_bridge(&mut self, rx: rk_mcp::McpBridgeRx) {
         self.mcp_bridge_rx = Some(rx);
     }
@@ -343,7 +354,14 @@ impl RockyStudioApp {
                 wasm_bridge::spawn_poll(ctx.clone());
             }
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(target_os = "android")]
+        {
+            let _ = ctx;
+            // No native MCP bridge on Android: keep advertised state honest.
+            self.mcp.config_dirty = false;
+            self.mcp.bridge_connected = false;
+        }
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
         {
             let _ = ctx;
             self.mcp.config_dirty = false;

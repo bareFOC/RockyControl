@@ -110,7 +110,7 @@ pub trait RobotTransport {
     fn recorded_log(&self) -> Option<&CopperReplayLog> {
         None
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     fn save_copper_log(&self, _path: &std::path::Path) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -436,7 +436,7 @@ impl RobotTransport for SimTransport {
         self.runner.recorded_log()
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     fn save_copper_log(&self, path: &std::path::Path) -> std::io::Result<()> {
         self.runner.save_copper_log_to_path(path)
     }

@@ -15,6 +15,7 @@ members = [
     "crates/rk-ui",
     "apps/rk-desktop",
     "apps/rk-web",
+    "apps/rk-android",
 ]
 exclude = [
     "firmware/rk-rp2350",

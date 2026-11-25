@@ -2025,7 +2025,7 @@ impl SimRobotIo {
     }
 
     /// Writes the recorded `.copper` log to disk on native Desktop targets.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     pub fn save_copper_log_to_path(&self, path: &std::path::Path) -> std::io::Result<()> {
         let Some(log) = &self.recorded_log else {
             return Err(std::io::Error::new(
@@ -2862,7 +2862,7 @@ mod tests {
         assert_eq!(check.matched_ticks, check.total_ticks);
 
         // Desktop `.copper` file write verification
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
         {
             let tmp = std::env::temp_dir().join("rocky_studio_test.copper");
             sim.save_copper_log_to_path(&tmp).expect("write .copper");

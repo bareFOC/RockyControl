@@ -2,7 +2,7 @@
 
 Pure Rust humanoid robotics control workstation and `#![no_std]` embedded firmware monorepo built on `egui` + `storytold/craft-libs` + `three-d` + `urdf-rs` + `k` + `copper-rs` + `embassy-rs`.
 
-Rocky Studio runs the exact same workstation UI on **Desktop** (`apps/rk-desktop`) and **Browser WASM** (`apps/rk-web`), paired with deterministic real-time firmware for **RP2350** (`firmware/rk-rp2350`) and **ESP32-P4** (`firmware/rk-esp32p4`).
+Rocky Studio runs the exact same workstation UI on **Desktop** (`apps/rk-desktop`), **Browser WASM** (`apps/rk-web`) and **Android** (`apps/rk-android`), paired with deterministic real-time firmware for **RP2350** (`firmware/rk-rp2350`) and **ESP32-P4** (`firmware/rk-esp32p4`).
 
 > [!WARNING]
 > **BREAKING telemetry wire-format change (fall-recovery):** `rk_proto::ImuState` now carries additional full-orientation fields (`yaw_rad`, `yaw_rate_rad_s`, `gravity`). Because the `postcard` + COBS telemetry framing has no protocol-version handshake, the host workstation and firmware must be **rebuilt and flashed in lockstep** — a mismatched host/firmware pair will fail to decode telemetry frames. Always update both sides together (and roll back both together).
@@ -43,6 +43,7 @@ Rocky Studio runs the exact same workstation UI on **Desktop** (`apps/rk-desktop
 | `crates/rk-ui` | Layer 5 | Shared `egui` + `craft-libs` workstation UI, floating CAD HUD, charts, teach/action studio, responsive engine |
 | `apps/rk-desktop` | Layer 6 | Native desktop runner (`eframe`, `craft-atomic` saves, `craft-quit`, native file dialog, fullscreen) |
 | `apps/rk-web` | Layer 6 | Browser WASM runner (`eframe` WebGL2, `craft-platform`, native launch splash, Web Fullscreen API) |
+| `apps/rk-android` | Layer 6 | Android runner (`eframe` glow/native-activity, app-internal `PlatformSaver`, no desktop-only services) |
 
 ### Embedded Firmware Workspace (`/firmware/Cargo.toml`)
 
@@ -89,6 +90,49 @@ cargo test --manifest-path firmware/Cargo.toml -p rk-fw-core
 cargo check --manifest-path firmware/Cargo.toml -p rk-rp2350 --target thumbv8m.main-none-eabihf
 cargo check --manifest-path firmware/Cargo.toml -p rk-rp2350 --target thumbv8m.main-none-eabihf --no-default-features --features usb-net,bench-loopback
 ```
+
+## Android APK
+
+The Android app reuses the shared workstation UI, control kernel and simulator unchanged. Build outputs an `aarch64-linux-android` APK for Android 23+; no host PC is required at runtime.
+
+### Prerequisites
+
+- Android SDK **platform 35** and **build-tools 36.0.0** (`sdkmanager "platforms;android-35" "build-tools;36.0.0"`)
+- Android NDK **27.1.12297006** (`sdkmanager "ndk;27.1.12297006"`)
+- `cargo-apk` **0.10+** (`cargo install cargo-apk --version 0.10.0`)
+- JDK 21 (`keytool` is used to create a local debug keystore)
+- Rust target: `rustup target add aarch64-linux-android` (the script checks this)
+
+The script defaults to SDK/NDK paths under `$HOME/Android/Sdk`. Override `ANDROID_HOME`, `ANDROID_NDK_ROOT`, `NDK_TOOLCHAIN` and `CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER` if your toolchain lives elsewhere; see the header of `scripts/build-android.sh`.
+
+### Build
+
+```sh
+bash scripts/build-android.sh            # release APK (default)
+bash scripts/build-android.sh --check    # cross-check only; no linking, no APK
+bash scripts/build-android.sh --debug    # dev-profile APK (faster local iteration)
+```
+
+The script prints the resulting APK path. With `cargo-apk` 0.10 the release APK is normally written to `target/release/apk/rk-android.apk`.
+
+### Install
+
+```sh
+bash scripts/build-android.sh --install        # build, then `adb install -r <apk>`
+# or install an already-built APK by hand:
+adb install -r target/release/apk/rk-android.apk
+```
+
+Use `adb devices` first to confirm a device is connected with USB debugging enabled.
+
+### Limitations
+
+- **No in-app MCP TCP listener.** The MCP bridge is disabled in the APK; connect an external MCP client to a host-side listener instead. Desktop behavior is unchanged.
+- **Gamepad input is inert.** `gilrs` has no Android backend; use the touch UI (or an external MCP client) for control.
+- **Single simulator session.** One `CopperSimRunner` exists per process and fixed steps run on the UI thread. Reconnect resets the experiment rather than creating a second runner, and simulation time pauses while the activity is suspended.
+- **WORLD / GRF telemetry channels are sim-only** and are not available from real hardware.
+- **URDF file picker is not configured.** No SAF/JNI picker is wired up yet, so import relies on the bundled `rocky_mk1.urdf` or the drag-and-drop/XML-paste fallback. Exported replay logs are written to the app-internal files directory; no `zenity` subprocess is used.
+- **Unsigned APK only.** No release signing or Play Store AAB is configured. `cargo-apk` 0.10 requires a signing key even for local installs, so the script falls back to the standard Android debug keystore (created under `$HOME/.android` if missing). Treat the output as a debug/dev artifact, not a distributable release.
 
 ## GitHub Pages Deployment
 
