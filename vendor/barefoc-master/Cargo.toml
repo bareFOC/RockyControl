@@ -1,0 +1,15 @@
+[package]
+name = "barefoc-master"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+description = "no_std, zero-heap host-side master controller SDK for BareFOC actuator nodes (vendored from bareFOC/barefoc-project for self-contained CI)."
+
+[dependencies]
+embedded-hal = "1.0"
+embedded-io = "0.6"
+heapless = "0.8"
+
+[dev-dependencies]
+embedded-hal-mock = "0.10"

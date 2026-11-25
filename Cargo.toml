@@ -69,7 +69,7 @@ k = "0.32"
 # Wire protocol & no_std helpers
 # Read-only path dependency on the sibling bareFOC checkout. Do NOT enable its
 # `defmt` feature: bareFOC uses defmt 0.3 while Rocky firmware uses defmt 1.0.
-barefoc-master = { path = "../bareFOC/barefoc-master" }
+barefoc-master = { path = "vendor/barefoc-master" }
 embedded-hal = "1.0"
 embedded-hal-mock = { version = "0.10", default-features = false, features = ["eh1"] }
 serde = { version = "1", default-features = false, features = ["derive"] }

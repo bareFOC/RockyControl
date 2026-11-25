@@ -80,9 +80,9 @@ These are **off by default** — the default `bench-loopback` build is unchanged
 > expose the canonical 512-byte BareFOC multibus control table at node
 > `0x20 + joint` — the old 16-byte command / 12-byte feedback I3C frame codec is
 > gone. Flashing the servos is a deployment step outside this repository. The
-> register client is a read-only path dependency on the sibling
-> `../bareFOC/barefoc-master` checkout, so that checkout must be present to
-> build this feature.
+> register client is vendored read-only at `vendor/barefoc-master` (MIT,
+> snapshot of `bareFOC/barefoc-project`), so no external bareFOC checkout is
+> needed to build this feature — including in CI and GitHub Pages.
 
 Example — LSM6DSV + I3C hardware with USB CDC transport:
 
