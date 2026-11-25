@@ -11,9 +11,10 @@ use core::cell::RefCell;
 
 use critical_section::Mutex;
 use rk_control::{RawServoCommand, RawServoFeedback};
-use rk_proto::MAX_JOINTS;
+use rk_proto::{JointCommandMode, MAX_JOINTS};
 
 use crate::config::DEFAULT_JOINT_COUNT;
+use crate::joint_plant::{IDLE_CURRENT_MA, JointPlant, DEFAULT_NM_PER_AMP};
 
 /// Hardware-independent servo bus interface called once per `copper-rs` control iteration.
 pub trait ServoBusPort: Send {
@@ -23,18 +24,13 @@ pub trait ServoBusPort: Send {
 
 /// Pure `no_std` single-precision `f32` bench-test servo plant running directly on the MCU.
 ///
-/// Simulates first-order actuator response, nominal 12 V bus voltage, idle/tracking current,
-/// and gentle thermal rise when torque is enabled — letting operators validate real MCU USB
-/// round-trip latency, E-Stop, and watchdog trips on the bench before powering real servos.
+/// Uses the same [`JointPlant`] model as the simulator, so USB bench tuning transfers to
+/// simulation and back. Bus voltage sag, the default (absent) IMU and bus-fault injection
+/// remain bench-specific.
 pub struct BenchLoopbackBus {
     joint_count: usize,
-    raw_rad: [f32; MAX_JOINTS],
-    velocity_rad_s: [f32; MAX_JOINTS],
-    target_rad: [f32; MAX_JOINTS],
-    torque_nm: [f32; MAX_JOINTS],
-    torque_mask: u32,
-    current_ma: [u16; MAX_JOINTS],
-    temp_c: [f32; MAX_JOINTS],
+    plant: JointPlant<MAX_JOINTS>,
+    last_cmd: RawServoCommand,
     bus_fault: bool,
 }
 
@@ -47,14 +43,15 @@ impl Default for BenchLoopbackBus {
 impl BenchLoopbackBus {
     pub const fn new(joint_count: usize) -> Self {
         Self {
-            joint_count,
-            raw_rad: [0.0_f32; MAX_JOINTS],
-            velocity_rad_s: [0.0_f32; MAX_JOINTS],
-            target_rad: [0.0_f32; MAX_JOINTS],
-            torque_nm: [1.8_f32; MAX_JOINTS],
-            torque_mask: 0,
-            current_ma: [80u16; MAX_JOINTS],
-            temp_c: [28.0_f32; MAX_JOINTS],
+            joint_count: if joint_count < MAX_JOINTS { joint_count } else { MAX_JOINTS },
+            plant: JointPlant::new(joint_count, DEFAULT_NM_PER_AMP),
+            last_cmd: RawServoCommand {
+                torque_mask: 0,
+                raw_target_rad: [0.0_f32; MAX_JOINTS],
+                command_mode: [JointCommandMode::Position as u8; MAX_JOINTS],
+                raw_velocity_rad_s: [0.0_f32; MAX_JOINTS],
+                torque_nm: [1.8_f32; MAX_JOINTS],
+            },
             bus_fault: false,
         }
     }
@@ -64,32 +61,28 @@ impl ServoBusPort for BenchLoopbackBus {
     fn read_feedback(&mut self, dt_sec: f32) -> RawServoFeedback {
         let dt = dt_sec.clamp(0.001_f32, 0.05_f32);
         let mut total_ma: u32 = 0;
+        let mut raw_angle_rad = [0.0_f32; MAX_JOINTS];
+        let mut velocity_rad_s = [0.0_f32; MAX_JOINTS];
+        let mut current_ma = [IDLE_CURRENT_MA; MAX_JOINTS];
+        let mut temp_c = [28u8; MAX_JOINTS];
 
         for i in 0..self.joint_count.min(MAX_JOINTS) {
-            let energized = (self.torque_mask & (1u32 << i)) != 0;
-            if energized {
-                let torque_scale = (self.torque_nm[i].abs() / 1.8_f32).clamp(0.08_f32, 1.0_f32);
-                let alpha = (dt * 18.0_f32 * torque_scale).clamp(0.0_f32, 1.0_f32);
-                let err = self.target_rad[i] - self.raw_rad[i];
-                let delta = err * alpha;
-                self.raw_rad[i] += delta;
-                self.velocity_rad_s[i] = delta / dt;
-                let draw =
-                    (160.0_f32 + err.abs() * 1150.0_f32 * torque_scale).clamp(120.0_f32, 1850.0_f32);
-                self.current_ma[i] = draw as u16;
-                self.temp_c[i] = (self.temp_c[i] + (draw * 0.00025_f32) * dt).min(68.0_f32);
-            } else {
-                // Torque OFF: hold current angle, idle quiescent current, cool toward ambient
-                self.velocity_rad_s[i] = 0.0;
-                self.current_ma[i] = 45;
-                self.temp_c[i] = (self.temp_c[i] - 0.15_f32 * dt).max(26.0_f32);
-            }
-            total_ma = total_ma.saturating_add(self.current_ma[i] as u32);
-        }
-
-        let mut temp_u8 = [28u8; MAX_JOINTS];
-        for i in 0..MAX_JOINTS {
-            temp_u8[i] = self.temp_c[i].clamp(0.0_f32, 120.0_f32) as u8;
+            let energized = (self.last_cmd.torque_mask & (1u32 << i)) != 0;
+            let limit = if energized { self.last_cmd.torque_nm[i].max(0.0_f32) } else { 0.0_f32 };
+            let (angle, velocity, ma, _) = self.plant.step(
+                i,
+                dt,
+                JointCommandMode::from_wire(self.last_cmd.command_mode[i]),
+                self.last_cmd.raw_target_rad[i],
+                self.last_cmd.raw_velocity_rad_s[i],
+                limit,
+                false,
+            );
+            raw_angle_rad[i] = angle;
+            velocity_rad_s[i] = velocity;
+            current_ma[i] = ma;
+            temp_c[i] = self.plant.temperature_c(i).clamp(0.0_f32, 120.0_f32) as u8;
+            total_ma = total_ma.saturating_add(ma as u32);
         }
 
         // Mild realistic voltage sag under load from 12.20 V nominal 3S LiPo
@@ -97,10 +90,10 @@ impl ServoBusPort for BenchLoopbackBus {
         let bus_voltage_mv = 12_200u16.saturating_sub(sag_mv);
 
         RawServoFeedback {
-            raw_angle_rad: self.raw_rad,
-            velocity_rad_s: self.velocity_rad_s,
-            current_ma: self.current_ma,
-            temp_c: temp_u8,
+            raw_angle_rad,
+            velocity_rad_s,
+            current_ma,
+            temp_c,
             bus_voltage_mv,
             bus_error: self.bus_fault,
             imu: rk_proto::ImuState::default(),
@@ -110,9 +103,7 @@ impl ServoBusPort for BenchLoopbackBus {
     }
 
     fn write_command(&mut self, cmd: &RawServoCommand) {
-        self.torque_mask = cmd.torque_mask;
-        self.target_rad = cmd.raw_target_rad;
-        self.torque_nm = cmd.torque_nm;
+        self.last_cmd = *cmd;
     }
 }
 

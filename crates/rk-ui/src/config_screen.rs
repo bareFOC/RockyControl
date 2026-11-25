@@ -1,12 +1,16 @@
 //! Screen 3 — Config & Calibration Screen (Visual 3D direct joint/arm dragging,
 //! 3D Protractor Rotation Arc, floating bottom-center visual joint calibration bar,
 //! and on-demand 3-tab slide-over engineering drawer: Balance & Gait, Joints, Setup).
+//!
+//! The achieved CoM/GRF/contact plots below use simulator-only WORLD/GRF
+//! telemetry channels; hardware v1 leaves them zero/clear, so those traces
+//! stay flat at zero on real hardware.
 
 use egui::{Color32, CornerRadius, Margin, Rect, RichText, Stroke, UiBuilder, Vec2, pos2, vec2};
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 use rk_fw_core::replay::verify_deterministic_replay;
-use rk_proto::{BalanceGains, ConfigCmd, ControlMode};
-use rk_viewport::{DragMode, ViewportOptions};
+use rk_proto::{BalanceGains, ConfigCmd, ControlMode, estimator_valid};
+use rk_viewport::{DragMode, FootContactState, ViewportOptions};
 
 use crate::{ConfigDrawerTab, RockyStudioApp};
 
@@ -26,6 +30,16 @@ impl RockyStudioApp {
         let telem = self.model.latest_telemetry;
         let estop = self.model.is_estop_active();
         let show_ghost = telem.active_mode == ControlMode::Drive;
+
+        // WORLD/GRF channels are simulator-only enrichment; hardware v1 leaves
+        // them clear/zero. Gate the per-foot marks on the GRF validity bit so the
+        // viewport does not render phantom contact on a v1 MCU.
+        let grf_valid = telem.estimator.valid_mask & estimator_valid::GRF != 0;
+        self.viewport.set_foot_contact_state(FootContactState {
+            contact_mask: if grf_valid { telem.estimator.contact_mask } else { 0 },
+            grf_left_n: if grf_valid { telem.estimator.grf_left_n } else { 0.0 },
+            grf_right_n: if grf_valid { telem.estimator.grf_right_n } else { 0.0 },
+        });
 
         let interaction = self.viewport.show(
             ui,
@@ -537,6 +551,91 @@ impl RockyStudioApp {
                         .width(1.8),
                 );
             });
+
+        // Achieved balance/contact signals. NOTE: the WORLD and GRF channels are
+        // simulator enrichment (rk-sim publishes the validity bits + plant forces);
+        // hardware v1 leaves them clear, so these traces stay flat at zero there.
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Achieved CoM — ground frame (m)")
+                .strong()
+                .size(12.0),
+        );
+        let com_x_pts = history_points(&self.history, |p| p.com_x_m);
+        let com_z_pts = history_points(&self.history, |p| p.com_z_m);
+        Plot::new("com_achieved_plot")
+            .height(110.0)
+            .legend(Legend::default())
+            .show_axes(true)
+            .show(ui, |plot_ui| {
+                plot_ui.line(
+                    Line::new("CoM X (m)", com_x_pts)
+                        .color(Color32::from_rgb(132, 154, 182))
+                        .width(1.6),
+                );
+                plot_ui.line(
+                    Line::new("CoM Z (m)", com_z_pts)
+                        .color(Color32::from_rgb(103, 232, 249))
+                        .width(1.6),
+                );
+            });
+
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Achieved GRF (N) & contact mask")
+                .strong()
+                .size(12.0),
+        );
+        let grf_l_pts = history_points(&self.history, |p| p.grf_left_n);
+        let grf_r_pts = history_points(&self.history, |p| p.grf_right_n);
+        let contact_pts = history_points(&self.history, |p| p.contact_mask as f64 * 10.0);
+        Plot::new("grf_contact_plot")
+            .height(110.0)
+            .legend(Legend::default())
+            .show_axes(true)
+            .show(ui, |plot_ui| {
+                plot_ui.line(
+                    Line::new("GRF Left (N)", grf_l_pts)
+                        .color(Color32::from_rgb(74, 222, 128))
+                        .width(1.6),
+                );
+                plot_ui.line(
+                    Line::new("GRF Right (N)", grf_r_pts)
+                        .color(Color32::from_rgb(245, 158, 11))
+                        .width(1.6),
+                );
+                // Contact mask plotted at 0/10/20/30 so it stays visually separate
+                // from the force traces; 0 = no contact, 10 = right, 20 = left, 30 = both.
+                plot_ui.line(
+                    Line::new("Contact x10", contact_pts)
+                        .color(Color32::from_rgb(190, 132, 255))
+                        .width(1.3),
+                );
+            });
+        ui.label(
+            RichText::new("Contact mask: 0 none · 10 right · 20 left · 30 both")
+                .size(10.0)
+                .color(Color32::from_rgb(148, 166, 190)),
+        );
+
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Torso tilt rate (deg/s)")
+                .strong()
+                .size(12.0),
+        );
+        let tilt_rate_pts = history_points(&self.history, |p| p.tilt_rate_dps);
+        Plot::new("tilt_rate_plot")
+            .height(100.0)
+            .legend(Legend::default())
+            .show_axes(true)
+            .show(ui, |plot_ui| {
+                plot_ui.line(
+                    Line::new("Tilt rate (deg/s)", tilt_rate_pts)
+                        .color(Color32::from_rgb(251, 191, 36))
+                        .width(1.6),
+                );
+            });
     }
 
     fn render_setup_tab(&mut self, ui: &mut egui::Ui) {
@@ -600,4 +699,14 @@ impl RockyStudioApp {
         ui.separator();
         self.render_sim_fault_panel(ui);
     }
+}
+
+/// Builds an owned `(t_sec, value)` plot series from the telemetry history.
+/// The resulting `PlotPoints` owns its samples, so it is independent of the
+/// history buffer's borrow and safe to hand straight to `egui_plot`.
+fn history_points(
+    history: &std::collections::VecDeque<crate::TelemetryPoint>,
+    value: impl Fn(&crate::TelemetryPoint) -> f64,
+) -> PlotPoints<'static> {
+    history.iter().map(|p| [p.t_sec, value(p)]).collect()
 }

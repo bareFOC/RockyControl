@@ -18,13 +18,16 @@ imu-bno055 = []
 # Opt-in high-rate ST LSM6DSV16X IMU on dedicated SPI1 (FIFO burst @ 200 Hz).
 # Mutually exclusive with `imu-bno055`: BNO055 is not spawned when this is enabled.
 imu-lsm6dsv = []
-# Opt-in SimpleFOC I3C servo bus adapter (external PIO I3C driver via ServoBusHooks).
-i3c-servo-bus = []
+# Opt-in BareFOC multibus servo adapter (external PIO I3C driver via ServoBusHooks).
+# `rk-multibus` is pulled in only for this feature so the default bench build
+# stays free of the BareFOC register client.
+i3c-servo-bus = ["dep:rk-multibus"]
 
 [dependencies]
 rk-proto = { path = "../../crates/rk-proto", default-features = false }
 rk-control = { path = "../../crates/rk-control", default-features = false }
 rk-fw-core = { path = "../rk-fw-core", default-features = false }
+rk-multibus = { path = "../../crates/rk-multibus", default-features = false, optional = true }
 
 # Embassy async embedded stack for RP2350 (Cortex-M33F)
 embassy-rp = { version = "0.10.0", features = [

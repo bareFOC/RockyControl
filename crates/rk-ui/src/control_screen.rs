@@ -79,6 +79,7 @@ impl RockyStudioApp {
             pos2(vp_rect.left() + pad, vp_rect.top() + pad),
             vec2(att_w, 268.0),
         );
+        let sim_led_on = self.transport.sim_led_on();
         let mut att_ui = ui.new_child(
             UiBuilder::new()
                 .max_rect(att_area)
@@ -102,6 +103,21 @@ impl RockyStudioApp {
                         .color(Color32::from_rgb(138, 162, 192)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Firmware `post_tick` LED state machine, mirrored by the sim
+                    // IO and exposed through `RobotTransport::sim_led_on`.
+                    let led_col = if sim_led_on {
+                        Color32::from_rgb(74, 222, 128)
+                    } else {
+                        Color32::from_rgb(62, 76, 96)
+                    };
+                    ui.label(
+                        RichText::new("LED")
+                            .monospace()
+                            .size(10.0)
+                            .color(led_col),
+                    );
+                    let (led_rect, _) = ui.allocate_exact_size(vec2(9.0, 9.0), Sense::hover());
+                    ui.painter().circle_filled(led_rect.center(), 4.5, led_col);
                     let (badge, col) = if fallen {
                         ("FALL CUTOFF", Color32::from_rgb(248, 113, 113))
                     } else if phase == rk_proto::uvc_phase::FALL_TUCK {

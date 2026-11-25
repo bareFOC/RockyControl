@@ -48,6 +48,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "barefoc-master"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-io 0.6.1",
+ "heapless 0.8.0",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1331,6 +1340,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rk-multibus"
+version = "0.1.0"
+dependencies = [
+ "barefoc-master",
+ "embedded-hal 1.0.0",
+ "rk-control",
+ "rk-proto",
+]
+
+[[package]]
 name = "rk-proto"
 version = "0.1.0"
 dependencies = [
@@ -1358,6 +1377,7 @@ dependencies = [
  "portable-atomic",
  "rk-control",
  "rk-fw-core",
+ "rk-multibus",
  "rk-proto",
  "spin",
  "static_cell",

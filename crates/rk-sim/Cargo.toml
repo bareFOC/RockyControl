@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 rk-proto.workspace = true
 rk-control.workspace = true
+rk-multibus.workspace = true
 rk-fw-core.workspace = true
 rk-harness.workspace = true
 serde.workspace = true

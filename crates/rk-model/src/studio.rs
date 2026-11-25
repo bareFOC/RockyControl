@@ -699,6 +699,21 @@ impl StudioModel {
         }
     }
 
+    /// Clears host-side sequencing state that must not leak into a scripted
+    /// experiment: the packet sequence counter, action/recovery playback and
+    /// queued config commands.
+    ///
+    /// Scripts feed explicit typed packets instead of `build_next_host_packet`,
+    /// so `tx_seq` restarts at a deterministic value and no stale keyframe or
+    /// config command can be applied on a later scripted tick.
+    pub fn reset_experiment_state(&mut self) {
+        self.tx_seq = 0;
+        self.playback = None;
+        self.playback_aborted = false;
+        self.recovery_playback = false;
+        self.pending_config.clear();
+    }
+
     pub fn load_bundle(&mut self, bundle: AssetBundle) -> Result<(), String> {
         let rig = KinematicRig::from_urdf_xml(&bundle.urdf_xml)?;
         let default_pose = rig.default_pose();
@@ -1342,5 +1357,22 @@ mod tests {
 
         assert!(model.playback.is_none());
         assert!(model.status_message.contains("blocked"));
+    }
+
+    #[test]
+    fn reset_experiment_state_clears_seq_playback_and_pending_config() {
+        let (mut model, _) = playing_model();
+        model.tx_seq = 41;
+        model.playback_aborted = true;
+        model.recovery_playback = true;
+        model.pending_config.push(ConfigCmd::ClearFaults);
+
+        model.reset_experiment_state();
+
+        assert_eq!(model.tx_seq, 0, "scripted packets must start at seq 0");
+        assert!(model.playback.is_none(), "active action must not leak into a script");
+        assert!(!model.playback_aborted, "abort latch must not leak into a script");
+        assert!(!model.recovery_playback, "recovery handoff must not leak into a script");
+        assert!(model.pending_config.is_empty(), "queued config must not leak into a script");
     }
 }

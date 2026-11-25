@@ -5,6 +5,7 @@ members = [
     "firmware/rk-fw-core",
     "crates/rk-proto",
     "crates/rk-control",
+    "crates/rk-multibus",
     "crates/rk-harness",
     "crates/rk-sim",
     "crates/rk-model",
@@ -29,6 +30,7 @@ license = "Apache-2.0"
 # Internal layered crates
 rk-proto = { path = "crates/rk-proto", default-features = false }
 rk-control = { path = "crates/rk-control", default-features = false }
+rk-multibus = { path = "crates/rk-multibus", default-features = false }
 rk-harness = { path = "crates/rk-harness" }
 # Shared host+MCU control application. Lives in the firmware workspace on disk; it is
 # a workspace dependency here so host crates can use `rk-fw-core = { workspace = true }`
@@ -64,6 +66,11 @@ urdf-rs = "0.10"
 k = "0.32"
 
 # Wire protocol & no_std helpers
+# Read-only path dependency on the sibling bareFOC checkout. Do NOT enable its
+# `defmt` feature: bareFOC uses defmt 0.3 while Rocky firmware uses defmt 1.0.
+barefoc-master = { path = "../bareFOC/barefoc-master" }
+embedded-hal = "1.0"
+embedded-hal-mock = { version = "0.10", default-features = false, features = ["eh1"] }
 serde = { version = "1", default-features = false, features = ["derive"] }
 serde_json = "1"
 postcard = { version = "1.1", default-features = false }

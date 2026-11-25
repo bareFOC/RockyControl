@@ -8,6 +8,7 @@ use rk_model::nalgebra::Point3;
 use rk_model::{AssetBundle, samples};
 use rk_fw_core::replay::verify_deterministic_replay;
 use rk_proto::{ControlMode, FallOrientation, ModelRequest, ModelResponse, uvc_phase};
+use rk_sim::ExperimentScript;
 use serde_json::{Value, json};
 
 use crate::host::{McpActivityEntry, McpCallOutcome, McpHost};
@@ -19,6 +20,9 @@ use crate::schema::{
 const MAX_URDF_BYTES: usize = 2 * 1024 * 1024;
 const MAX_LINE_BYTES: usize = 2_621_440;
 const MAX_STEP_TICKS: usize = 400;
+/// Upper bound on a scripted experiment so a malformed script cannot monopolize
+/// the headless runner (each tick allocates one frozen `ControlTick` record).
+const MAX_SCRIPT_TICKS: usize = 20_000;
 
 static NEXT_ACTIVITY_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1203,17 +1207,51 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
                     },
                     _ => None,
                 };
-                if args.get("corrupt_frame").and_then(Value::as_bool) == Some(true) {
+                // One-shot wire corruption: mirror the native UI button, which
+                // puzzles a malformed frame into the COBS stream once per click.
+                let corrupt_frame_injected =
+                    args.get("corrupt_frame").and_then(Value::as_bool) == Some(true);
+                if corrupt_frame_injected {
                     self.host.transport_mut().inject_corrupted_frame();
                 }
+                let lag = match Self::finite_f32(args, "servo_lag_factor", 0.03, 0.35) {
+                    Ok(v) => v,
+                    Err(e) => return self.err_result(name, "servo_lag_factor", e),
+                };
                 let Some(faults) = self.host.transport_mut().sim_faults_mut() else {
                     return self.err_result(name, "sim only", "Fault injection is only supported on the Simulation transport.");
                 };
-                if let Some(drop_hb) = args.get("drop_heartbeat").and_then(Value::as_bool) {
-                    faults.drop_heartbeat = drop_hb;
+                // Every field of `SimFaultInjection` is settable here with the same
+                // semantics as the native Sim drawer, so MCP and GUI cannot drift.
+                if let Some(v) = args.get("drop_heartbeat").and_then(Value::as_bool) {
+                    faults.drop_heartbeat = v;
                 }
-                if let Some(sag) = args.get("voltage_sag").and_then(Value::as_bool) {
-                    faults.voltage_sag = sag;
+                if let Some(v) = args.get("voltage_sag").and_then(Value::as_bool) {
+                    faults.voltage_sag = v;
+                }
+                if let Some(v) = args.get("servo_bus_error").and_then(Value::as_bool) {
+                    faults.servo_bus_error = v;
+                }
+                if let Some(v) = args.get("external_hand_wave").and_then(Value::as_bool) {
+                    faults.external_hand_wave = v;
+                }
+                if let Some(v) = args.get("imu_disconnected").and_then(Value::as_bool) {
+                    faults.imu_disconnected = v;
+                }
+                if let Some(v) = args.get("rx_crc_error").and_then(Value::as_bool) {
+                    faults.rx_crc_error = v;
+                }
+                if let Some(v) = args.get("rx_version_mismatch").and_then(Value::as_bool) {
+                    faults.rx_version_mismatch = v;
+                }
+                if let Some(v) = args.get("rx_truncated_frame").and_then(Value::as_bool) {
+                    faults.rx_truncated_frame = v;
+                }
+                if let Some(v) = args.get("rx_fragmented_frame").and_then(Value::as_bool) {
+                    faults.rx_fragmented_frame = v;
+                }
+                if let Some(v) = lag {
+                    faults.servo_lag_factor = v;
                 }
                 if let Some(idx) = stall_idx {
                     let stalled = args.get("stalled").and_then(Value::as_bool).unwrap_or(true);
@@ -1221,11 +1259,98 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
                         faults.stalled_joints[idx] = stalled;
                     }
                 }
+                let stalled: Vec<usize> = faults
+                    .stalled_joints
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| s.then_some(i))
+                    .collect();
                 let summary = json!({
                     "drop_heartbeat": faults.drop_heartbeat,
                     "voltage_sag": faults.voltage_sag,
+                    "servo_bus_error": faults.servo_bus_error,
+                    "external_hand_wave": faults.external_hand_wave,
+                    "imu_disconnected": faults.imu_disconnected,
+                    "servo_lag_factor": faults.servo_lag_factor,
+                    "stalled_joints": stalled,
+                    "corrupt_frame_injected": corrupt_frame_injected,
+                    "rx_crc_error": faults.rx_crc_error,
+                    "rx_version_mismatch": faults.rx_version_mismatch,
+                    "rx_truncated_frame": faults.rx_truncated_frame,
+                    "rx_fragmented_frame": faults.rx_fragmented_frame,
                 });
                 self.ok_json(name, "faults updated", summary)
+            }
+            "reset_experiment" => {
+                match self.host.reset_experiment() {
+                    Ok(msg) => self.ok_json(name, "experiment reset", json!({"reset": true, "message": msg})),
+                    Err(e) => self.err_result(name, "reset unavailable", e),
+                }
+            }
+            "run_experiment" => {
+                // Accept an inline script object/JSON string or a confined file
+                // so CI can commit a script and point the CLI at it.
+                let script_value: Value = if let Some(raw) = args.get("script") {
+                    match raw {
+                        Value::Object(_) => raw.clone(),
+                        Value::String(text) => match serde_json::from_str::<Value>(text) {
+                            Ok(parsed) => parsed,
+                            Err(e) => {
+                                return self.err_result(name, "invalid script JSON", format!("`script` is not valid JSON: {e}"));
+                            }
+                        },
+                        _ => {
+                            return self.err_result(name, "invalid script", "`script` must be an ExperimentScript JSON object or a JSON string");
+                        }
+                    }
+                } else if let Some(path) = args.get("file_path").and_then(Value::as_str) {
+                    let bytes = match self.host.read_confined_file(path) {
+                        Ok(bytes) => bytes,
+                        Err(e) => return self.err_result(name, "script read failed", e),
+                    };
+                    match serde_json::from_slice::<Value>(&bytes) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            return self.err_result(name, "invalid script file", format!("`file_path` did not contain valid JSON: {e}"));
+                        }
+                    }
+                } else {
+                    return self.err_result(name, "missing script", "Provide `script` (ExperimentScript JSON) or `file_path` (confined JSON file).");
+                };
+
+                let script: ExperimentScript = match serde_json::from_value(script_value) {
+                    Ok(script) => script,
+                    Err(e) => {
+                        return self.err_result(name, "invalid script", format!("`script` is not a valid ExperimentScript: {e}"));
+                    }
+                };
+                if script.max_ticks == 0 || script.packets.is_empty() {
+                    return self.err_result(
+                        name,
+                        "empty script",
+                        "A script needs at least one tick (`max_ticks > 0`) and one typed host packet.",
+                    );
+                }
+                if script.max_ticks > MAX_SCRIPT_TICKS {
+                    return self.err_result(
+                        name,
+                        "script too large",
+                        format!("`max_ticks` exceeds the {MAX_SCRIPT_TICKS}-tick safety cap"),
+                    );
+                }
+
+                match self.host.run_experiment(&script) {
+                    Ok(check) => self.ok_json(
+                        name,
+                        if check.exact_match { "experiment EXACT" } else { "experiment MISMATCH" },
+                        json!({
+                            "exact_match": check.exact_match,
+                            "matched_ticks": check.matched_ticks,
+                            "total_ticks": check.total_ticks,
+                        }),
+                    ),
+                    Err(e) => self.err_result(name, "experiment failed", e),
+                }
             }
             "recording_control" => {
                 let action = args.get("action").and_then(Value::as_str).unwrap_or("");
@@ -1428,6 +1553,249 @@ mod tests {
         assert_eq!(body["exact_match"], true, "replay result: {body}");
         assert_eq!(body["matched_ticks"], body["total_ticks"]);
         assert_eq!(body["total_ticks"], 80);
+    }
+
+    /// The native Sim drawer writes the same `SimFaultInjection` fields directly;
+    /// this asserts the MCP surface writes every one of them identically.
+    #[test]
+    fn mcp_fault_injection_matches_native_ui_faults() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
+        let _ = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "robot_connect", "arguments": {"transport": "sim"}}}),
+        );
+
+        // Mirrors the native UI (sim_tab.rs): mutate the shared fault struct.
+        {
+            let f = host.transport_mut().sim_faults_mut().expect("sim faults");
+            *f = rk_sim::SimFaultInjection {
+                drop_heartbeat: true,
+                stalled_joints: {
+                    let mut s = [false; rk_proto::MAX_JOINTS];
+                    s[0] = true;
+                    s[2] = true;
+                    s
+                },
+                voltage_sag: true,
+                servo_bus_error: true,
+                external_hand_wave: true,
+                imu_disconnected: true,
+                servo_lag_factor: 0.12,
+                rx_crc_error: true,
+                rx_version_mismatch: true,
+                rx_truncated_frame: true,
+                rx_fragmented_frame: true,
+                ..Default::default()
+            };
+        }
+        let native = host.transport_mut().sim_faults().expect("sim faults").clone();
+
+        // Reset to defaults, then recreate the exact same state through MCP.
+        {
+            let f = host.transport_mut().sim_faults_mut().expect("sim faults");
+            *f = rk_sim::SimFaultInjection::default();
+        }
+        let reply = dispatch_json_rpc(
+            &mut host,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "sim_inject_fault", "arguments": {
+                    "drop_heartbeat": true, "voltage_sag": true,
+                    "servo_bus_error": true, "external_hand_wave": true,
+                    "imu_disconnected": true, "servo_lag_factor": 0.12,
+                    "rx_crc_error": true, "rx_version_mismatch": true,
+                    "rx_truncated_frame": true, "rx_fragmented_frame": true
+                }}
+            }),
+        )
+        .expect("inject reply");
+        assert!(reply["result"]["isError"].is_null(), "{reply}");
+        let mut last_reply = reply.clone();
+        for (joint, stalled) in [(0, true), (2, true)] {
+            last_reply = dispatch_json_rpc(
+                &mut host,
+                json!({
+                    "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                    "params": {"name": "sim_inject_fault", "arguments": {
+                        "stall_joint": joint, "stalled": stalled
+                    }}
+                }),
+            )
+            .expect("stall reply");
+        }
+
+        let mcp = host.transport_mut().sim_faults().expect("sim faults").clone();
+        assert_eq!(mcp.drop_heartbeat, native.drop_heartbeat);
+        assert_eq!(mcp.stalled_joints, native.stalled_joints);
+        assert_eq!(mcp.voltage_sag, native.voltage_sag);
+        assert_eq!(mcp.servo_bus_error, native.servo_bus_error);
+        assert_eq!(mcp.external_hand_wave, native.external_hand_wave);
+        assert_eq!(mcp.imu_disconnected, native.imu_disconnected);
+        assert_eq!(mcp.servo_lag_factor, native.servo_lag_factor);
+        assert_eq!(mcp.rx_crc_error, native.rx_crc_error);
+        assert_eq!(mcp.rx_version_mismatch, native.rx_version_mismatch);
+        assert_eq!(mcp.rx_truncated_frame, native.rx_truncated_frame);
+        assert_eq!(mcp.rx_fragmented_frame, native.rx_fragmented_frame);
+
+        let body: Value = serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["drop_heartbeat"], true);
+        assert_eq!(body["voltage_sag"], true);
+        assert_eq!(body["servo_bus_error"], true);
+        assert_eq!(body["external_hand_wave"], true);
+        assert_eq!(body["imu_disconnected"], true);
+        assert!((body["servo_lag_factor"].as_f64().unwrap() - f64::from(0.12_f32)).abs() < 1.0e-6);
+        let last_body: Value = serde_json::from_str(last_reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(last_body["stalled_joints"], json!([0, 2]));
+        assert_eq!(body["rx_crc_error"], true);
+        assert_eq!(body["rx_version_mismatch"], true);
+        assert_eq!(body["rx_truncated_frame"], true);
+        assert_eq!(body["rx_fragmented_frame"], true);
+        assert_eq!(body["corrupt_frame_injected"], false);
+    }
+
+    /// The reset tool must clear injected faults and keep the tool surface usable.
+    #[test]
+    fn reset_experiment_tool_clears_injected_faults() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
+        let _ = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "robot_connect", "arguments": {"transport": "sim"}}}),
+        );
+        let _ = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "sim_inject_fault", "arguments": {"imu_disconnected": true, "rx_crc_error": true}}}),
+        );
+        assert!(host.transport().sim_faults().unwrap().imu_disconnected);
+
+        let reply = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "reset_experiment", "arguments": {}}}),
+        )
+        .expect("reset reply");
+        assert!(reply["result"]["isError"].is_null(), "{reply}");
+        let faults = host.transport().sim_faults().expect("sim faults");
+        assert!(!faults.imu_disconnected);
+        assert!(!faults.rx_crc_error);
+    }
+
+    #[test]
+    fn run_experiment_tool_replays_shove_and_fault_toggle_exactly() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
+
+        let mut faults = rk_fw_core::replay::SimFaultSnapshot::default();
+        faults.voltage_sag = true;
+        let script = ExperimentScript {
+            seed: 0xDEAD_BEEF,
+            events: vec![
+                rk_fw_core::replay::TimedSimEvent {
+                    tick_index: 40,
+                    kind: rk_fw_core::replay::SimEventKind::Shove {
+                        pitch_rad_s: 1.6,
+                        roll_rad_s: -0.7,
+                    },
+                },
+                rk_fw_core::replay::TimedSimEvent {
+                    tick_index: 80,
+                    kind: rk_fw_core::replay::SimEventKind::SetFaults(faults),
+                },
+            ],
+            packets: (0..100u32)
+                .map(|seq| rk_proto::HostToMcu {
+                    seq,
+                    mode: ControlMode::Drive,
+                    torque_mask: 0b11,
+                    ..Default::default()
+                })
+                .collect(),
+            max_ticks: 100,
+        };
+
+        let reply = dispatch_json_rpc(
+            &mut host,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "run_experiment", "arguments": {"script": serde_json::to_value(&script).unwrap()}}
+            }),
+        )
+        .expect("run_experiment reply");
+        assert!(reply["result"]["isError"].is_null(), "{reply}");
+        let body: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["exact_match"], true, "{body}");
+        assert_eq!(body["total_ticks"], 100, "{body}");
+        assert_eq!(body["matched_ticks"], body["total_ticks"], "{body}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn run_experiment_tool_loads_script_from_confined_file() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join("rk_mcp_experiment_script_test");
+        let _ = std::fs::create_dir_all(&base);
+        let script = ExperimentScript {
+            seed: 7,
+            events: Vec::new(),
+            packets: (0..12u32)
+                .map(|seq| rk_proto::HostToMcu {
+                    seq,
+                    ..Default::default()
+                })
+                .collect(),
+            max_ticks: 12,
+        };
+        let path = base.join("script.json");
+        std::fs::write(&path, serde_json::to_vec(&script).unwrap()).unwrap();
+
+        let mut host = HeadlessHost::new(
+            McpPolicy::default(),
+            AutomationRoots {
+                read_root: Some(base.clone()),
+                write_root: None,
+            },
+        );
+        let reply = dispatch_json_rpc(
+            &mut host,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "run_experiment", "arguments": {"file_path": "script.json"}}
+            }),
+        )
+        .expect("run_experiment reply");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(reply["result"]["isError"].is_null(), "{reply}");
+        let body: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["exact_match"], true, "{body}");
+        assert_eq!(body["total_ticks"], 12, "{body}");
+    }
+
+    #[test]
+    fn run_experiment_tool_rejects_empty_and_invalid_scripts() {
+        let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
+        for (id, args) in [
+            (2, json!({})),
+            (3, json!({"script": {}})),
+            (4, json!({"script": {"max_ticks": 5}})),
+            (5, json!({"script": {"max_ticks": "oops", "packets": [{}]}})),
+            (6, json!({"script": "not json"})),
+        ] {
+            let reply = dispatch_json_rpc(
+                &mut host,
+                json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "run_experiment", "arguments": args}
+                }),
+            )
+            .expect("run_experiment reply");
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(!text.is_empty(), "error must carry a readable message");
+        }
     }
 
     #[test]

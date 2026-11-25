@@ -1,7 +1,9 @@
 //! Platform-agnostic host facade (`McpHost`) and Guarded Autonomy policy (`McpPolicy`).
 
+use rk_fw_core::replay::{ReplayVerification, verify_deterministic_replay};
 use rk_link::{RobotTransport, TransportKind};
 use rk_model::{AssetBundle, StudioModel};
+use rk_sim::{CopperSimRunner, ExperimentScript};
 use serde::{Deserialize, Serialize};
 
 /// Guarded autonomy policy controlling external MCP agent permissions.
@@ -85,6 +87,47 @@ pub trait McpHost {
     fn set_drive_armed(&mut self, armed: bool);
     fn trigger_estop_and_disarm(&mut self);
     fn reset_estop_upright(&mut self);
+
+    /// Restarts the simulation from clean construction inputs: fresh control
+    /// kernel, plant, fault flags, wire state and recorder, plus cleared host
+    /// history where the host owns any.
+    ///
+    /// The default asks the simulation transport to reset in place, preserving
+    /// its persistent Embassy executor. The GUI bridge overrides this to also
+    /// drop its telemetry history. Host packet sequencing is reset in both
+    /// paths so scripted runs do not inherit frame-derived `tx_seq` values.
+    /// Wired transports do not support a reset.
+    fn reset_experiment(&mut self) -> Result<String, String> {
+        if self.transport().kind() != TransportKind::SimKernel {
+            return Err("Reset experiment is only supported on the Simulation transport.".to_string());
+        }
+        self.transport_mut().reset_experiment();
+        self.model_mut().reset_experiment_state();
+        Ok("Simulation experiment reset: kernel, plant, faults, wire, recorder and host sequencing are clean.".to_string())
+    }
+
+    /// Executes a deterministic [`ExperimentScript`] on a fresh software twin
+    /// and verifies the resulting `.copper` log bit-exactly.
+    ///
+    /// The script owns its whole input stream (typed host packets, timed plant
+    /// events and PRNG seed), so this path never builds frame-derived packets.
+    /// Host-side sequencing is reset first to keep seq values independent of
+    /// prior UI activity. The default works for both the headless CLI host and
+    /// the live GUI bridge without requiring transport-specific access.
+    fn run_experiment(&mut self, script: &ExperimentScript) -> Result<ReplayVerification, String> {
+        if self.transport().kind() != TransportKind::SimKernel {
+            return Err("Scripted experiments require the Simulation transport.".to_string());
+        }
+        self.model_mut().reset_experiment_state();
+        let model = self.model();
+        let mut runner = CopperSimRunner::new(
+            model.rig.joints.len().max(1),
+            &model.calibration,
+            model.rig.default_pose(),
+        );
+        let log = runner.run_script(script);
+        Ok(verify_deterministic_replay(&log))
+    }
 
     fn record_activity(&mut self, entry: McpActivityEntry);
 

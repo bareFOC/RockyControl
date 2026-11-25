@@ -8,8 +8,8 @@
 pub mod config;
 pub mod control_task;
 pub mod copper;
-pub mod i3c_bus;
 pub mod imu;
+pub mod joint_plant;
 pub mod lsm6dsv;
 pub mod model_store;
 #[cfg(feature = "std")]

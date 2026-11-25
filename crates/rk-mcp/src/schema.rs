@@ -398,14 +398,45 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "sim_inject_fault",
             "Inject Simulation Fault (Sim)",
-            "Configures simulation fault injection (drop_heartbeat, voltage_sag, stall_joint, corrupt_frame) for safety testing.",
+            "Configures every simulation fault knob (heartbeat, voltage, stalls, servo bus, IMU, hand wave, actuator lag and RX wire faults) with the same semantics as the native Sim drawer.",
             object(
                 json!({
                     "drop_heartbeat": boolean("Drop host heartbeats to test 100 ms watchdog cutoff"),
                     "voltage_sag": boolean("Simulate under-voltage battery sag"),
                     "stall_joint": joint_ref("Optional joint to stall/unstall"),
                     "stalled": boolean("Stall state for stall_joint"),
-                    "corrupt_frame": boolean("Inject a malformed COBS wire frame")
+                    "corrupt_frame": boolean("Inject one malformed COBS wire frame"),
+                    "servo_bus_error": boolean("Inject a servo bus communication error flag"),
+                    "external_hand_wave": boolean("Drive a smooth external hand wave in Teach mode"),
+                    "imu_disconnected": boolean("Disconnect the virtual IMU (upright lock)"),
+                    "servo_lag_factor": num("Actuator responsiveness factor (0.03..=0.35); lower is laggier"),
+                    "rx_crc_error": boolean("Inject a CRC mismatch on the host -> MCU wire path"),
+                    "rx_version_mismatch": boolean("Inject a protocol version mismatch on the host -> MCU wire path"),
+                    "rx_truncated_frame": boolean("Inject a truncated host frame"),
+                    "rx_fragmented_frame": boolean("Inject a fragmented host frame")
+                }),
+                &[],
+            ),
+            Effect::Edits,
+        ),
+        tool(
+            "reset_experiment",
+            "Reset Simulation Experiment (Sim)",
+            "Restarts the simulation from clean construction inputs (kernel, plant, faults, wire, recorder and UI history) so scripted runs are reproducible. Simulation transport only.",
+            object(json!({}), &[]),
+            Effect::Edits,
+        ),
+        tool(
+            "run_experiment",
+            "Run Scripted Experiment (Sim)",
+            "Runs a deterministic experiment script (typed host packets, timed plant events, PRNG seed) from a clean simulation reset and returns bit-exact replay verification. Supply `script` as ExperimentScript JSON, or a `file_path` confined to --automation-read-root on the native CLI.",
+            object(
+                json!({
+                    "script": json!({
+                        "description": "ExperimentScript JSON object (or a string containing JSON): {seed: u64, events: [{tick_index, kind}], packets: [HostToMcu], max_ticks: usize}",
+                        "anyOf": [{"type": "object"}, {"type": "string"}]
+                    }),
+                    "file_path": string("Path to a JSON experiment script inside --automation-read-root (native CLI only)")
                 }),
                 &[],
             ),

@@ -10,14 +10,22 @@ use core::ptr::NonNull;
 use embassy_executor::raw;
 use embassy_time::{Duration, Instant, Ticker};
 use rk_control::{
-    JointCalibration, RawServoCommand, RawServoFeedback, com_fk::compute_state,
-    uvc::LegGeometry,
+    JointCalibration, MAX_IMPACT_JOINTS, RawServoCommand, RawServoFeedback,
+    com_fk::compute_state, gravity_torque_nm, uvc::LegGeometry,
+};
+use rk_multibus::{
+    CONTROL_TABLE_SIZE, ControlTableClient, FEEDBACK_BURST_LEN, FEEDBACK_BURST_REG, I2cTransport,
+    JOINT_NODE_BASE, JointFeedback, MAX_I2C_WRITE_FRAME, MAX_SERVO_JOINTS, OperatingMode, PioError,
+    PioI3c, PioI3cBus, REG_GOAL_CURRENT, REG_GOAL_POSITION, REG_GOAL_VELOCITY, REG_OPERATING_MODE,
+    REG_TORQUE_ENABLE, TorqueConstants, joint_node_addr, read_joint_feedback, write_joint_command,
 };
 use rk_fw_core::control_task::{RobotIo, step_control_tick};
 use rk_fw_core::copper::{ControlTask, ControlTick};
+use rk_fw_core::joint_plant::{JointPlant, DEFAULT_NM_PER_AMP};
 use rk_harness::DeterministicHarness;
 pub use rk_fw_core::replay::{
-    CopperReplayLog, ReplayVerification, verify_deterministic_replay,
+    CopperReplayLog, ReplayVerification, SimEventKind, SimFaultSnapshot, TimedSimEvent,
+    verify_deterministic_replay,
 };
 use rk_fw_core::servo_bus::ServoBusPort;
 use rk_fw_core::transport::{CobsStreamFramer, HostLinkMailbox, encode_telemetry_frame};
@@ -28,7 +36,7 @@ use rk_proto::{
     encode_model_req_cobs, encode_model_resp_cobs, estimator_valid,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use rk_fw_core::config::CONTROL_PERIOD_MS;
 
@@ -56,7 +64,11 @@ const PELVIS_TO_HIP_PITCH_M: f32 = 0.12;
 /// The printed foot sole sits slightly below the ankle-roll link origin.
 const SOLE_BELOW_ANKLE_M: f32 = 0.018;
 /// Foot clearance below which the sole is considered planted (metres).
-const CONTACT_TOLERANCE_M: f32 = 0.006;
+///
+/// 12 mm covers the finite stance-tracking lag of the torque-based joint plant
+/// (the PD servo settles a few millimetres above a purely kinematic pose),
+/// keeping a compliant printed sole in contact instead of chattering at 6 mm.
+const CONTACT_TOLERANCE_M: f32 = 0.012;
 /// LIPM capture-velocity tracking gain (1/s) for the world CoM.
 const WORLD_VEL_TRACK_GAIN: f32 = 6.0;
 /// Capture-point gain used when placing the next stance foot.
@@ -67,6 +79,24 @@ const WORLD_MAX_ACCEL: f32 = 6.0;
 const WALK_SPEED_SCALE: f32 = 0.5;
 /// Effectiveness of the contact CoP moment on torso tilt (lumped inertia).
 const CONTACT_MOMENT_GAIN: f32 = 0.35;
+/// Default Coulomb friction coefficient at the sole (`F_t <= mu · GRF`).
+const DEFAULT_FOOT_FRICTION_MU: f32 = 0.7;
+/// Default seed of the deterministic sensor-noise PRNG.
+const DEFAULT_NOISE_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Largest supported IMU latency, in 200 Hz ticks (ring-buffer capacity).
+const MAX_IMU_LATENCY_TICKS: usize = 16;
+/// Low-pass time constant of the slowly-varying sensor biases (seconds).
+const IMU_BIAS_TAU_S: f32 = 0.35;
+/// Converts a shove's angular impulse into stance-joint velocity (rad/s per rad/s).
+const STANCE_IMPULSE_GAIN: f32 = 0.20;
+
+const fn default_noise_seed() -> u64 {
+    DEFAULT_NOISE_SEED
+}
+
+const fn default_foot_friction_mu() -> f32 {
+    DEFAULT_FOOT_FRICTION_MU
+}
 
 /// Per-foot ground contact state in the world/ground frame.
 ///
@@ -104,6 +134,57 @@ pub struct SimFaultInjection {
     pub imu_disconnected: bool,
     /// Actuator responsiveness factor (0.04 = slow/visible ghost lag, 0.35 = crisp).
     pub servo_lag_factor: f32,
+    /// Seed of the deterministic xorshift64* generator driving all sensor noise.
+    ///
+    /// All imperfection amplitudes default to zero so recorded trajectories keep
+    /// their exact numeric parity; enable individual knobs to exercise the noisy plant.
+    #[serde(default = "default_noise_seed")]
+    pub seed: u64,
+    /// Per-axis IMU gyro white-noise amplitude (rad/s). Zero disables it.
+    #[serde(default)]
+    pub imu_gyro_noise_rad_s: f32,
+    /// Per-axis IMU accelerometer white-noise amplitude (m/s²). Zero disables it.
+    #[serde(default)]
+    pub imu_accel_noise_m_s2: f32,
+    /// Slowly-varying bias amplitude on published attitude (rad).
+    #[serde(default)]
+    pub imu_angle_bias_rad: f32,
+    /// Slowly-varying bias amplitude on published gyro rates (rad/s).
+    #[serde(default)]
+    pub imu_gyro_bias_rad_s: f32,
+    /// Slowly-varying bias amplitude on published gravity (m/s²).
+    #[serde(default)]
+    pub imu_accel_bias_m_s2: f32,
+    /// IMU sample latency in control ticks (delayed ring buffer of true samples).
+    #[serde(default)]
+    pub imu_latency_ticks: u16,
+    /// Current-sense noise as a fraction of the reading (0.02 = ±2%).
+    #[serde(default)]
+    pub current_noise_pct: f32,
+    /// Temperature sensor offset in °C (also sets the magnitude of its dither).
+    #[serde(default)]
+    pub temperature_offset_c: f32,
+    /// Encoder quantization LSB in radians (zero = full-resolution angle).
+    #[serde(default)]
+    pub encoder_quantization_lsb_rad: f32,
+    /// Sole Coulomb friction coefficient used by the slip threshold.
+    #[serde(default = "default_foot_friction_mu")]
+    pub foot_friction_mu: f32,
+    /// Desynchronizes plant contacts from the controller's phase-scripted support foot.
+    #[serde(default)]
+    pub contact_disagreement: bool,
+    /// Injects a CRC mismatch on the host -> MCU wire path (consumed by the transport layer).
+    #[serde(default)]
+    pub rx_crc_error: bool,
+    /// Injects a protocol-version mismatch on the host -> MCU wire path.
+    #[serde(default)]
+    pub rx_version_mismatch: bool,
+    /// Injects a truncated frame on the host -> MCU wire path.
+    #[serde(default)]
+    pub rx_truncated_frame: bool,
+    /// Injects a fragmented frame on the host -> MCU wire path.
+    #[serde(default)]
+    pub rx_fragmented_frame: bool,
 }
 
 impl Default for SimFaultInjection {
@@ -116,21 +197,256 @@ impl Default for SimFaultInjection {
             external_hand_wave: false,
             imu_disconnected: false,
             servo_lag_factor: 0.12,
+            seed: DEFAULT_NOISE_SEED,
+            imu_gyro_noise_rad_s: 0.0,
+            imu_accel_noise_m_s2: 0.0,
+            imu_angle_bias_rad: 0.0,
+            imu_gyro_bias_rad_s: 0.0,
+            imu_accel_bias_m_s2: 0.0,
+            imu_latency_ticks: 0,
+            current_noise_pct: 0.0,
+            temperature_offset_c: 0.0,
+            encoder_quantization_lsb_rad: 0.0,
+            foot_friction_mu: DEFAULT_FOOT_FRICTION_MU,
+            contact_disagreement: false,
+            rx_crc_error: false,
+            rx_version_mismatch: false,
+            rx_truncated_frame: false,
+            rx_fragmented_frame: false,
         }
+    }
+}
+
+/// Converts the simulator's native fault configuration into the portable,
+/// serde-friendly payload stored in `TimedSimEvent::SetFaults`.
+///
+/// Kept as an explicit free function (rather than a `From` impl) so both
+/// directions live side by side and the mapping is easy to audit when a fault
+/// knob is added: add the field to [`SimFaultSnapshot`] and to both functions.
+pub fn fault_snapshot(faults: &SimFaultInjection) -> SimFaultSnapshot {
+    SimFaultSnapshot {
+        drop_heartbeat: faults.drop_heartbeat,
+        stalled_joints: faults.stalled_joints,
+        voltage_sag: faults.voltage_sag,
+        servo_bus_error: faults.servo_bus_error,
+        external_hand_wave: faults.external_hand_wave,
+        imu_disconnected: faults.imu_disconnected,
+        servo_lag_factor: faults.servo_lag_factor,
+        seed: faults.seed,
+        imu_gyro_noise_rad_s: faults.imu_gyro_noise_rad_s,
+        imu_accel_noise_m_s2: faults.imu_accel_noise_m_s2,
+        imu_angle_bias_rad: faults.imu_angle_bias_rad,
+        imu_gyro_bias_rad_s: faults.imu_gyro_bias_rad_s,
+        imu_accel_bias_m_s2: faults.imu_accel_bias_m_s2,
+        imu_latency_ticks: faults.imu_latency_ticks,
+        current_noise_pct: faults.current_noise_pct,
+        temperature_offset_c: faults.temperature_offset_c,
+        encoder_quantization_lsb_rad: faults.encoder_quantization_lsb_rad,
+        foot_friction_mu: faults.foot_friction_mu,
+        contact_disagreement: faults.contact_disagreement,
+        rx_crc_error: faults.rx_crc_error,
+        rx_version_mismatch: faults.rx_version_mismatch,
+        rx_truncated_frame: faults.rx_truncated_frame,
+        rx_fragmented_frame: faults.rx_fragmented_frame,
+    }
+}
+
+/// Restores a simulator fault configuration from a scripted event payload.
+pub fn faults_from_snapshot(snapshot: &SimFaultSnapshot) -> SimFaultInjection {
+    SimFaultInjection {
+        drop_heartbeat: snapshot.drop_heartbeat,
+        stalled_joints: snapshot.stalled_joints,
+        voltage_sag: snapshot.voltage_sag,
+        servo_bus_error: snapshot.servo_bus_error,
+        external_hand_wave: snapshot.external_hand_wave,
+        imu_disconnected: snapshot.imu_disconnected,
+        servo_lag_factor: snapshot.servo_lag_factor,
+        seed: snapshot.seed,
+        imu_gyro_noise_rad_s: snapshot.imu_gyro_noise_rad_s,
+        imu_accel_noise_m_s2: snapshot.imu_accel_noise_m_s2,
+        imu_angle_bias_rad: snapshot.imu_angle_bias_rad,
+        imu_gyro_bias_rad_s: snapshot.imu_gyro_bias_rad_s,
+        imu_accel_bias_m_s2: snapshot.imu_accel_bias_m_s2,
+        imu_latency_ticks: snapshot.imu_latency_ticks,
+        current_noise_pct: snapshot.current_noise_pct,
+        temperature_offset_c: snapshot.temperature_offset_c,
+        encoder_quantization_lsb_rad: snapshot.encoder_quantization_lsb_rad,
+        foot_friction_mu: snapshot.foot_friction_mu,
+        contact_disagreement: snapshot.contact_disagreement,
+        rx_crc_error: snapshot.rx_crc_error,
+        rx_version_mismatch: snapshot.rx_version_mismatch,
+        rx_truncated_frame: snapshot.rx_truncated_frame,
+        rx_fragmented_frame: snapshot.rx_fragmented_frame,
+    }
+}
+
+/// Deterministic xorshift64* generator shared by every simulated sensor.
+///
+/// Fixed-size `u64` state, no wall clock and no external RNG dependency. The
+/// same seed and number of draws always yields the same `f32` sequence, so a
+/// recorded command stream replays bit-for-bit across sessions.
+#[derive(Clone, Debug)]
+struct NoiseRng {
+    state: u64,
+}
+
+impl NoiseRng {
+    fn new(seed: u64) -> Self {
+        // A zero xorshift state is a fixed point; fold the seed into a nonzero
+        // constant so every seed (including 0) produces a usable sequence.
+        let state = seed ^ 0xD1B5_4A32_D192_ED03;
+        Self {
+            state: if state == 0 { DEFAULT_NOISE_SEED } else { state },
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// One uniform sample in `[-1, 1)` from the top 24 bits of the generator.
+    fn next_f32(&mut self) -> f32 {
+        let unit = (self.next_u64() >> 40) as f32 * (1.0_f32 / 8_388_608.0_f32);
+        unit - 1.0_f32
+    }
+}
+
+/// In-memory BareFOC register server used by the simulator.
+///
+/// Each Rocky joint owns one 512-byte control table (node `0x20 + joint`) and a
+/// latched register pointer. The server sits behind [`PioI3cBus`], so every
+/// simulated command and feedback exchange travels through the *same* wire
+/// encoding as firmware: a two-byte big-endian pointer followed by
+/// little-endian payload bytes. Reads latch the pointer with a short write and
+/// then burst the reply back; the pointer survives between HAL calls.
+#[derive(Clone, Debug)]
+pub struct SimMultibusPio {
+    banks: [[u8; CONTROL_TABLE_SIZE]; MAX_SERVO_JOINTS],
+    latched: [Option<u16>; MAX_SERVO_JOINTS],
+    /// When set, every transaction fails with [`PioError::Bus`], mirroring the
+    /// `servo_bus_error` fault injection used by the rest of the simulator.
+    bus_error_injection: bool,
+}
+
+/// The bus handle shared by all simulated joints.
+type SimPioBus = PioI3cBus<SimMultibusPio>;
+/// Typed control-table client bound to one simulated joint node.
+type SimControlClient<'a> =
+    ControlTableClient<I2cTransport<&'a mut SimPioBus, MAX_I2C_WRITE_FRAME>>;
+
+impl SimMultibusPio {
+    pub fn new() -> Self {
+        Self {
+            banks: [[0u8; CONTROL_TABLE_SIZE]; MAX_SERVO_JOINTS],
+            latched: [None; MAX_SERVO_JOINTS],
+            bus_error_injection: false,
+        }
+    }
+
+    /// Enable/disable injected bus failures (no transaction is accepted while on).
+    pub fn set_bus_error_injection(&mut self, enabled: bool) {
+        self.bus_error_injection = enabled;
+    }
+
+    fn node_index(address: u8) -> Option<usize> {
+        let last = JOINT_NODE_BASE + MAX_SERVO_JOINTS as u8;
+        (address >= JOINT_NODE_BASE && address < last)
+            .then_some((address - JOINT_NODE_BASE) as usize)
+    }
+
+    /// Read-only view of a joint's control table (useful for wire-level assertions).
+    pub fn register_bank(&self, address: u8) -> Option<&[u8; CONTROL_TABLE_SIZE]> {
+        Self::node_index(address).map(|index| &self.banks[index])
+    }
+
+    /// Publish a 14-byte feedback burst into a joint's control table.
+    pub fn write_feedback_burst(&mut self, address: u8, burst: &[u8; FEEDBACK_BURST_LEN]) -> bool {
+        let Some(index) = Self::node_index(address) else {
+            return false;
+        };
+        let start = FEEDBACK_BURST_REG as usize;
+        self.banks[index][start..start + FEEDBACK_BURST_LEN].copy_from_slice(burst);
+        true
+    }
+}
+
+impl Default for SimMultibusPio {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PioI3c for SimMultibusPio {
+    fn transaction(&mut self, address: u8, tx: &[u8], rx: &mut [u8]) -> Result<(), PioError> {
+        if self.bus_error_injection {
+            return Err(PioError::Bus);
+        }
+        let index = Self::node_index(address).ok_or(PioError::Bus)?;
+
+        // A pointer-less transaction is the burst half of a read. It must use
+        // the pointer latched by the preceding two-byte write and leave that
+        // pointer untouched for any following burst.
+        if tx.is_empty() {
+            let start = self.latched[index].ok_or(PioError::Bus)? as usize;
+            let end = start.checked_add(rx.len()).ok_or(PioError::Bus)?;
+            if end > CONTROL_TABLE_SIZE {
+                return Err(PioError::Bus);
+            }
+            rx.copy_from_slice(&self.banks[index][start..end]);
+            return Ok(());
+        }
+
+        if tx.len() < 2 {
+            return Err(PioError::Bus);
+        }
+        let pointer = u16::from_be_bytes([tx[0], tx[1]]) as usize;
+        self.latched[index] = Some(pointer as u16);
+
+        // Writes carry their payload after the pointer and auto-increment.
+        let payload = &tx[2..];
+        let write_end = pointer.checked_add(payload.len()).ok_or(PioError::Bus)?;
+        if write_end > CONTROL_TABLE_SIZE {
+            return Err(PioError::Bus);
+        }
+        self.banks[index][pointer..write_end].copy_from_slice(payload);
+
+        // `PioI3cBus::read` re-sends the latched pointer as a two-byte tx while
+        // asking for the burst in `rx`; that is still a read, not a write.
+        if !rx.is_empty() {
+            let read_end = pointer.checked_add(rx.len()).ok_or(PioError::Bus)?;
+            if read_end > CONTROL_TABLE_SIZE {
+                return Err(PioError::Bus);
+            }
+            rx.copy_from_slice(&self.banks[index][pointer..read_end]);
+        }
+        Ok(())
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct SimulatedServoPlant {
     joint_count: usize,
+    /// Shared torque-based actuator model (the same type the MCU bench uses).
+    joints: JointPlant<MAX_JOINTS>,
+    /// Published feedback snapshot refreshed from `joints` every plant step.
     raw_angle_rad: [f32; MAX_JOINTS],
     velocity_rad_s: [f32; MAX_JOINTS],
     current_ma: [u16; MAX_JOINTS],
     temp_c_f: [f32; MAX_JOINTS],
     virtual_hand_rad: [f32; MAX_JOINTS],
     wave_phase: f32,
+    /// Decoded mirror of the goal registers; consumed by `step_plant`.
     last_cmd: RawServoCommand,
     faults: SimFaultInjection,
+    /// In-memory BareFOC register server and its pointer-latching bus.
+    multibus: SimPioBus,
+    /// N·m ↔ A conversion shared with firmware's register mapping.
+    torque_constants: TorqueConstants,
     // Deterministic 2-axis stepping-aware LIPM torso dynamics + virtual IMU state
     torso_pitch_rad: f32,
     torso_roll_rad: f32,
@@ -196,6 +512,28 @@ pub struct SimulatedServoPlant {
     /// CoP offset `[x, z]` relative to CoM from the latest contact step (m).
     /// Drives the torso tilt through ground-reaction moments instead of a scripted sway.
     contact_cop_offset_m: [f32; 2],
+    // --- Deterministic sensor imperfection ----------------------------------
+    /// Runtime PRNG state, seeded from `faults.seed` (reseeds when the seed changes).
+    noise_rng: NoiseRng,
+    /// Seed currently installed in `noise_rng`.
+    noise_seed_applied: u64,
+    /// Low-pass filtered sensor biases `[pitch, roll, yaw]` / axes.
+    imu_angle_bias_rad: [f32; 3],
+    imu_gyro_bias_rad_s: [f32; 3],
+    imu_accel_bias_m_s2: [f32; 3],
+    /// Ring buffer of recent noisy IMU samples for configurable latency.
+    imu_history: VecDeque<rk_proto::ImuState>,
+}
+
+/// Inverse of `rk_multibus::operating_mode_for`. BareFOC orders operating modes
+/// Torque=0 / Velocity=1 / Position=2 while Rocky's wire enum is
+/// Position=0 / Velocity=1 / Torque=2, so the codes cannot be cast directly.
+fn joint_mode_from_operating(mode: u8) -> JointCommandMode {
+    match mode {
+        code if code == OperatingMode::Torque as u8 => JointCommandMode::Torque,
+        code if code == OperatingMode::Velocity as u8 => JointCommandMode::Velocity,
+        _ => JointCommandMode::Position,
+    }
 }
 
 /// Body-frame gravity consistent with the kinematics tilt rotation.
@@ -241,10 +579,107 @@ fn initial_world_com(initial_raw_pose: &[f32; MAX_JOINTS]) -> [f32; 3] {
     ]
 }
 
+/// Unilateral normal force: no adhesion is possible and a lifted sole carries
+/// exactly zero GRF. Non-finite spring evaluations are treated as unloaded.
+fn unilateral_grf(contact: bool, raw_grf_n: f32, max_grf_n: f32) -> f32 {
+    if !contact || !raw_grf_n.is_finite() {
+        return 0.0_f32;
+    }
+    raw_grf_n.clamp(0.0_f32, max_grf_n.max(0.0_f32))
+}
+
+/// Coulomb slip: when tangential sole speed exceeds the friction limit
+/// `mu · GRF / (m · k)`, the pinned point loses part of its normal load and
+/// therefore contributes less to the support CoP. The reduction is bounded so a
+/// transient FK velocity spike cannot unload a whole foot or drive the planted
+/// point away (the latter would break the LIPM's pinned-pool assumption).
+fn apply_friction_slip(foot: &mut FootContact, mass_kg: f32, mu: f32) {
+    if !foot.contact || foot.grf_n <= 0.0_f32 || !foot.slip_m_s.is_finite() {
+        return;
+    }
+    let mu = mu.clamp(0.01_f32, 2.0_f32);
+    let mass = mass_kg.clamp(0.2_f32, 10.0_f32);
+    // Force/velocity scale: `F_t = m · k · v_t`, so `v_limit = mu · GRF / (m · k)`.
+    let limit_m_s = mu * foot.grf_n / (mass * WORLD_VEL_TRACK_GAIN);
+    if foot.slip_m_s <= limit_m_s {
+        return;
+    }
+    let excess = ((foot.slip_m_s - limit_m_s) / (limit_m_s + 0.25_f32)).clamp(0.0_f32, 1.0_f32);
+    foot.grf_n = unilateral_grf(true, foot.grf_n * (1.0_f32 - 0.15_f32 * excess), foot.grf_n);
+}
+
+/// Clamps the GRF-weighted CoP into the convex hull of the *loaded* foot points.
+/// An unloaded sole (zero GRF) is excluded; airborne -> the CoM is the CoP.
+fn clamp_cop_to_support(cop: [f32; 2], contacts: &[FootContact; 2]) -> [f32; 2] {
+    const MIN_LOADED_GRF_N: f32 = 1.0e-3_f32;
+    let mut loaded = [usize::MAX; 2];
+    let mut count = 0usize;
+    for (i, foot) in contacts.iter().enumerate() {
+        if foot.contact
+            && foot.grf_n >= MIN_LOADED_GRF_N
+            && foot.point_m[0].is_finite()
+            && foot.point_m[1].is_finite()
+        {
+            loaded[count] = i;
+            count += 1;
+        }
+    }
+    match count {
+        0 => cop,
+        1 => contacts[loaded[0]].point_m,
+        _ => {
+            let a = contacts[loaded[0]].point_m;
+            let b = contacts[loaded[1]].point_m;
+            let dx = b[0] - a[0];
+            let dz = b[1] - a[1];
+            let len2 = dx * dx + dz * dz;
+            if len2 <= 1.0e-8_f32 {
+                a
+            } else {
+                let t = ((cop[0] - a[0]) * dx + (cop[1] - a[1]) * dz) / len2;
+                let t = t.clamp(0.0_f32, 1.0_f32);
+                [a[0] + t * dx, a[1] + t * dz]
+            }
+        }
+    }
+}
+
 impl SimulatedServoPlant {
     pub fn new(joint_count: usize, initial_raw_pose: [f32; MAX_JOINTS]) -> Self {
+        let joints = joint_count.clamp(1, MAX_JOINTS);
+        let mut multibus = SimPioBus::new(SimMultibusPio::new());
+        // Seed every node with the plant's initial pose so a `step_plant` call
+        // without a preceding `write_command` still sees the original goals.
+        for joint in 0..joints.min(MAX_SERVO_JOINTS) {
+            let feedback = JointFeedback {
+                position_rad: initial_raw_pose[joint],
+                velocity_rad_s: 0.0,
+                current_amps: 0.0,
+                temperature_c: 28.0,
+            };
+            let burst = feedback.to_burst();
+            {
+                let bus = multibus.bus_mut();
+                let bank = &mut bus.banks[joint];
+                bank[REG_TORQUE_ENABLE as usize] = 0;
+                bank[REG_OPERATING_MODE as usize] = OperatingMode::Position as u8;
+                bank[REG_GOAL_POSITION as usize..REG_GOAL_POSITION as usize + 4]
+                    .copy_from_slice(&initial_raw_pose[joint].to_le_bytes());
+                bank[REG_GOAL_VELOCITY as usize..REG_GOAL_VELOCITY as usize + 4]
+                    .copy_from_slice(&0.0_f32.to_le_bytes());
+                bank[REG_GOAL_CURRENT as usize..REG_GOAL_CURRENT as usize + 4]
+                    .copy_from_slice(&0.0_f32.to_le_bytes());
+            }
+            let node = joint_node_addr(joint).expect("seeded joints are servoed");
+            multibus.bus_mut().write_feedback_burst(node, &burst);
+        }
+        let mut joints_plant = JointPlant::<MAX_JOINTS>::new(joints, DEFAULT_NM_PER_AMP);
+        for joint in 0..joints {
+            joints_plant.set_angle(joint, initial_raw_pose[joint]);
+        }
         Self {
-            joint_count: joint_count.clamp(1, MAX_JOINTS),
+            joint_count: joints,
+            joints: joints_plant,
             raw_angle_rad: initial_raw_pose,
             velocity_rad_s: [0.0; MAX_JOINTS],
             current_ma: [0; MAX_JOINTS],
@@ -257,6 +692,8 @@ impl SimulatedServoPlant {
                 ..Default::default()
             },
             faults: SimFaultInjection::default(),
+            multibus,
+            torque_constants: TorqueConstants::default(),
             torso_pitch_rad: 0.0,
             torso_roll_rad: 0.0,
             torso_yaw_rad: 0.0,
@@ -293,6 +730,12 @@ impl SimulatedServoPlant {
             contact_ticks: [0; 2],
             last_support_foot: 0,
             contact_cop_offset_m: [0.0; 2],
+            noise_rng: NoiseRng::new(DEFAULT_NOISE_SEED),
+            noise_seed_applied: DEFAULT_NOISE_SEED,
+            imu_angle_bias_rad: [0.0; 3],
+            imu_gyro_bias_rad_s: [0.0; 3],
+            imu_accel_bias_m_s2: [0.0; 3],
+            imu_history: VecDeque::with_capacity(MAX_IMU_LATENCY_TICKS + 1),
         }
     }
 
@@ -302,6 +745,68 @@ impl SimulatedServoPlant {
 
     pub fn faults_mut(&mut self) -> &mut SimFaultInjection {
         &mut self.faults
+    }
+
+    /// Rebuild `last_cmd` from the goal registers written over the wire.
+    ///
+    /// This is the plant's only command input: firmware and simulation both
+    /// encode a `RawServoCommand` into the same BareFOC control table, and the
+    /// plant decodes it back through a `ControlTableClient` before integrating.
+    /// A failed (injected) transaction leaves that joint's previous goal intact.
+    fn harvest_commands(&mut self) {
+        self.multibus
+            .bus_mut()
+            .set_bus_error_injection(self.faults.servo_bus_error);
+        let mut decoded = self.last_cmd;
+        for joint in 0..self.joint_count.min(MAX_SERVO_JOINTS) {
+            let Some(node) = joint_node_addr(joint) else {
+                break;
+            };
+            let goal = {
+                let mut client = SimControlClient::new(node, I2cTransport::new(&mut self.multibus));
+                let torque_enable = client.read_u8(REG_TORQUE_ENABLE);
+                let operating_mode = client.read_u8(REG_OPERATING_MODE);
+                let position = client.read_f32(REG_GOAL_POSITION);
+                let velocity = client.read_f32(REG_GOAL_VELOCITY);
+                let current = client.read_f32(REG_GOAL_CURRENT);
+                match (torque_enable, operating_mode, position, velocity, current) {
+                    (Ok(t), Ok(m), Ok(p), Ok(v), Ok(c)) => Some((t, m, p, v, c)),
+                    _ => None,
+                }
+            };
+            let Some((torque_enable, mode, position, velocity, current)) = goal else {
+                continue;
+            };
+            if torque_enable != 0 {
+                decoded.torque_mask |= 1u32 << joint;
+            } else {
+                decoded.torque_mask &= !(1u32 << joint);
+            }
+            decoded.command_mode[joint] = joint_mode_from_operating(mode).to_wire();
+            decoded.raw_target_rad[joint] = position;
+            decoded.raw_velocity_rad_s[joint] = velocity;
+            decoded.torque_nm[joint] = self.torque_constants.amps_to_nm(joint, current);
+        }
+        self.last_cmd = decoded;
+    }
+
+    /// Publish the plant's measured joint state into each node's feedback burst
+    /// (`0x142..=0x14F`) so the next burst read sees exactly what hardware would.
+    fn publish_feedback(&mut self, fb: &RawServoFeedback) {
+        for joint in 0..self.joint_count.min(MAX_SERVO_JOINTS) {
+            let Some(node) = joint_node_addr(joint) else {
+                break;
+            };
+            let sample = JointFeedback {
+                position_rad: fb.raw_angle_rad[joint],
+                velocity_rad_s: fb.velocity_rad_s[joint],
+                current_amps: fb.current_ma[joint] as f32 * 0.001_f32,
+                temperature_c: fb.temp_c[joint] as f32,
+            };
+            self.multibus
+                .bus_mut()
+                .write_feedback_burst(node, &sample.to_burst());
+        }
     }
 
     pub fn set_virtual_hand_angle(&mut self, joint: usize, raw_rad: f32) {
@@ -318,13 +823,71 @@ impl SimulatedServoPlant {
         &self.raw_angle_rad
     }
 
-    /// Injects a combat shove angular velocity impulse (rad/s) into torso pitch and roll.
+    /// Read-only view of the shared joint-plant state (used by parity tests).
+    pub fn joint_plant(&self) -> &JointPlant<MAX_JOINTS> {
+        &self.joints
+    }
+
+    /// Mutable view of the shared joint-plant state (fault injection / tests).
+    pub fn joint_plant_mut(&mut self) -> &mut JointPlant<MAX_JOINTS> {
+        &mut self.joints
+    }
+
+    /// Injects a combat shove as both a torso angular impulse and a velocity
+    /// impulse on the stance-leg joints.
+    ///
+    /// The torso rate alone cannot exercise the kernel's impact detector: that
+    /// path watches joint current. Adding the velocity step on the supporting
+    /// legs makes the shared `JointPlant` develop a large opposing PD torque,
+    /// hence a current spike the detector can debounce. Alternating the joint
+    /// signs keeps the net FK displacement small so fall detection still sees
+    /// the torso impulse as the dominant effect.
     pub fn apply_push_impulse(&mut self, pitch_impulse_rad_s: f32, roll_impulse_rad_s: f32) {
         if pitch_impulse_rad_s.is_finite() {
             self.pitch_rate_rad_s = (self.pitch_rate_rad_s + pitch_impulse_rad_s).clamp(-6.5, 6.5);
         }
         if roll_impulse_rad_s.is_finite() {
             self.roll_rate_rad_s = (self.roll_rate_rad_s + roll_impulse_rad_s).clamp(-6.5, 6.5);
+        }
+
+        if !pitch_impulse_rad_s.is_finite() && !roll_impulse_rad_s.is_finite() {
+            return;
+        }
+        let pitch = if pitch_impulse_rad_s.is_finite() {
+            pitch_impulse_rad_s
+        } else {
+            0.0_f32
+        };
+        let roll = if roll_impulse_rad_s.is_finite() {
+            roll_impulse_rad_s
+        } else {
+            0.0_f32
+        };
+        let impulse = (pitch.abs() + roll.abs()).min(8.0_f32) * STANCE_IMPULSE_GAIN;
+        let direction = if pitch + roll >= 0.0_f32 { 1.0_f32 } else { -1.0_f32 };
+        if impulse <= 0.0_f32 || self.joint_count < 17 {
+            return;
+        }
+
+        let leg_start = 9usize;
+        let leg_end = if self.joint_count >= 21 { 21 } else { 17 }.min(self.joint_count);
+        let per_leg = (leg_end - leg_start) / 2;
+        if per_leg == 0 {
+            return;
+        }
+        let support_left = if self.last_balance.support_foot <= 1 {
+            self.last_balance.support_foot == 1
+        } else {
+            self.foot_contacts[1].grf_n >= self.foot_contacts[0].grf_n
+        };
+        let stance_start = leg_start + if support_left { per_leg } else { 0 };
+        for joint in stance_start..stance_start + per_leg {
+            let sign = if (joint - leg_start) % 2 == 0 { -1.0_f32 } else { 1.0_f32 };
+            let scale = 0.7_f32 + 0.3_f32 * ((joint - leg_start) as f32 / per_leg as f32);
+            let delta = direction * sign * impulse * scale;
+            let velocity = (self.joints.velocity(joint) + delta).clamp(-14.0_f32, 14.0_f32);
+            self.joints.set_velocity(joint, velocity);
+            self.velocity_rad_s[joint] = velocity;
         }
     }
 
@@ -404,6 +967,14 @@ impl SimulatedServoPlant {
     /// Right (`false`) and left (`true`) sole contact state.
     pub fn foot_contact(&self, left: bool) -> FootContact {
         self.foot_contacts[if left { 1 } else { 0 }]
+    }
+
+    /// Mutable right (`false`) / left (`true`) sole contact state.
+    ///
+    /// Used by tests and by direct world-state setup; the next plant step
+    /// recomputes contacts from FK as usual.
+    pub fn foot_contact_mut(&mut self, left: bool) -> &mut FootContact {
+        &mut self.foot_contacts[if left { 1 } else { 0 }]
     }
 
     /// Both sole contact states, indexed `[right, left]`.
@@ -686,7 +1257,7 @@ impl SimulatedServoPlant {
             let penetration = (-clearance).max(0.0_f32);
             let contact = clearance <= CONTACT_TOLERANCE_M;
             let world_point = [pelvis_x + p[0], pelvis_z + p[2]];
-            let grf = if contact {
+            let raw_grf = if contact {
                 // Generalised stance spring: same touchdown/nominal compliance
                 // as the running hop, driven here by sole penetration.
                 stance_spring_grf(penetration, (-pv[1]).max(0.0_f32), &self.running_cfg, 1.0)
@@ -701,7 +1272,8 @@ impl SimulatedServoPlant {
                 } else {
                     world_point
                 },
-                grf_n: grf.min(4.0_f32 * body_weight),
+                // Unilateral: a lifted sole can never pull the body down.
+                grf_n: unilateral_grf(contact, raw_grf, 4.0_f32 * body_weight),
                 penetration_m: penetration,
                 slip_m_s: 0.0_f32,
             };
@@ -742,10 +1314,24 @@ impl SimulatedServoPlant {
             contacts[support].contact = true;
         }
 
-        // 3. GRF-weighted CoP (the support point of the LIPM). Airborne -> CoM,
-        //    so no phantom ground moment is applied.
+        // Fault: desynchronize plant contacts from the controller's phase-scripted
+        // support foot by reporting a phantom double support. Published telemetry
+        // still uses the plant's actual mask (see `contact_mask`).
+        if self.faults.contact_disagreement {
+            for foot in 0..2 {
+                contacts[foot].contact = true;
+                if contacts[foot].grf_n <= 0.0_f32 {
+                    contacts[foot].grf_n =
+                        unilateral_grf(true, 0.5_f32 * body_weight, 4.0_f32 * body_weight);
+                }
+            }
+        }
+
+        // 3. GRF-weighted CoP (the support point of the LIPM), clamped to the
+        //    convex hull of the loaded soles. Airborne -> CoM, so no phantom
+        //    ground moment is applied.
         let grf_sum = contacts[0].grf_n + contacts[1].grf_n;
-        let cop = if grf_sum > 1.0e-3_f32 {
+        let weighted_cop = if grf_sum > 1.0e-3_f32 {
             [
                 (contacts[0].point_m[0] * contacts[0].grf_n
                     + contacts[1].point_m[0] * contacts[1].grf_n)
@@ -757,6 +1343,7 @@ impl SimulatedServoPlant {
         } else {
             [self.world_com_pos_m[0], self.world_com_pos_m[2]]
         };
+        let cop = clamp_cop_to_support(weighted_cop, &contacts);
         self.contact_cop_offset_m = [
             cop[0] - self.world_com_pos_m[0],
             cop[1] - self.world_com_pos_m[2],
@@ -795,6 +1382,7 @@ impl SimulatedServoPlant {
                 let fvx = self.world_com_vel_m_s[0] - fk.com_vel[0] + pv[0];
                 let fvz = self.world_com_vel_m_s[2] - fk.com_vel[2] + pv[2];
                 contacts[foot].slip_m_s = (fvx * fvx + fvz * fvz).sqrt().min(2.0_f32);
+                apply_friction_slip(&mut contacts[foot], mass, self.faults.foot_friction_mu);
             }
         }
         self.foot_contacts = contacts;
@@ -805,89 +1393,170 @@ impl SimulatedServoPlant {
         }
     }
 
+    /// Builds one seeded IMU sample: white noise, slowly-varying biases and
+    /// gravity derived from the *published* (biased) attitude so the two stay
+    /// physically consistent. All draws come from `NoiseRng` in a fixed order.
+    fn imu_sample(&mut self, dt: f32) -> rk_proto::ImuState {
+        const AXES: usize = 3;
+        let noise = &self.faults;
+        let beta = (dt / IMU_BIAS_TAU_S).clamp(0.0_f32, 1.0_f32);
+
+        let mut angle_bias = [0.0_f32; AXES];
+        let mut gyro_bias = [0.0_f32; AXES];
+        let mut accel_bias = [0.0_f32; AXES];
+        for axis in 0..AXES {
+            let a = self.noise_rng.next_f32() * noise.imu_angle_bias_rad.max(0.0_f32);
+            let g = self.noise_rng.next_f32() * noise.imu_gyro_bias_rad_s.max(0.0_f32);
+            let b = self.noise_rng.next_f32() * noise.imu_accel_bias_m_s2.max(0.0_f32);
+            self.imu_angle_bias_rad[axis] += (a - self.imu_angle_bias_rad[axis]) * beta;
+            self.imu_gyro_bias_rad_s[axis] += (g - self.imu_gyro_bias_rad_s[axis]) * beta;
+            self.imu_accel_bias_m_s2[axis] += (b - self.imu_accel_bias_m_s2[axis]) * beta;
+            angle_bias[axis] = self.imu_angle_bias_rad[axis];
+            gyro_bias[axis] = self.imu_gyro_bias_rad_s[axis];
+            accel_bias[axis] = self.imu_accel_bias_m_s2[axis];
+        }
+
+        let pitch_rate = self.pitch_rate_rad_s + gyro_bias[0]
+            + self.noise_rng.next_f32() * noise.imu_gyro_noise_rad_s.max(0.0_f32);
+        let roll_rate = self.roll_rate_rad_s + gyro_bias[1]
+            + self.noise_rng.next_f32() * noise.imu_gyro_noise_rad_s.max(0.0_f32);
+        let yaw_rate = self.roll_rate_rad_s * 0.06_f32 + gyro_bias[2]
+            + self.noise_rng.next_f32() * noise.imu_gyro_noise_rad_s.max(0.0_f32);
+
+        let pitch = self.torso_pitch_rad + angle_bias[0];
+        let roll = self.torso_roll_rad + angle_bias[1];
+        let yaw = self.torso_yaw_rad + angle_bias[2];
+        let mut gravity = gravity_from_tilt(pitch, roll);
+        for axis in 0..AXES {
+            gravity[axis] += accel_bias[axis]
+                + self.noise_rng.next_f32() * noise.imu_accel_noise_m_s2.max(0.0_f32);
+        }
+
+        let mut sample = rk_proto::ImuState {
+            available: true,
+            pitch_rad: pitch,
+            roll_rad: roll,
+            yaw_rad: yaw,
+            pitch_rate_rad_s: pitch_rate,
+            roll_rate_rad_s: roll_rate,
+            yaw_rate_rad_s: yaw_rate,
+            gravity,
+        };
+        // Latency: publish the oldest buffered sample once the ring is full.
+        let latency = (noise.imu_latency_ticks as usize).min(MAX_IMU_LATENCY_TICKS);
+        if latency > 0 {
+            self.imu_history.push_back(sample);
+            while self.imu_history.len() > latency + 1 {
+                self.imu_history.pop_front();
+            }
+            // Until the ring fills, the newest sample is the best available.
+            if self.imu_history.len() > latency {
+                if let Some(delayed) = self.imu_history.front().copied() {
+                    sample = delayed;
+                }
+            }
+        } else {
+            self.imu_history.clear();
+        }
+        sample
+    }
+
     pub fn step_plant(&mut self, dt_sec: f32) -> RawServoFeedback {
+        // The plant consumes goal registers, never a raw struct copy: this is
+        // the same control table firmware writes on the real bus.
+        self.harvest_commands();
         let dt = dt_sec.clamp(0.001_f32, 0.05_f32);
         self.wave_phase += dt * 2.4_f32;
+
+        // Changing the configured seed reinitialises every noise state so two
+        // sessions with the same seed and command stream stay bit-identical.
+        if self.faults.seed != self.noise_seed_applied {
+            self.noise_rng = NoiseRng::new(self.faults.seed);
+            self.noise_seed_applied = self.faults.seed;
+            self.imu_angle_bias_rad = [0.0; 3];
+            self.imu_gyro_bias_rad_s = [0.0; 3];
+            self.imu_accel_bias_m_s2 = [0.0; 3];
+            self.imu_history.clear();
+        }
+
+        // The shared plant maps the lag fault onto bandwidth/friction and takes
+        // the kernel's gravity-torque approximation as a feed-forward load.
+        self.joints.set_lag_factor(self.faults.servo_lag_factor);
+        let mut gravity = [0.0_f32; MAX_IMPACT_JOINTS];
+        gravity_torque_nm(&self.raw_angle_rad, &mut gravity);
+        for i in 0..self.joint_count.min(MAX_IMPACT_JOINTS) {
+            self.joints.set_gravity_torque(i, gravity[i]);
+        }
 
         let mut total_current_ma: u32 = 180;
 
         for i in 0..self.joint_count {
             let torque_on = ((self.last_cmd.torque_mask >> i) & 1) == 1;
             let stalled = self.faults.stalled_joints[i];
-            let running_torque = self.running_mode
-                && torque_on
-                && JointCommandMode::from_wire(self.last_cmd.command_mode[i])
-                    == JointCommandMode::Torque;
+            let mode = JointCommandMode::from_wire(self.last_cmd.command_mode[i]);
+            let running_torque = self.running_mode && torque_on && mode == JointCommandMode::Torque;
+            // Torque OFF is encoded as a non-positive limit; the plant then holds
+            // the joint, draws quiescent current and cools toward ambient.
+            let limit = if torque_on { self.last_cmd.torque_nm[i].max(0.0_f32) } else { 0.0_f32 };
 
             if running_torque {
                 // Torque-capable running: torque_nm is a thrust command, not a
                 // position-servo target. The vertical hop integrator consumes it;
                 // joint angles are held at their last pose. Current tracks the
                 // commanded torque so flight detection sees near-zero leg current.
+                self.joints.set_angle(i, self.raw_angle_rad[i]);
+                let (_, _, stall_ma, _) = self.joints.step(i, dt, mode, 0.0_f32, 0.0_f32, 0.0_f32, stalled);
                 let tq = self.last_cmd.torque_nm[i].abs();
                 self.velocity_rad_s[i] = 0.0;
                 self.current_ma[i] = if stalled {
-                    2250
+                    stall_ma
                 } else {
                     (tq / RUNNING_NOMINAL_TORQUE_NM * rk_proto::RATED_CURRENT_MA as f32)
                         .clamp(0.0, 3400.0) as u16
                 };
-            } else if torque_on {
-                let target = self.last_cmd.raw_target_rad[i];
-                let pos = self.raw_angle_rad[i];
-                let err = target - pos;
-
-                if stalled {
-                    self.velocity_rad_s[i] = 0.0;
-                    let torque_scale = (self.last_cmd.torque_nm[i].abs() / 1.8_f32).clamp(0.10, 1.0);
-                    let spike =
-                        ((2350.0_f32 + err.abs() * 900.0_f32) * torque_scale).min(3400.0_f32) as u16;
-                    self.current_ma[i] = spike;
-                } else {
-                    // Honor per-joint torque_nm saturation limit (software compliance & ukemi relaxation)
-                    let torque_scale = (self.last_cmd.torque_nm[i].abs() / 1.8_f32).clamp(0.08, 1.0);
-                    let rate = (2.6_f32 + self.faults.servo_lag_factor * 42.0_f32) * torque_scale;
-                    let alpha = 1.0_f32 - (-rate * dt).exp();
-                    let next_pos = pos + err * alpha;
-                    let vel = (next_pos - pos) / dt;
-                    self.raw_angle_rad[i] = next_pos;
-                    self.velocity_rad_s[i] = vel;
-                    self.virtual_hand_rad[i] = next_pos;
-
-                    let max_ma = (2800.0_f32 * torque_scale).max(260.0_f32);
-                    let load = (95.0_f32 + (err.abs() * 1450.0_f32 + vel.abs() * 160.0_f32) * torque_scale)
-                        .min(max_ma) as u16;
-                    self.current_ma[i] = load;
-                }
             } else {
-                // Torque OFF (Teach or EStop): follows Virtual-Hand posing or external wave
-                let mut hand_goal = self.virtual_hand_rad[i];
-                if self.faults.external_hand_wave {
-                    match i {
-                        0 => hand_goal = (self.wave_phase * 0.6).sin() * 0.35, // waist_yaw
-                        1 => hand_goal = (self.wave_phase * 0.8).sin() * 0.42, // head_yaw
-                        3 => hand_goal = -1.35 + self.wave_phase.sin() * 0.48, // l_shoulder_pitch
-                        5 => hand_goal = -1.25 + (self.wave_phase * 1.3).cos() * 0.55, // l_elbow
-                        6 => hand_goal = -0.95 + self.wave_phase.cos() * 0.40, // r_shoulder_pitch
-                        8 => hand_goal = -1.15 + (self.wave_phase * 1.1).sin() * 0.45, // r_elbow
-                        _ => {}
+                let (angle, velocity, ma, _) = self.joints.step(
+                    i,
+                    dt,
+                    mode,
+                    self.last_cmd.raw_target_rad[i],
+                    self.last_cmd.raw_velocity_rad_s[i],
+                    limit,
+                    stalled,
+                );
+                self.raw_angle_rad[i] = angle;
+                self.velocity_rad_s[i] = velocity;
+                self.current_ma[i] = ma;
+
+                if torque_on {
+                    self.virtual_hand_rad[i] = angle;
+                } else {
+                    // Torque OFF (Teach or EStop): the plant holds the joint;
+                    // virtual-hand posing / external wave is an external kinematic
+                    // input layered on top (there is no motor torque here).
+                    let mut hand_goal = self.virtual_hand_rad[i];
+                    if self.faults.external_hand_wave {
+                        match i {
+                            0 => hand_goal = (self.wave_phase * 0.6).sin() * 0.35, // waist_yaw
+                            1 => hand_goal = (self.wave_phase * 0.8).sin() * 0.42, // head_yaw
+                            3 => hand_goal = -1.35 + self.wave_phase.sin() * 0.48, // l_shoulder_pitch
+                            5 => hand_goal = -1.25 + (self.wave_phase * 1.3).cos() * 0.55, // l_elbow
+                            6 => hand_goal = -0.95 + self.wave_phase.cos() * 0.40, // r_shoulder_pitch
+                            8 => hand_goal = -1.15 + (self.wave_phase * 1.1).sin() * 0.45, // r_elbow
+                            _ => {}
+                        }
                     }
+                    let alpha = 1.0_f32 - (-14.0_f32 * dt).exp();
+                    let next_pos = angle + (hand_goal - angle) * alpha;
+                    self.velocity_rad_s[i] = (next_pos - angle) / dt;
+                    self.raw_angle_rad[i] = next_pos;
+                    self.joints.set_angle(i, next_pos);
+                    self.joints.set_velocity(i, self.velocity_rad_s[i]);
                 }
-                let pos = self.raw_angle_rad[i];
-                let alpha = 1.0_f32 - (-14.0_f32 * dt).exp();
-                let next_pos = pos + (hand_goal - pos) * alpha;
-                self.velocity_rad_s[i] = (next_pos - pos) / dt;
-                self.raw_angle_rad[i] = next_pos;
-                self.current_ma[i] = if stalled { 2250 } else { 35 };
             }
 
             total_current_ma = total_current_ma.saturating_add(self.current_ma[i] as u32);
-
-            let ambient = 28.0_f32;
-            let amps = (self.current_ma[i] as f32) * 0.001_f32;
-            let heat = amps * amps * 4.0_f32;
-            let cool = (self.temp_c_f[i] - ambient) * 0.14_f32;
-            self.temp_c_f[i] = (self.temp_c_f[i] + (heat - cool) * dt).clamp(ambient, 98.0_f32);
+            self.temp_c_f[i] = self.joints.temperature_c(i);
         }
 
         // Deterministic 2-axis stepping-aware LIPM torso tilt dynamics
@@ -1039,9 +1708,37 @@ impl SimulatedServoPlant {
             self.step_running_dynamics(dt);
         }
 
+        // Published sensor values are *copies*: the physics plant keeps the
+        // true angle/current/temperature so replay and direct plant parity stay
+        // unaffected by noise, quantization and offsets.
+        let mut published_angles = self.raw_angle_rad;
+        let mut published_current = self.current_ma;
         let mut temp_c = [28u8; MAX_JOINTS];
         for i in 0..self.joint_count {
             temp_c[i] = self.temp_c_f[i].round() as u8;
+        }
+
+        let lsb = self.faults.encoder_quantization_lsb_rad;
+        if lsb.is_finite() && lsb > 0.0_f32 {
+            for angle in published_angles.iter_mut().take(self.joint_count) {
+                *angle = (*angle / lsb).round() * lsb;
+            }
+        }
+        let current_noise = self.faults.current_noise_pct.clamp(0.0_f32, 1.0_f32);
+        if current_noise > 0.0_f32 {
+            for ma in published_current.iter_mut().take(self.joint_count) {
+                let noisy = *ma as f32 * (1.0_f32 + self.noise_rng.next_f32() * current_noise);
+                *ma = noisy.round().clamp(0.0_f32, 65_535.0_f32) as u16;
+            }
+        }
+        let temp_offset = self.faults.temperature_offset_c;
+        if temp_offset != 0.0_f32 && temp_offset.is_finite() {
+            for temp in temp_c.iter_mut().take(self.joint_count) {
+                let dither = self.noise_rng.next_f32() * 0.1_f32 * temp_offset.abs();
+                *temp = ((*temp as f32) + temp_offset + dither)
+                    .round()
+                    .clamp(0.0_f32, 255.0_f32) as u8;
+            }
         }
 
         let nominal_mv: i32 = if self.faults.voltage_sag {
@@ -1052,27 +1749,19 @@ impl SimulatedServoPlant {
         let sag_mv: i32 = ((total_current_ma as f32 * 0.001_f32) * 85.0_f32) as i32;
         let bus_voltage_mv = (nominal_mv - sag_mv).clamp(8_500, 16_800) as u16;
 
+        let imu = if self.faults.imu_disconnected {
+            rk_proto::ImuState::default()
+        } else {
+            self.imu_sample(dt)
+        };
         RawServoFeedback {
-            raw_angle_rad: self.raw_angle_rad,
+            raw_angle_rad: published_angles,
             velocity_rad_s: self.velocity_rad_s,
-            current_ma: self.current_ma,
+            current_ma: published_current,
             temp_c,
             bus_voltage_mv,
             bus_error: self.faults.servo_bus_error,
-            imu: if self.faults.imu_disconnected {
-                rk_proto::ImuState::default()
-            } else {
-                rk_proto::ImuState {
-                    available: true,
-                    pitch_rad: self.torso_pitch_rad,
-                    roll_rad: self.torso_roll_rad,
-                    yaw_rad: self.torso_yaw_rad,
-                    pitch_rate_rad_s: self.pitch_rate_rad_s,
-                    roll_rate_rad_s: self.roll_rate_rad_s,
-                    yaw_rate_rad_s: self.roll_rate_rad_s * 0.06_f32,
-                    gravity: gravity_from_tilt(self.torso_pitch_rad, self.torso_roll_rad),
-                }
-            },
+            imu,
             i3c_timeout_count: if self.faults.servo_bus_error { 1 } else { 0 },
             imu_source_mask: if self.faults.imu_disconnected {
                 0
@@ -1085,11 +1774,38 @@ impl SimulatedServoPlant {
 
 impl ServoBusPort for SimulatedServoPlant {
     fn read_feedback(&mut self, dt_sec: f32) -> RawServoFeedback {
-        self.step_plant(dt_sec)
+        // Integrate first, then publish the measured state into the register
+        // bank and read it back over the real register-pointer wire encoding.
+        let mut feedback = self.step_plant(dt_sec);
+        self.publish_feedback(&feedback);
+        self.multibus
+            .bus_mut()
+            .set_bus_error_injection(self.faults.servo_bus_error);
+        for joint in 0..self.joint_count.min(MAX_SERVO_JOINTS) {
+            let Some(node) = joint_node_addr(joint) else {
+                break;
+            };
+            let mut client = SimControlClient::new(node, I2cTransport::new(&mut self.multibus));
+            // On a bus failure the values computed by `step_plant` remain in
+            // place, so IMU/voltage/bus health stay independent of servo I/O.
+            let _ = read_joint_feedback(&mut client, joint, &mut feedback);
+        }
+        feedback
     }
 
     fn write_command(&mut self, cmd: &RawServoCommand) {
-        self.last_cmd = *cmd;
+        self.multibus
+            .bus_mut()
+            .set_bus_error_injection(self.faults.servo_bus_error);
+        for joint in 0..self.joint_count.min(MAX_SERVO_JOINTS) {
+            let Some(node) = joint_node_addr(joint) else {
+                break;
+            };
+            let mut client = SimControlClient::new(node, I2cTransport::new(&mut self.multibus));
+            let _ = write_joint_command(&mut client, joint, cmd, &self.torque_constants);
+        }
+        // No direct `last_cmd = *cmd`: goals now live in the register bank and
+        // are decoded by `harvest_commands` at the start of every plant step.
     }
 }
 
@@ -1115,6 +1831,18 @@ pub struct SimRobotIo {
     /// rebased to zero to keep each replay log self-contained.
     record_tick_base: Option<u64>,
     max_recorded_ticks: usize,
+    /// Logical tick index stamped on the next captured plant event. `run_script`
+    /// sets this explicitly before applying each tick's events; outside a script
+    /// it advances in `record_tick` so UI-driven events land on the next tick.
+    event_tick_index: u64,
+    /// Fault snapshot last captured into the event side-channel. Faults are
+    /// mutated through `&mut SimFaultInjection` (see `plant.faults_mut()`), so
+    /// capture is a deterministic diff at each recorded tick — see `record_tick`.
+    last_recorded_faults: Option<SimFaultSnapshot>,
+    /// Virtual-hand angles last captured into the event side-channel. rk-link
+    /// reaches `plant.set_virtual_hand_angle()` directly, bypassing any runner
+    /// wrapper, so this is likewise captured by diffing at each recorded tick.
+    last_recorded_virtual_hand: Option<[f32; MAX_JOINTS]>,
     mcu_model_info: ModelInfo,
     mcu_model_blob: Vec<u8>,
     // --- RobotIo backend state ---
@@ -1128,6 +1856,11 @@ pub struct SimRobotIo {
     pending_cmds: VecDeque<HostToMcu>,
     /// Latest telemetry decoded on the host side of the simulated wire.
     last_host_rx: Option<McuToHost>,
+    /// Status LED state evaluated by `RobotIo::post_tick` from the same firmware
+    /// state machine the board uses. Purely sim-visible: never recorded in ticks.
+    pub sim_led_on: bool,
+    /// Number of `post_tick` invocations (diagnostic, not part of replay).
+    pub post_tick_calls: u32,
 }
 
 impl SimRobotIo {
@@ -1150,6 +1883,9 @@ impl SimRobotIo {
             recorded_log: None,
             record_tick_base: None,
             max_recorded_ticks: 2400,
+            event_tick_index: 0,
+            last_recorded_faults: None,
+            last_recorded_virtual_hand: None,
             mcu_model_info,
             mcu_model_blob,
             ticker: None,
@@ -1157,6 +1893,8 @@ impl SimRobotIo {
             dt_override: None,
             pending_cmds: VecDeque::new(),
             last_host_rx: None,
+            sim_led_on: false,
+            post_tick_calls: 0,
         }
     }
 
@@ -1228,18 +1966,58 @@ impl SimRobotIo {
     pub fn start_recording(&mut self) {
         self.recording = true;
         self.record_tick_base = None;
+        // Snapshot the current fault/virtual-hand state so the initial
+        // configuration is part of the script and subsequent changes are the
+        // only events emitted by the per-tick diffs in `record_tick`.
+        let initial_faults = fault_snapshot(self.plant.faults());
+        self.last_recorded_faults = Some(initial_faults.clone());
+        self.last_recorded_virtual_hand = Some(*self.plant.virtual_hand_angles());
+        self.event_tick_index = 0;
         self.recorded_log = Some(CopperReplayLog {
             version: 1,
             joint_count: self.task.kernel().joint_count(),
             initial_raw_pose: *self.plant.raw_angles(),
             initial_calibration: self.task.kernel().calibration().to_vec(),
             ticks: Vec::new(),
+            seed: initial_faults.seed,
+            events: vec![TimedSimEvent {
+                tick_index: 0,
+                kind: SimEventKind::SetFaults(initial_faults),
+            }],
         });
     }
 
     pub fn stop_recording(&mut self) -> Option<CopperReplayLog> {
         self.recording = false;
+        if let Some(log) = self.recorded_log.as_mut() {
+            // The seed may have been replaced by a SetFaults event mid-run.
+            log.seed = self.plant.faults().seed;
+        }
         self.recorded_log.clone()
+    }
+
+    /// Overrides the per-recording tick cap (default 2400). Call before
+    /// `start_recording`; `run_script` sets it from `ExperimentScript::max_ticks`.
+    pub fn set_max_recorded_ticks(&mut self, max_ticks: usize) {
+        self.max_recorded_ticks = max_ticks.max(1);
+    }
+
+    /// Sets the logical tick index stamped on plant events applied before the
+    /// next `step_harness` call. Used by `run_script` to reproduce exact indices.
+    pub fn set_event_tick_index(&mut self, tick_index: u64) {
+        self.event_tick_index = tick_index;
+    }
+
+    /// Records one non-kernel plant event into the active replay log.
+    fn record_event(&mut self, kind: SimEventKind) {
+        if self.recording {
+            if let Some(log) = self.recorded_log.as_mut() {
+                log.events.push(TimedSimEvent {
+                    tick_index: self.event_tick_index,
+                    kind,
+                });
+            }
+        }
     }
 
     pub fn recorded_log(&self) -> Option<&CopperReplayLog> {
@@ -1309,16 +2087,42 @@ impl SimRobotIo {
     pub fn apply_push_impulse(&mut self, pitch_impulse_rad_s: f32, roll_impulse_rad_s: f32) {
         self.plant
             .apply_push_impulse(pitch_impulse_rad_s, roll_impulse_rad_s);
+        self.record_event(SimEventKind::Shove {
+            pitch_rad_s: pitch_impulse_rad_s,
+            roll_rad_s: roll_impulse_rad_s,
+        });
     }
 
     /// Resets the simulated torso strictly upright at 0 deg pitch/roll.
     pub fn reset_upright(&mut self) {
         self.plant.reset_upright();
+        self.record_event(SimEventKind::ResetUpright);
     }
 
     /// Updates active get-up recovery progress so ground push-off lifts the fallen torso upright.
     pub fn set_recovery_progress(&mut self, progress: Option<f32>) {
         self.plant.set_recovery_progress(progress);
+        self.record_event(SimEventKind::Recovery(progress));
+    }
+
+    /// Applies one scripted plant event. This is the single replay entry point
+    /// used by `run_script`; it shares the exact hooks the UI/MCP paths use so
+    /// a captured script re-drives the same plant code on replay.
+    pub fn apply_event(&mut self, kind: &SimEventKind) {
+        match *kind {
+            SimEventKind::SetFaults(ref snapshot) => {
+                *self.plant.faults_mut() = faults_from_snapshot(snapshot);
+            }
+            SimEventKind::Shove {
+                pitch_rad_s,
+                roll_rad_s,
+            } => self.apply_push_impulse(pitch_rad_s, roll_rad_s),
+            SimEventKind::Recovery(progress) => self.set_recovery_progress(progress),
+            SimEventKind::ResetUpright => self.reset_upright(),
+            SimEventKind::VirtualHand { joint, rad } => {
+                self.plant.set_virtual_hand_angle(joint, rad);
+            }
+        }
     }
 
     /// Injects a valid COBS frame with a flipped payload bit to exercise pre-COBS CRC-32 drop counting.
@@ -1430,26 +2234,71 @@ impl RobotIo for SimRobotIo {
         decoded.balance.world_vel_m_s = self.plant.world_velocity_m_s();
         decoded.estimator.valid_mask |= estimator_valid::WORLD;
         decoded.estimator.contact_mask = self.plant.contact_mask();
-        decoded.estimator.grf_left_n = self.plant.foot_contact(false).grf_n;
-        decoded.estimator.grf_right_n = self.plant.foot_contact(true).grf_n;
+        // `foot_contact(left)` indexes `[1]` for left / `[0]` for right, matching
+        // the plant's `fk_feet = [right, left]` and the wire contact-mask bits.
+        decoded.estimator.grf_left_n = self.plant.foot_contact(true).grf_n;
+        decoded.estimator.grf_right_n = self.plant.foot_contact(false).grf_n;
         decoded.estimator.valid_mask |= estimator_valid::GRF;
         self.last_host_rx = Some(decoded);
     }
 
     fn record_tick(&mut self, tick: &ControlTick) {
         if self.recording {
+            // Replay verification starts a fresh `ControlTask` at index zero.
+            // Rebase the persistent task's running index so a log recorded
+            // across many fixed-step calls stays replayable.
+            let base = *self.record_tick_base.get_or_insert(tick.tick_index);
+            let logical_index = tick.tick_index.saturating_sub(base);
+
+            // Fault and virtual-hand mutations arrive through `&mut` handles
+            // (rk-link's `faults_mut()` / `plant.set_virtual_hand_angle()`), so
+            // they cannot call a recorder hook at the mutation site. Diffing at
+            // each recorded tick is deterministic and captures exactly the
+            // state that influenced this tick's feedback. Explicit hooks below
+            // handle events with no persistent snapshot to diff.
+            let current_faults = fault_snapshot(self.plant.faults());
+            if self.last_recorded_faults.as_ref() != Some(&current_faults) {
+                self.last_recorded_faults = Some(current_faults.clone());
+                if let Some(log) = self.recorded_log.as_mut() {
+                    log.events.push(TimedSimEvent {
+                        tick_index: logical_index,
+                        kind: SimEventKind::SetFaults(current_faults),
+                    });
+                }
+            }
+            let previous_hand = self.last_recorded_virtual_hand;
+            let current_hand = *self.plant.virtual_hand_angles();
+            if previous_hand != Some(current_hand) {
+                for (joint, rad) in current_hand.into_iter().enumerate() {
+                    if previous_hand.map_or(true, |prev| prev[joint] != rad) {
+                        if let Some(log) = self.recorded_log.as_mut() {
+                            log.events.push(TimedSimEvent {
+                                tick_index: logical_index,
+                                kind: SimEventKind::VirtualHand { joint, rad },
+                            });
+                        }
+                    }
+                }
+                self.last_recorded_virtual_hand = Some(current_hand);
+            }
+            self.event_tick_index = logical_index.saturating_add(1);
+
             if let Some(log) = self.recorded_log.as_mut() {
                 if log.ticks.len() < self.max_recorded_ticks {
-                    // Replay verification starts a fresh `ControlTask` at index
-                    // zero. Rebase the persistent task's running index so a log
-                    // recorded across many fixed-step calls stays replayable.
-                    let base = *self.record_tick_base.get_or_insert(tick.tick_index);
                     let mut recorded = *tick;
-                    recorded.tick_index = tick.tick_index.saturating_sub(base);
+                    recorded.tick_index = logical_index;
                     log.ticks.push(recorded);
                 }
             }
         }
+    }
+
+    fn post_tick(&mut self, now_ms: u32) {
+        // Same side effect as the RP2350 board hook: the LED mode was refreshed
+        // from the kernel's safety snapshot earlier in `step_control_tick`.
+        // This is intentionally outside `record_tick`, so replay stays bit-exact.
+        self.post_tick_calls = self.post_tick_calls.saturating_add(1);
+        self.sim_led_on = rk_fw_core::copper::current_led_mode().is_lit(now_ms);
     }
 }
 
@@ -1471,6 +2320,32 @@ type HarnessFuture = core::pin::Pin<Box<dyn core::future::Future<Output = ()> + 
 /// dereferences happen strictly inside `poll`, which this executor drives
 /// synchronously and never concurrently with the runner.
 struct PersistentIoPtr(*mut SimRobotIo);
+
+/// Control loop driven by the deterministic harness.
+///
+/// Unlike the generic `rk_fw_core::control_task::control_task`, the kernel lives
+/// in `SimRobotIo::task` instead of as a local of this future. That is what lets
+/// `reset_experiment` install a fresh `ControlTask` while the future stays parked
+/// on the global mock timer queue (dropping/re-spawning it would strand an
+/// alarm). Every tick still goes through the shared `step_control_tick`, so the
+/// firmware and simulator execute the exact same control body.
+async fn persistent_control_task(mut io: PersistentIoPtr) {
+    loop {
+        io.wait_tick().await;
+        // SAFETY: the harness polls this future synchronously and never while
+        // the runner holds a `&mut` to the same IO. The kernel is moved out for
+        // exactly one tick so `io` and the kernel are disjoint borrows.
+        let mut task = {
+            let io_ref = unsafe { &mut *io.0 };
+            let placeholder = ControlTask::new(1, &[JointCalibration::default(); MAX_JOINTS]);
+            core::mem::replace(&mut io_ref.task, placeholder)
+        };
+        step_control_tick(&mut io, &mut task);
+        unsafe {
+            (&mut *io.0).task = task;
+        }
+    }
+}
 
 impl RobotIo for PersistentIoPtr {
     async fn wait_tick(&mut self) {
@@ -1524,6 +2399,24 @@ impl RobotIo for PersistentIoPtr {
     }
 }
 
+/// A deterministic, headless experiment specification.
+///
+/// `packets[i]` is the exact typed `HostToMcu` the kernel consumes on tick `i`
+/// (missing packets leave that tick command-less). `events` are applied before
+/// the tick named by `tick_index`, and `seed` seeds the simulator's sensor-noise
+/// PRNG. No wall-clock or frame-derived packets are involved: the script is the
+/// complete input to [`CopperSimRunner::run_script`].
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct ExperimentScript {
+    pub seed: u64,
+    pub events: Vec<TimedSimEvent>,
+    pub packets: Vec<HostToMcu>,
+    /// Number of control ticks to drive. This is also the recorder cap for the
+    /// resulting log; events at indices >= `max_ticks` are ignored.
+    pub max_ticks: usize,
+}
+
 /// Public simulation runner. One instance owns exactly one deterministic
 /// Embassy executor and one spawned shared control task for its whole lifetime.
 /// Repeated fixed-step calls reuse them instead of creating a fresh executor
@@ -1537,6 +2430,18 @@ pub struct CopperSimRunner {
     // Kept alive for the session; see `HarnessFuture` docs for why it is never
     // reclaimed in `Drop`.
     _storage: &'static raw::TaskStorage<HarnessFuture>,
+    /// Construction inputs retained so `reset_experiment` can rebuild an
+    /// identical kernel + plant instead of trying to reset a kernel owned by a
+    /// parked (and therefore unreachable) control-task future.
+    reset_spec: RunnerResetSpec,
+}
+
+/// Immutable construction inputs needed to reproduce a runner exactly.
+#[derive(Clone)]
+struct RunnerResetSpec {
+    joint_count: usize,
+    initial_cal: Vec<JointCalibration>,
+    initial_raw_pose: [f32; MAX_JOINTS],
 }
 
 // SAFETY: Embassy's `raw::Executor` and our raw IO pointer are deliberately
@@ -1585,7 +2490,7 @@ impl CopperSimRunner {
         let storage: &'static raw::TaskStorage<HarnessFuture> =
             Box::leak(Box::new(raw::TaskStorage::new()));
         let token = storage
-            .spawn(move || Box::pin(rk_fw_core::control_task::control_task(PersistentIoPtr(io))))
+            .spawn(move || Box::pin(persistent_control_task(PersistentIoPtr(io))))
             .expect("fresh harness task storage must be spawnable");
         harness.spawner().spawn(token);
 
@@ -1593,6 +2498,11 @@ impl CopperSimRunner {
             io: NonNull::new(io).expect("Box::into_raw never returns null"),
             harness,
             _storage: storage,
+            reset_spec: RunnerResetSpec {
+                joint_count,
+                initial_cal: initial_cal.to_vec(),
+                initial_raw_pose,
+            },
         }
     }
 
@@ -1644,6 +2554,123 @@ impl CopperSimRunner {
         self.io_mut().last_host_rx.take().unwrap_or_default()
     }
 
+    /// Decodes a delimited COBS `HostToMcu` frame through the exact same
+    /// `CobsStreamFramer` the firmware USB CDC-ACM path uses.
+    ///
+    /// This is the minimal host-frame decoder exposed for the fixed-step
+    /// transport: codec errors are forwarded into this runner's local mailbox,
+    /// so `wire_error_counts()` (and therefore the next telemetry snapshot)
+    /// observe the very same counters the app reads on hardware.
+    pub fn decode_host_frame(&mut self, wire_frame: &mut [u8]) -> Option<HostToMcu> {
+        self.decode_rx(wire_frame)
+    }
+
+    /// Resets the whole simulation experiment to its construction state:
+    /// control kernel, plant, fault injection, wire framer/mailbox and replay
+    /// recorder all start fresh, so an identical scripted command stream
+    /// produces identical replay bytes.
+    ///
+    /// The persistent executor and its future are intentionally kept alive:
+    /// the Embassy mock clock cannot be reset after the task has registered a
+    /// periodic alarm (doing so strands the alarm and never wakes the task
+    /// again). The harness loop reads the kernel from `SimRobotIo::task` on
+    /// every tick, so replacing that field installs a genuinely fresh kernel —
+    /// calibration, soft limits, zero offsets and every internal filter — for
+    /// the next tick. `uptime_ms` still advances monotonically (as it does on hardware), so
+    /// callers compare replay/tick streams rather than absolute wall-clock
+    /// fields. The MCP bridge channel is owned outside this runner and is
+    /// intentionally untouched.
+    pub fn reset_experiment(&mut self) {
+        let spec = self.reset_spec.clone();
+        let io = self.io_mut();
+
+        // Rebuild the kernel from the construction inputs so every internal
+        // filter/integrator/calibration state starts from the same values.
+        io.task = ControlTask::new(spec.joint_count, &spec.initial_cal);
+
+        // Plant: replace wholesale with a fresh instance seeded from the same
+        // pose. Fault injection defaults to off, so all four wire knobs reset.
+        io.plant = SimulatedServoPlant::new(spec.joint_count, spec.initial_raw_pose);
+
+        // Wire: drop any queued commands, clear the stream framer and reset the
+        // local mailbox so no stale packet or error count leaks into the run.
+        io.host_framer = CobsStreamFramer::new();
+        io.host_mailbox = HostLinkMailbox::new();
+        io.pending_cmds.clear();
+        io.last_host_rx = None;
+        io.host_decode_errors = 0;
+        io.uptime_ms_f = 0.0;
+        io.sim_led_on = false;
+        io.post_tick_calls = 0;
+
+        // Recorder: stop and clear any log from the previous experiment.
+        io.recording = false;
+        io.recorded_log = None;
+        io.record_tick_base = None;
+        io.max_recorded_ticks = 2400;
+        io.event_tick_index = 0;
+        io.last_recorded_faults = None;
+        io.last_recorded_virtual_hand = None;
+
+        // Keep the task driven by the same mock clock (no reset, no re-spawn).
+        io.use_mock_clock = true;
+        io.dt_override = None;
+        // Keep the ticker: dropping it would re-register the first alarm at a
+        // different phase against the still-running mock clock. The periodic
+        // Ticker resumes from its existing schedule, so ticks stay aligned.
+    }
+
+    /// Runs a scripted experiment from a clean reset and returns a replayable log.
+    ///
+    /// The experiment is reset first (kernel, plant, faults, wire, host command
+    /// sequencing and recorder), then each tick applies its scheduled plant
+    /// events before feeding the script's typed packet through `step_harness`.
+    /// Events are recorded by the same hooks used by UI/MCP experiments, so the
+    /// returned log's `events` side-channel is derived from the applied events
+    /// rather than copied from the script. Re-running the same script after
+    /// another reset produces bit-identical ticks (modulo the monotonically
+    /// advancing `now_ms`, which replay normalizes by feeding it back).
+    pub fn run_script(&mut self, script: &ExperimentScript) -> CopperReplayLog {
+        self.reset_experiment();
+        let max_ticks = script.max_ticks.max(1);
+        self.set_max_recorded_ticks(max_ticks);
+        self.plant.faults_mut().seed = script.seed;
+        self.start_recording();
+
+        let mut events_by_tick: BTreeMap<u64, Vec<&TimedSimEvent>> = BTreeMap::new();
+        for event in &script.events {
+            if event.tick_index < max_ticks as u64 {
+                events_by_tick.entry(event.tick_index).or_default().push(event);
+            }
+        }
+
+        for tick_index in 0..max_ticks as u64 {
+            self.set_event_tick_index(tick_index);
+            if let Some(events) = events_by_tick.get(&tick_index) {
+                for event in events {
+                    self.apply_event(&event.kind);
+                }
+            }
+            match script.packets.get(tick_index as usize) {
+                Some(packet) => {
+                    let _ = self.step_harness(1, core::slice::from_ref(packet));
+                }
+                None => {
+                    let _ = self.step_harness(1, &[]);
+                }
+            }
+        }
+
+        self.stop_recording()
+            .expect("start_recording installed a replay log")
+    }
+
+    /// Status LED state from the last control tick's `post_tick` side effect.
+    /// Other agents expose this through `RobotTransport` / the control HUD.
+    pub fn sim_led_on(&self) -> bool {
+        self.sim_led_on
+    }
+
     fn io_mut(&mut self) -> &mut SimRobotIo {
         unsafe { self.io.as_mut() }
     }
@@ -1658,6 +2685,107 @@ mod tests {
     /// `embassy_time::MockDriver` is process-global. Tests that reset the clock
     /// or step a harness must not overlap with each other.
     static HARNESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A command written as BareFOC register transactions must reach the plant:
+    /// the raw struct copy is gone, so only the wire can move the joint.
+    #[test]
+    fn multibus_wire_command_drives_plant() {
+        let mut plant = SimulatedServoPlant::new(6, [0.0; MAX_JOINTS]);
+        let mut cmd = RawServoCommand::default();
+        cmd.torque_mask = 1;
+        cmd.raw_target_rad[0] = 0.8;
+        let start = plant.raw_angles()[0];
+        for _ in 0..20 {
+            plant.write_command(&cmd);
+            let _ = plant.step_plant(0.01);
+        }
+        assert!(
+            plant.raw_angles()[0] > start + 0.1,
+            "wire-written goal must move the joint: {start} -> {}",
+            plant.raw_angles()[0]
+        );
+        let bank = plant
+            .multibus
+            .bus()
+            .register_bank(0x20)
+            .expect("node 0x20 exists");
+        assert_eq!(bank[REG_TORQUE_ENABLE as usize], 1);
+        assert_eq!(bank[REG_OPERATING_MODE as usize], OperatingMode::Position as u8);
+        assert_eq!(
+            &bank[REG_GOAL_POSITION as usize..REG_GOAL_POSITION as usize + 4],
+            &0.8_f32.to_le_bytes()
+        );
+    }
+
+    /// Feedback published by the plant into `0x142` must come back through a
+    /// burst read and populate the returned `RawServoFeedback` joint fields.
+    #[test]
+    fn multibus_feedback_burst_round_trips_plant_state() {
+        let mut plant = SimulatedServoPlant::new(6, [0.0; MAX_JOINTS]);
+        let mut cmd = RawServoCommand::default();
+        cmd.torque_mask = 1;
+        cmd.raw_target_rad[0] = 0.5;
+        for _ in 0..10 {
+            plant.write_command(&cmd);
+            let _ = plant.step_plant(0.01);
+        }
+        let feedback = plant.read_feedback(0.01);
+
+        let bank = plant
+            .multibus
+            .bus()
+            .register_bank(0x20)
+            .expect("node 0x20 exists");
+        let start = FEEDBACK_BURST_REG as usize;
+        let published =
+            JointFeedback::from_burst(&bank[start..start + FEEDBACK_BURST_LEN]).unwrap();
+        assert!(
+            (published.position_rad - feedback.raw_angle_rad[0]).abs() < 1e-6,
+            "burst position must match the returned feedback"
+        );
+        assert!(
+            (published.velocity_rad_s - feedback.velocity_rad_s[0]).abs() < 1e-6,
+            "burst velocity must match the returned feedback"
+        );
+        assert!(published.current_amps > 0.0);
+        assert_eq!(feedback.current_ma[0], (published.current_amps * 1000.0 + 0.5) as u16);
+        assert_eq!(feedback.temp_c[0], published.temperature_c as u8);
+        assert_ne!(feedback.current_ma[1], feedback.current_ma[0]);
+    }
+
+    /// The register server honours the pointer-latch idiom, bounds-checks both
+    /// directions and does not clobber the latch on a pointer-less burst read.
+    #[test]
+    fn multibus_register_server_latch_and_bounds() {
+        let mut pio = SimMultibusPio::new();
+        pio.transaction(0x20, &[0x01, 0x44, 1, 2, 3, 4], &mut [])
+            .unwrap();
+        let mut burst = [0u8; 4];
+        pio.transaction(0x20, &[], &mut burst).unwrap();
+        assert_eq!(burst, [1, 2, 3, 4]);
+        pio.transaction(0x20, &[], &mut burst).unwrap();
+        assert_eq!(burst, [1, 2, 3, 4], "empty-tx read must keep the latch");
+
+        let mut scratch = [0u8; 4];
+        assert_eq!(
+            pio.transaction(0x20, &[0x01, 0xFE, 0, 0, 0], &mut []),
+            Err(PioError::Bus),
+            "write past 0x200 must fail"
+        );
+        assert_eq!(
+            pio.transaction(0x20, &[0x01, 0xFE], &mut scratch),
+            Err(PioError::Bus),
+            "read past 0x200 must fail"
+        );
+        assert_eq!(
+            pio.transaction(0x40, &[0, 0], &mut []),
+            Err(PioError::Bus),
+            "unmapped node must fail"
+        );
+
+        pio.set_bus_error_injection(true);
+        assert_eq!(pio.transaction(0x20, &[0x01, 0x44], &mut []), Err(PioError::Bus));
+    }
 
     /// The deterministic harness must drive the *shared* async control task, and
     /// replay recording must survive through `RobotIo::record_tick`.
@@ -1942,13 +3070,17 @@ mod tests {
 
     #[test]
     fn compliance_scale_and_crc_injection_propagate_end_to_end() {
+        // With the shared torque-based plant, compliance only changes measured
+        // current when the demanded torque exceeds the soft ceiling. Drive a
+        // high-inertia hip joint (I≈0.038 kg·m²) so the step genuinely saturates
+        // at 0.45 N·m with 25% compliance and at 1.8 N·m when stiff.
         let cal = [JointCalibration {
             min_rad: -2.2,
             max_rad: 2.2,
             ..Default::default()
-        }; 6];
-        let mut sim_stiff = CopperSimRunner::new(6, &cal, [0.0; MAX_JOINTS]);
-        let mut sim_soft = CopperSimRunner::new(6, &cal, [0.0; MAX_JOINTS]);
+        }; 21];
+        let mut sim_stiff = CopperSimRunner::new(21, &cal, [0.0; MAX_JOINTS]);
+        let mut sim_soft = CopperSimRunner::new(21, &cal, [0.0; MAX_JOINTS]);
 
         let mut soft_gains = rk_proto::BalanceGains::default();
         soft_gains.compliance_scale = 0.25;
@@ -1963,11 +3095,11 @@ mod tests {
         let mut cmd = HostToMcu {
             seq: 2,
             mode: ControlMode::Drive,
-            torque_mask: 0b11_1111,
+            torque_mask: (1u32 << 21) - 1,
             speed_limit_pct: 100,
             ..Default::default()
         };
-        cmd.target_rad[0] = 1.0;
+        cmd.target_rad[11] = 1.0;
 
         let mut stiff_peak_ma = 0u16;
         let mut soft_peak_ma = 0u16;
@@ -1975,8 +3107,8 @@ mod tests {
             cmd.seq = step;
             let t_stiff = sim_stiff.tick(0.01, &cmd);
             let t_soft = sim_soft.tick(0.01, &cmd);
-            stiff_peak_ma = stiff_peak_ma.max(t_stiff.current_ma[0]);
-            soft_peak_ma = soft_peak_ma.max(t_soft.current_ma[0]);
+            stiff_peak_ma = stiff_peak_ma.max(t_stiff.current_ma[11]);
+            soft_peak_ma = soft_peak_ma.max(t_soft.current_ma[11]);
         }
         assert!(
             soft_peak_ma < stiff_peak_ma,
@@ -2319,5 +3451,819 @@ mod tests {
         assert_eq!(log.ticks[0].rx_cmd.expect("cmd").mode, ControlMode::Teach);
         assert_eq!(log.ticks[2].rx_cmd.expect("cmd").mode, ControlMode::Drive);
         assert!(verify_deterministic_replay(&log).exact_match);
+    }
+
+    // --- simulator-fidelity-hardening / Group 1 ------------------------------
+
+    /// The plant stores soles as `[right, left]` but `foot_contact(left)` indexes
+    /// 1/0. Telemetry must not invert the two GRF channels or the contact mask.
+    #[test]
+    fn telemetry_maps_left_and_right_grf_to_correct_channels() {
+        let cal = [JointCalibration::default(); MAX_JOINTS];
+        let mut io = SimRobotIo::new(6, &cal, [0.0; MAX_JOINTS]);
+
+        // Asymmetric load: only the left sole carries ground reaction.
+        let left = io.plant.foot_contact_mut(true);
+        left.contact = true;
+        left.grf_n = 42.0;
+        let right = io.plant.foot_contact_mut(false);
+        right.contact = false;
+        right.grf_n = 0.0;
+
+        // Publish directly so the world plant does not recompute contacts first.
+        RobotIo::publish_telemetry(&mut io, McuToHost::default());
+        let telem = io.last_host_rx.expect("telemetry published");
+        assert!(
+            telem.estimator.grf_left_n > 0.0,
+            "left-loaded plant must report left GRF, got {}",
+            telem.estimator.grf_left_n
+        );
+        assert_eq!(
+            telem.estimator.grf_right_n, 0.0,
+            "unloaded right sole must report zero GRF"
+        );
+        assert_eq!(
+            telem.estimator.contact_mask, 0b10,
+            "contact mask bit 1 = left only"
+        );
+    }
+
+    /// Velocity-mode joints integrate the commanded speed into their angle and
+    /// report a lagged velocity; a reversed command reverses both.
+    #[test]
+    fn velocity_mode_drives_plant_angle_and_measured_velocity() {
+        let mut plant = SimulatedServoPlant::new(6, [0.0; MAX_JOINTS]);
+        let mut cmd = RawServoCommand::default();
+        cmd.torque_mask = 1;
+        cmd.command_mode[0] = JointCommandMode::Velocity.to_wire();
+        cmd.raw_velocity_rad_s[0] = 3.0;
+
+        let start = plant.raw_angles()[0];
+        let mut fb = RawServoFeedback::default();
+        for _ in 0..20 {
+            plant.write_command(&cmd);
+            fb = plant.step_plant(0.01);
+        }
+        assert!(
+            plant.raw_angles()[0] > start + 0.1,
+            "velocity mode must move the joint in the commanded direction: {start} -> {}",
+            plant.raw_angles()[0]
+        );
+        assert!(
+            fb.velocity_rad_s[0] > 2.5 && fb.velocity_rad_s[0] <= 3.0,
+            "measured velocity must approach the 3.0 rad/s command, got {}",
+            fb.velocity_rad_s[0]
+        );
+
+        let midpoint = plant.raw_angles()[0];
+        cmd.raw_velocity_rad_s[0] = -2.0;
+        for _ in 0..20 {
+            plant.write_command(&cmd);
+            fb = plant.step_plant(0.01);
+        }
+        assert!(
+            fb.velocity_rad_s[0] < -1.5,
+            "measured velocity must follow the reversed command, got {}",
+            fb.velocity_rad_s[0]
+        );
+        assert!(
+            plant.raw_angles()[0] < midpoint,
+            "negative velocity must reverse joint motion"
+        );
+    }
+
+    /// The simulator must not own a private actuator model: stepping the shared
+    /// `JointPlant` directly with the same wire-decoded command and dt must be
+    /// bit-identical to stepping it through `SimulatedServoPlant::step_plant`.
+    #[test]
+    fn joint_plant_direct_step_matches_simulator_step() {
+        const DT: f32 = 0.005_f32;
+        let mut plant = SimulatedServoPlant::new(6, [0.0; MAX_JOINTS]);
+        let mut cmd = RawServoCommand::default();
+        cmd.torque_mask = 1;
+        cmd.raw_target_rad[0] = 0.6_f32;
+        cmd.torque_nm[0] = 1.2_f32;
+        plant.write_command(&cmd);
+        plant.harvest_commands();
+        let wire = plant.last_cmd;
+
+        // Clone the simulator's exact joint state and feed it the same inputs
+        // `step_plant` will use (lag mapping + shared gravity approximation).
+        let mut direct = plant.joint_plant().clone();
+        direct.set_lag_factor(plant.faults().servo_lag_factor);
+        let mut gravity = [0.0_f32; MAX_IMPACT_JOINTS];
+        gravity_torque_nm(plant.raw_angles(), &mut gravity);
+        for i in 0..plant.joint_count {
+            direct.set_gravity_torque(i, gravity[i]);
+        }
+
+        let expected = direct.step(
+            0,
+            DT,
+            JointCommandMode::from_wire(wire.command_mode[0]),
+            wire.raw_target_rad[0],
+            wire.raw_velocity_rad_s[0],
+            wire.torque_nm[0],
+            false,
+        );
+        let feedback = plant.step_plant(DT);
+        assert_eq!(feedback.raw_angle_rad[0], expected.0, "shared plant angle diverged");
+        assert_eq!(feedback.velocity_rad_s[0], expected.1, "shared plant velocity diverged");
+        assert_eq!(feedback.current_ma[0], expected.2, "shared plant current diverged");
+    }
+
+    /// Host velocity-mode commands reach the kernel as Velocity and remain
+    /// bit-exact under replay; the plant change must not touch recorded ticks.
+    #[test]
+    fn velocity_mode_commands_replay_bit_exact() {
+        let _guard = HARNESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cal = [JointCalibration::default(); MAX_JOINTS];
+        let mut sim = CopperSimRunner::new(6, &cal, [0.0; MAX_JOINTS]);
+        sim.start_recording();
+
+        let mut cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: 1,
+            speed_limit_pct: 100,
+            ..Default::default()
+        };
+        cmd.command_mode[0] = JointCommandMode::Velocity.to_wire();
+        cmd.velocity_rad_s[0] = 2.0;
+        let cmds: Vec<HostToMcu> = (1..=12u32)
+            .map(|i| {
+                cmd.seq = i;
+                cmd
+            })
+            .collect();
+        let _last = sim.step_harness(12, &cmds);
+
+        let log = sim.stop_recording().expect("velocity ticks recorded");
+        assert_eq!(log.ticks.len(), 12);
+        assert!(
+            log.ticks.iter().all(|t| {
+                JointCommandMode::from_wire(t.tx_cmd.command_mode[0])
+                    == JointCommandMode::Velocity
+            }),
+            "every recorded kernel command must be velocity mode"
+        );
+        let check = verify_deterministic_replay(&log);
+        assert!(
+            check.exact_match,
+            "velocity-mode replay must be bit-exact: {check:?}"
+        );
+        assert_eq!(check.matched_ticks, check.total_ticks);
+    }
+
+    /// `SimRobotIo::post_tick` must fire once per control tick and mirror the
+    /// firmware LED state machine without altering recorded kernel ticks.
+    #[test]
+    fn sim_post_tick_evaluates_led_state_once_per_tick() {
+        let _guard = HARNESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cal = [JointCalibration::default(); MAX_JOINTS];
+        let mut sim = CopperSimRunner::new(6, &cal, [0.0; MAX_JOINTS]);
+        const N: u32 = 7;
+        for i in 1..=N {
+            let cmd = HostToMcu {
+                seq: i,
+                mode: ControlMode::Teach,
+                ..Default::default()
+            };
+            let _ = sim.step_harness(1, &[cmd]);
+        }
+        assert_eq!(
+            sim.post_tick_calls, N,
+            "post_tick must run exactly once per control tick"
+        );
+        let now_ms = sim.now_ms();
+        let expected = rk_fw_core::copper::current_led_mode().is_lit(now_ms);
+        assert_eq!(sim.sim_led_on(), expected);
+        assert_eq!(sim.sim_led_on, expected);
+    }
+
+    /// Wire fault knobs default to off, survive serde round-trips, and may be
+    /// absent from older JSON payloads.
+    #[test]
+    fn sim_fault_injection_wire_knobs_default_and_serde_round_trip() {
+        let defaults = SimFaultInjection::default();
+        assert!(!defaults.rx_crc_error);
+        assert!(!defaults.rx_version_mismatch);
+        assert!(!defaults.rx_truncated_frame);
+        assert!(!defaults.rx_fragmented_frame);
+
+        let all = SimFaultInjection {
+            rx_crc_error: true,
+            rx_version_mismatch: true,
+            rx_truncated_frame: true,
+            rx_fragmented_frame: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&all).expect("serialize faults");
+        let back: SimFaultInjection = serde_json::from_str(&json).expect("deserialize faults");
+        assert!(back.rx_crc_error && back.rx_version_mismatch);
+        assert!(back.rx_truncated_frame && back.rx_fragmented_frame);
+
+        // Simulate an older payload that omits the new knobs: serde defaults apply.
+        let mut value = serde_json::to_value(&all).expect("fault value");
+        let obj = value.as_object_mut().expect("fault object");
+        obj.remove("rx_crc_error");
+        obj.remove("rx_version_mismatch");
+        obj.remove("rx_truncated_frame");
+        obj.remove("rx_fragmented_frame");
+        let legacy: SimFaultInjection =
+            serde_json::from_value(value).expect("missing wire knobs use defaults");
+        assert!(!legacy.rx_crc_error && !legacy.rx_version_mismatch);
+        assert!(!legacy.rx_truncated_frame && !legacy.rx_fragmented_frame);
+
+        let _clone = all.clone();
+        let _debug = format!("{all:?}");
+    }
+
+    /// Reset must restore clock, kernel, plant, faults, framer and recorder so a
+    /// second identical scripted run is byte-identical to the first, without
+    /// breaking the persistent executor (no stale timer wakers, no panic).
+    #[test]
+    fn reset_experiment_reproduces_identical_telemetry_and_replay() {
+        let _guard = HARNESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cal = [JointCalibration::default(); MAX_JOINTS];
+        let mut sim = CopperSimRunner::new(6, &cal, [0.0; MAX_JOINTS]);
+
+        let script: Vec<HostToMcu> = (1..=4u32)
+            .map(|seq| HostToMcu {
+                seq,
+                mode: if seq % 2 == 0 {
+                    ControlMode::Drive
+                } else {
+                    ControlMode::Teach
+                },
+                torque_mask: if seq % 2 == 0 { 0b11 } else { 0 },
+                target_rad: [0.05 * seq as f32; MAX_JOINTS],
+                ..Default::default()
+            })
+            .collect();
+
+        let run = |sim: &mut CopperSimRunner| -> (McuToHost, CopperReplayLog) {
+            sim.start_recording();
+            let mut last = McuToHost::default();
+            for cmd in &script {
+                last = sim.step_harness(3, &[*cmd]);
+            }
+            (last, sim.stop_recording().expect("replay log"))
+        };
+
+        let (_first_telem, first_log) = run(&mut sim);
+        assert_eq!(first_log.ticks.len(), script.len() * 3);
+        assert!(verify_deterministic_replay(&first_log).exact_match);
+
+        sim.reset_experiment();
+        let (second_telem, second_log) = run(&mut sim);
+
+        // `now_ms` is monotonic (as on hardware), so compare the replay stream
+        // with its own time base rebased to zero, not the absolute clock.
+        let base = first_log.ticks[0].now_ms;
+        let mut expected = first_log.clone();
+        for tick in &mut expected.ticks {
+            tick.now_ms -= base;
+            tick.tx_telem.uptime_ms -= base;
+        }
+        let mut actual = second_log.clone();
+        let second_base = actual.ticks[0].now_ms;
+        for tick in &mut actual.ticks {
+            tick.now_ms -= second_base;
+            tick.tx_telem.uptime_ms -= second_base;
+        }
+        assert_eq!(expected.ticks, actual.ticks);
+        assert_eq!(second_log.version, first_log.version);
+        assert_eq!(second_log.joint_count, first_log.joint_count);
+        assert_eq!(second_log.initial_raw_pose, first_log.initial_raw_pose);
+        assert_eq!(second_log.initial_calibration, first_log.initial_calibration);
+        assert_eq!(
+            second_telem.uptime_ms - second_base,
+            (script.len() * 3 * 5) as u32 - 5
+        );
+        assert!(verify_deterministic_replay(&second_log).exact_match);
+
+        // The executor must still be alive and receptive after a reset.
+        sim.reset_experiment();
+        let (third_telem, third_log) = run(&mut sim);
+        assert_eq!(third_telem.active_mode, second_telem.active_mode);
+        assert_eq!(third_telem.seq_ack, second_telem.seq_ack);
+        assert_eq!(third_log.ticks.len(), second_log.ticks.len());
+        let third_base = third_log.ticks[0].now_ms;
+        let mut third = third_log.clone();
+        for tick in &mut third.ticks {
+            tick.now_ms -= third_base;
+            tick.tx_telem.uptime_ms -= third_base;
+        }
+        assert_eq!(actual.ticks, third.ticks);
+    }
+
+    /// Builds a small log directly through the shared `ControlTask`, so the
+    /// legacy-log JSON test does not depend on the mock-clock harness.
+    fn sample_log_with_events() -> CopperReplayLog {
+        let joint_count = 6;
+        let cal = vec![JointCalibration::default(); joint_count];
+        let mut task = ControlTask::new(joint_count, &cal);
+        let mut ticks = Vec::new();
+        for i in 0..4u32 {
+            let cmd = HostToMcu {
+                seq: i,
+                mode: ControlMode::Drive,
+                ..Default::default()
+            };
+            let (_, tick) = task.step_recorded(
+                i * 10,
+                rk_fw_core::config::CONTROL_DT_SEC,
+                Some(&cmd),
+                &RawServoFeedback::default(),
+                (i as u16, 0),
+            );
+            ticks.push(tick);
+        }
+        CopperReplayLog {
+            version: 1,
+            joint_count,
+            initial_raw_pose: [0.0; MAX_JOINTS],
+            initial_calibration: cal,
+            ticks,
+            seed: 0x1234_5678_9ABC_DEF0,
+            events: vec![TimedSimEvent {
+                tick_index: 2,
+                kind: SimEventKind::Shove {
+                    pitch_rad_s: 1.5,
+                    roll_rad_s: -0.25,
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn v1_log_without_seed_or_events_still_deserializes_and_verifies() {
+        // Old `.copper` files were written before the seed/events side-channel
+        // existed. Removing the two keys from a current log emulates one exactly.
+        let current = sample_log_with_events();
+        let mut value = serde_json::to_value(&current).expect("log serializes");
+        let object = value.as_object_mut().expect("log is a JSON object");
+        assert!(object.remove("seed").is_some());
+        assert!(object.remove("events").is_some());
+
+        let legacy: CopperReplayLog = serde_json::from_value(value).expect("v1 log parses");
+        assert_eq!(legacy.seed, 0);
+        assert!(legacy.events.is_empty());
+        assert_eq!(legacy.ticks.len(), current.ticks.len());
+        let check = verify_deterministic_replay(&legacy);
+        assert!(check.exact_match, "legacy log must verify as before");
+        assert_eq!(check.matched_ticks, current.ticks.len());
+    }
+
+    #[test]
+    fn fault_snapshot_round_trips_every_simulator_knob() {
+        let mut faults = SimFaultInjection::default();
+        faults.drop_heartbeat = true;
+        faults.stalled_joints[7] = true;
+        faults.voltage_sag = true;
+        faults.servo_bus_error = true;
+        faults.external_hand_wave = true;
+        faults.imu_disconnected = true;
+        faults.servo_lag_factor = 0.31;
+        faults.seed = 42;
+        faults.imu_gyro_noise_rad_s = 0.01;
+        faults.imu_accel_noise_m_s2 = 0.02;
+        faults.imu_angle_bias_rad = 0.03;
+        faults.imu_gyro_bias_rad_s = 0.04;
+        faults.imu_accel_bias_m_s2 = 0.05;
+        faults.imu_latency_ticks = 3;
+        faults.current_noise_pct = 0.06;
+        faults.temperature_offset_c = 1.5;
+        faults.encoder_quantization_lsb_rad = 0.001;
+        faults.foot_friction_mu = 0.42;
+        faults.contact_disagreement = true;
+        faults.rx_crc_error = true;
+        faults.rx_version_mismatch = true;
+        faults.rx_truncated_frame = true;
+        faults.rx_fragmented_frame = true;
+
+        let snapshot = fault_snapshot(&faults);
+        let restored = faults_from_snapshot(&snapshot);
+        assert_eq!(fault_snapshot(&restored), snapshot);
+    }
+
+    /// The shove@40 + fault@80 script must replay identically from a clean
+    /// reset, with events captured at their exact tick indices.
+    #[test]
+    fn scripted_experiment_replays_bit_identically_after_reset() {
+        let _guard = HARNESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cal = [JointCalibration::default(); MAX_JOINTS];
+        let mut sim = CopperSimRunner::new(6, &cal, [0.0; MAX_JOINTS]);
+
+        const SEED: u64 = 0xDEAD_BEEF_0000_0001;
+        let mut base_faults = SimFaultInjection::default();
+        base_faults.seed = SEED;
+        let mut toggled = base_faults.clone();
+        toggled.voltage_sag = true;
+
+        let packets: Vec<HostToMcu> = (0..100u32)
+            .map(|seq| HostToMcu {
+                seq,
+                mode: ControlMode::Drive,
+                torque_mask: 0b11,
+                ..Default::default()
+            })
+            .collect();
+        let script = ExperimentScript {
+            seed: SEED,
+            events: vec![
+                TimedSimEvent {
+                    tick_index: 40,
+                    kind: SimEventKind::Shove {
+                        pitch_rad_s: 1.6,
+                        roll_rad_s: -0.7,
+                    },
+                },
+                TimedSimEvent {
+                    tick_index: 80,
+                    kind: SimEventKind::SetFaults(fault_snapshot(&toggled)),
+                },
+            ],
+            packets,
+            max_ticks: 100,
+        };
+
+        let first = sim.run_script(&script);
+        assert_eq!(first.ticks.len(), 100);
+        assert_eq!(first.seed, SEED);
+        assert!(first.events.iter().any(|event| {
+            event.tick_index == 40
+                && matches!(event.kind, SimEventKind::Shove { pitch_rad_s, .. } if pitch_rad_s == 1.6)
+        }), "shove@40 must be captured");
+        assert!(first.events.iter().any(|event| {
+            event.tick_index == 80
+                && matches!(event.kind, SimEventKind::SetFaults(ref faults) if faults.voltage_sag)
+        }), "fault toggle@80 must be captured");
+
+        let first_check = verify_deterministic_replay(&first);
+        assert!(first_check.exact_match);
+        assert_eq!(first_check.matched_ticks, 100);
+
+        sim.reset_experiment();
+        let second = sim.run_script(&script);
+        assert_eq!(second.ticks.len(), first.ticks.len());
+        assert_eq!(second.seed, first.seed);
+        assert_eq!(second.events, first.events, "event stream must repeat exactly");
+
+        // `now_ms`/`uptime_ms` advance monotonically with the mock clock; strip
+        // their origin before comparing the kernel-relevant tick stream.
+        let rebase = |log: &CopperReplayLog| -> CopperReplayLog {
+            let mut rebased = log.clone();
+            let base = log.ticks[0].now_ms;
+            for tick in &mut rebased.ticks {
+                tick.now_ms -= base;
+                tick.tx_telem.uptime_ms -= base;
+            }
+            rebased
+        };
+        let first_rebased = rebase(&first);
+        let second_rebased = rebase(&second);
+        for (index, (a, b)) in first_rebased
+            .ticks
+            .iter()
+            .zip(second_rebased.ticks.iter())
+            .enumerate()
+        {
+            assert_eq!(a, b, "tick {index} diverged between runs");
+        }
+
+        let second_check = verify_deterministic_replay(&second);
+        assert!(second_check.exact_match);
+        assert_eq!(second_check.matched_ticks, first_check.matched_ticks);
+    }
+
+    // --- Group 2: sensors, constrained contacts, impact path -----------------
+
+    /// A shove must reach the kernel's impact detector through the shared plant's
+    /// measured joint current (not only through the torso IMU). The kernel treats
+    /// impact as telemetry: fall/ukemi retains priority, so this test also checks
+    /// that an impact alone does not latch a fall or change the control mode.
+    #[test]
+    fn shove_while_guarding_trips_kernel_impact_detector() {
+        let _guard = HARNESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cal = [JointCalibration {
+            min_rad: -2.2,
+            max_rad: 2.2,
+            ..Default::default()
+        }; 21];
+        let mut sim = CopperSimRunner::new(21, &cal, [0.0; MAX_JOINTS]);
+        let mut cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: (1u32 << 21) - 1,
+            speed_limit_pct: 100,
+            walk: WalkCmd {
+                walk_enabled: false,
+                balance_enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for i in 1..=60 {
+            cmd.seq = i;
+            let _ = sim.tick(0.01, &cmd);
+        }
+
+        sim.apply_push_impulse(1.6, -1.1);
+        let mut saw_impact = false;
+        let mut peak_magnitude_nm = 0.0_f32;
+        let mut last = McuToHost::default();
+        for i in 61..=100 {
+            cmd.seq = i;
+            last = sim.tick(0.01, &cmd);
+            if last.balance.impact_detected {
+                saw_impact = true;
+                peak_magnitude_nm = peak_magnitude_nm.max(last.balance.impact_magnitude_nm);
+            }
+        }
+        assert!(
+            saw_impact,
+            "shove must produce a joint current spike the kernel flags as impact"
+        );
+        assert!(
+            peak_magnitude_nm > rk_control::impact::DEFAULT_CURRENT_SPIKE_MA
+                / rk_control::impact::DEFAULT_MA_PER_NM,
+            "impact magnitude must reflect a real current jump, got {peak_magnitude_nm}"
+        );
+        assert_ne!(
+            last.estimator.valid_mask & estimator_valid::IMPACT,
+            0,
+            "impact telemetry must be marked valid"
+        );
+        assert_eq!(last.active_mode, ControlMode::Drive, "impact alone must not abort Drive");
+        assert!(
+            !last.faults.contains(FaultFlags::TILT_FALL_CUTOFF),
+            "impact must never latch the fall cutoff (fall handling keeps priority)"
+        );
+    }
+
+    /// Same seed + command stream must produce bit-identical sensor samples in
+    /// two independent sessions, while a different seed gives different samples.
+    #[test]
+    fn seeded_sensor_imperfection_is_repeatable() {
+        let mut config = SimFaultInjection {
+            seed: 0x1234_5678_9ABC_DEF0,
+            imu_gyro_noise_rad_s: 0.02,
+            imu_accel_noise_m_s2: 0.05,
+            imu_angle_bias_rad: 0.01,
+            imu_gyro_bias_rad_s: 0.02,
+            imu_accel_bias_m_s2: 0.03,
+            imu_latency_ticks: 3,
+            current_noise_pct: 0.04,
+            temperature_offset_c: 2.0,
+            encoder_quantization_lsb_rad: 0.01,
+            ..Default::default()
+        };
+        let run = |cfg: &SimFaultInjection| -> Vec<RawServoFeedback> {
+            let mut plant = SimulatedServoPlant::new(6, [0.0; MAX_JOINTS]);
+            *plant.faults_mut() = cfg.clone();
+            let mut out = Vec::new();
+            for step in 0..40u32 {
+                let mut cmd = RawServoCommand::default();
+                cmd.torque_mask = 0b11_1111;
+                cmd.raw_target_rad[0] = (step as f32 * 0.03_f32).sin() * 0.4_f32;
+                plant.write_command(&cmd);
+                out.push(plant.step_plant(0.005_f32));
+            }
+            out
+        };
+
+        let first = run(&config);
+        let second = run(&config);
+        assert_eq!(first.len(), second.len());
+        for (tick, (a, b)) in first.iter().zip(second.iter()).enumerate() {
+            assert_eq!(
+                a.raw_angle_rad, b.raw_angle_rad,
+                "tick {tick}: encoder samples diverged"
+            );
+            assert_eq!(
+                a.current_ma, b.current_ma,
+                "tick {tick}: current samples diverged"
+            );
+            assert_eq!(a.temp_c, b.temp_c, "tick {tick}: temperature samples diverged");
+            assert_eq!(a.imu, b.imu, "tick {tick}: IMU samples diverged");
+        }
+
+        // The enabled knobs really perturb the samples, and a different seed
+        // produces a different (but still deterministic) stream.
+        config.seed = 0xDEAD_BEEF_0000_0001;
+        let other_seed = run(&config);
+        assert_ne!(first[39].imu, other_seed[39].imu, "seed must change the IMU stream");
+        assert_ne!(
+            first[39].current_ma, other_seed[39].current_ma,
+            "seed must change the current-sense stream"
+        );
+    }
+
+    /// Biases persist across ticks; latency publishes a delayed copy of the
+    /// true sample and eventually settles at exactly `latency_ticks` of delay.
+    #[test]
+    fn imu_bias_persists_and_latency_delays_true_samples() {
+        let mut plant = SimulatedServoPlant::new(6, [0.0; MAX_JOINTS]);
+        {
+            let faults = plant.faults_mut();
+            faults.seed = 77;
+            faults.imu_angle_bias_rad = 0.05;
+            faults.imu_gyro_bias_rad_s = 0.01;
+        }
+        plant.apply_push_impulse(0.8, 0.0);
+        for _ in 0..120 {
+            let _ = plant.step_plant(0.005_f32);
+        }
+        let biased = plant.step_plant(0.005_f32);
+        assert!(
+            (biased.imu.pitch_rad - plant.torso_pitch_rad).abs() > 1.0e-3_f32,
+            "configured attitude bias must remain visible after many ticks"
+        );
+        assert!(
+            (biased.imu.pitch_rate_rad_s - plant.pitch_rate_rad_s).abs() > 1.0e-4_f32,
+            "configured gyro bias must persist"
+        );
+
+        let mut delayed = SimulatedServoPlant::new(6, [0.0; MAX_JOINTS]);
+        delayed.faults_mut().imu_latency_ticks = 3;
+        delayed.apply_push_impulse(0.8, 0.0);
+        let mut truth = Vec::new();
+        for _ in 0..30 {
+            let _ = delayed.step_plant(0.005_f32);
+            truth.push(delayed.torso_pitch_rad);
+        }
+        let delayed_sample = delayed.step_plant(0.005_f32);
+        assert_eq!(
+            delayed_sample.imu.pitch_rad, truth[truth.len() - 3],
+            "latency must publish the sample from exactly 3 ticks earlier"
+        );
+    }
+
+    /// Quantization, current noise and temperature offset change only the
+    /// published feedback; the physical plant state stays full precision so
+    /// replay and direct-JointPlant parity are unaffected.
+    #[test]
+    fn encoder_current_and_temperature_imperfections_are_publish_only() {
+        const LSB: f32 = 0.02_f32;
+        let mut plant = SimulatedServoPlant::new(6, [0.0; MAX_JOINTS]);
+        {
+            let faults = plant.faults_mut();
+            faults.seed = 9;
+            faults.current_noise_pct = 0.10;
+            faults.temperature_offset_c = 3.0;
+            faults.encoder_quantization_lsb_rad = LSB;
+        }
+        let mut cmd = RawServoCommand::default();
+        cmd.torque_mask = 1;
+        cmd.raw_target_rad[0] = 0.37_f32;
+        let mut saw_quantized = false;
+        let mut saw_current_noise = false;
+        let mut saw_temp_offset = false;
+        for _ in 0..40 {
+            plant.write_command(&cmd);
+            let fb = plant.step_plant(0.005_f32);
+            let angle = fb.raw_angle_rad[0];
+            if (angle / LSB - (angle / LSB).round()).abs() < 1.0e-6_f32 {
+                saw_quantized = true;
+            }
+            if fb.current_ma[0] != plant.joint_plant().current_ma(0) {
+                saw_current_noise = true;
+            }
+            if fb.temp_c[0] >= plant.joint_plant().temperature_c(0).round() as u8 + 2 {
+                saw_temp_offset = true;
+            }
+            // The physical angle is never quantized.
+            assert_ne!(
+                plant.raw_angles()[0], angle,
+                "published angle must be quantized, plant state must not"
+            );
+        }
+        assert!(saw_quantized, "encoder LSB must be visible on published angles");
+        assert!(saw_current_noise, "current noise must be visible on published current");
+        assert!(saw_temp_offset, "temperature offset must be visible on published temps");
+    }
+
+    /// Unilateral GRF and support-polygon CoP: a lifted/unloaded sole carries no
+    /// force and contributes no support point, and the CoP stays on the segment.
+    #[test]
+    fn contact_unilateral_grf_and_cop_support_polygon() {
+        assert_eq!(unilateral_grf(false, 100.0_f32, 20.0_f32), 0.0_f32);
+        assert_eq!(unilateral_grf(true, -5.0_f32, 20.0_f32), 0.0_f32);
+        assert_eq!(unilateral_grf(true, 999.0_f32, 20.0_f32), 20.0_f32);
+
+        let right = FootContact {
+            contact: true,
+            point_m: [-0.1_f32, 0.0_f32],
+            grf_n: 10.0_f32,
+            ..Default::default()
+        };
+        let lifted = FootContact {
+            contact: false,
+            point_m: [5.0_f32, 5.0_f32],
+            grf_n: 0.0_f32,
+            ..Default::default()
+        };
+        assert_eq!(
+            clamp_cop_to_support([4.0_f32, 4.0_f32], &[right, lifted]),
+            right.point_m,
+            "unloaded sole must not pull the CoP toward it"
+        );
+
+        let left = FootContact {
+            contact: true,
+            point_m: [0.1_f32, 0.2_f32],
+            grf_n: 10.0_f32,
+            ..Default::default()
+        };
+        let clamped = clamp_cop_to_support([9.0_f32, 9.0_f32], &[right, left]);
+        assert!(
+            (clamped[0] - left.point_m[0]).abs() < 1.0e-6_f32
+                && (clamped[1] - left.point_m[1]).abs() < 1.0e-6_f32,
+            "CoP must clamp to the loaded-foot segment endpoint, got {clamped:?}"
+        );
+    }
+
+    /// Slip: above the friction limit the pinned foot loses GRF (and hence
+    /// support influence); below it the contact stays fully loaded.
+    #[test]
+    fn contact_slip_reduces_loaded_point_when_friction_is_exceeded() {
+        let make_foot = |slip_m_s: f32| FootContact {
+            contact: true,
+            grf_n: 10.0_f32,
+            slip_m_s,
+            ..Default::default()
+        };
+        let mut quiet = make_foot(0.1_f32);
+        apply_friction_slip(&mut quiet, 1.5_f32, 0.7_f32);
+        assert_eq!(quiet.grf_n, 10.0_f32, "sub-threshold sole must stay pinned");
+
+        let mut sliding = make_foot(2.0_f32);
+        apply_friction_slip(&mut sliding, 1.5_f32, 0.7_f32);
+        assert!(
+            sliding.grf_n > 0.0_f32 && sliding.grf_n < 10.0_f32,
+            "slip must reduce but never unload the planted point, got {}",
+            sliding.grf_n
+        );
+        assert_eq!(sliding.slip_m_s, 2.0_f32, "reported slip must stay the true speed");
+    }
+
+    /// Contact-disagreement fault: plant contacts no longer follow the
+    /// controller's phase-scripted support foot, while telemetry reports the
+    /// plant's real contacts and the estimator remains stable.
+    #[test]
+    fn contact_disagreement_desynchronizes_plant_and_controller() {
+        let _guard = HARNESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cal = [JointCalibration {
+            min_rad: -2.2,
+            max_rad: 2.2,
+            ..Default::default()
+        }; 21];
+        let mut sim = CopperSimRunner::new(21, &cal, [0.0; MAX_JOINTS]);
+        sim.plant.faults_mut().contact_disagreement = true;
+        let mut cmd = HostToMcu {
+            seq: 1,
+            mode: ControlMode::Drive,
+            torque_mask: (1u32 << 21) - 1,
+            speed_limit_pct: 100,
+            walk: WalkCmd {
+                walk_enabled: true,
+                balance_enabled: true,
+                vx: 0.5,
+                cadence_hz: 1.55,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Warm up until the Drive-mode torque stage energizes the legs; before
+        // that the plant intentionally drops all contacts on every tick.
+        for i in 1..=60 {
+            cmd.seq = i;
+            let _ = sim.tick(0.01, &cmd);
+        }
+        let mut controller_supports = [false; 2];
+        let mut last = McuToHost::default();
+        for i in 61..=360 {
+            cmd.seq = i;
+            last = sim.tick(0.01, &cmd);
+            assert_eq!(
+                last.estimator.contact_mask,
+                sim.plant.contact_mask(),
+                "telemetry must report the plant's real contact mask"
+            );
+            assert_eq!(last.estimator.contact_mask, 0b11, "fault must report phantom double support");
+            controller_supports[(last.balance.support_foot & 1) as usize] = true;
+            assert!(
+                !last.faults.contains(FaultFlags::TILT_FALL_CUTOFF),
+                "contact disagreement must not destabilize the estimator at tick {i}"
+            );
+        }
+        assert!(
+            controller_supports[0] && controller_supports[1],
+            "controller must still script alternating support: {:?}",
+            controller_supports
+        );
+        assert_eq!(last.active_mode, ControlMode::Drive);
     }
 }

@@ -61,7 +61,7 @@ Both wired transports carry the **exact same `postcard` COBS-encoded `HostToMcu`
 ### Bench Loopback vs. Real Servo Bus
 
 - **`bench-loopback`** *(default)*: Runs `BenchLoopbackBus` directly inside the MCU so you can flash RP2350, plug in a **single USB cable**, and test live 200 Hz Teach/Drive mirroring, bumpless transfer, E-Stop, and cable-pull watchdog trip with zero servos powered.
-- **`uart-servo-bus`**: Initializes RP2350 `UART0` (`GPIO0` TX / `GPIO1` RX @ `1 Mbps`) wired into `SERVO_BUS_SLOT` for physical Feetech STS3215 / Dynamixel Protocol 2.0 smart bus servos.
+- **`uart-servo-bus`** *(legacy, unused by the control application)*: Initializes RP2350 `UART0` (`GPIO0` TX / `GPIO1` RX @ `1 Mbps`) wired into `SERVO_BUS_SLOT` for physical Feetech STS3215 / Dynamixel Protocol 2.0 smart bus servos. `rk-multibus` is now the single servo wire path; this remains only as a bring-up placeholder.
 
 > [!IMPORTANT]
 > **`bench-loopback` hooks are overridden whenever a hardware servo bus is enabled.** Both `uart-servo-bus` and `i3c-servo-bus` register their own `ServoBusHooks` in `SERVO_BUS_SLOT`, so the `bench-loopback` mirroring plant is not active in those builds even if the `bench-loopback` feature is still present. The two hardware bus features are mutually exclusive and enabling both is a compile error.
@@ -73,7 +73,16 @@ These are **off by default** — the default `bench-loopback` build is unchanged
 | Feature | Hardware | What it wires |
 | :--- | :--- | :--- |
 | `imu-lsm6dsv` | ST LSM6DSV16X on dedicated **SPI1** (SCK `GPIO10`, MOSI `GPIO11`, MISO `GPIO8`, CS `GPIO9`) | 960 Hz hardware FIFO burst-read at 200 Hz, complementary filter publishes `ImuState` to `IMU_SLOT` tagged `LSM6DSV_OK`. **Mutually exclusive with `imu-bno055`** — the BNO055 task is not spawned when this is enabled (motor currents disturb its magnetometer). |
-| `i3c-servo-bus` | RP2350 PIO I3C master (external driver, *not* implemented here) | Registers `ServoBusHooks` in `SERVO_BUS_SLOT` using `encode_joint_cmd` / `unpack_i3c_joint_reply`, per-joint timeout accounting, and a `defmt::warn!` on transition to degraded. The external PIO driver plugs in via `set_i3c_transport()`; until then a safe stub records timeouts without stalling the loop. |
+| `i3c-servo-bus` | RP2350 PIO I3C master (external driver, *not* implemented here) | Registers `ServoBusHooks` in `SERVO_BUS_SLOT` via `rk-multibus` / `barefoc-master`: one BareFOC node per joint (`0x20 + joint`), register-pointer writes to the canonical control table (`0x120` torque enable, `0xE0` operating mode, `0x130/0x134/0x138` goal position/velocity/current) and one 14-byte burst read at `0x142` for temperature/position/velocity/current. Per-joint timeout accounting and an edge-triggered `defmt::warn!` are preserved; the external PIO driver plugs in via `set_i3c_transport()` and a safe stub records timeouts until then. |
+
+> [!IMPORTANT]
+> **Servo firmware must be reflashed for `i3c-servo-bus`.** Each servo node must
+> expose the canonical 512-byte BareFOC multibus control table at node
+> `0x20 + joint` — the old 16-byte command / 12-byte feedback I3C frame codec is
+> gone. Flashing the servos is a deployment step outside this repository. The
+> register client is a read-only path dependency on the sibling
+> `../bareFOC/barefoc-master` checkout, so that checkout must be present to
+> build this feature.
 
 Example — LSM6DSV + I3C hardware with USB CDC transport:
 

@@ -2,13 +2,19 @@
 //! required by OpenSpec change `fall-recovery-and-visual-alarm` (task 7.3).
 //!
 //! This test drives the *real* simulation stack — `SimTransport` /
-//! `CopperSimRunner` / `SimulatedServoPlant`, the real `DirectServoKernel`
-//! inside the Copper runner, and the real `StudioModel` + fall watcher state
-//! machine in `RockyStudioApp::update_fall_watcher()` — with no egui context
-//! and no GUI. Only the per-frame call order of the real `update_frame()`
-//! loop (`build_next_host_packet -> step_exchange -> ingest_telemetry ->
-//! update_fall_watcher`) is reproduced by the local `step()` helper below,
-//! exactly as documented in `update_frame()`.
+//! `CopperSimRunner` / the shared torque-based plant, the real
+//! `DirectServoKernel` inside the Copper runner, and the real `StudioModel` +
+//! fall watcher state machine in `RockyStudioApp::update_fall_watcher()` —
+//! with no egui context and no GUI. Only the per-frame call order of the real
+//! `update_frame()` loop (`build_next_host_packet -> step_fixed ->
+//! ingest_telemetry -> update_fall_watcher`) is reproduced by the local
+//! `step()` helper below, exactly as documented in `update_frame()`.
+//!
+//! Timing is deterministic: every call advances exactly one 5 ms control tick
+//! and reports that same duration to the host playback / recovery dwell timers.
+//! No wall clock is read anywhere. All loop bounds are explicit tick budgets in
+//! simulated control ticks (1 tick per frame here), so a stall cannot silently
+//! stretch the scenario.
 //!
 //! The recovery is started purely by the operator Get Up control: the watcher
 //! queues `ClearFaults` via `reset_estop()` as part of its ordered sequence, so
@@ -16,21 +22,33 @@
 
 use rk_proto::{ControlMode, FaultFlags, FallOrientation, fall_orientation};
 
-use super::{NoopSaver, RecoveryState, RockyStudioApp};
+use super::{CONTROL_STEP_SEC, NoopSaver, RecoveryState, RockyStudioApp};
 
-const DT: f32 = 0.016;
+/// One fixed control tick per frame keeps host-side (playback / dwell) time in
+/// lockstep with simulator time; both are driven solely by this constant.
+const TICKS_PER_FRAME: usize = 1;
+const FRAME_DT: f32 = CONTROL_STEP_SEC;
+
+/// Explicit tick budgets (in 5 ms control ticks) for each scenario phase.
+/// Previously these were iteration counts at a 16 ms variable dt; the budgets
+/// below are expressed in control ticks so fixed-step pacing is unambiguous.
+const FALL_LATCH_TICKS: usize = 400; // 2.0 s — shove + FallTuck latch
+const CLEAR_FAULT_TICKS: usize = 400; // 2.0 s — dwell + ClearFaults round trip
+const PLAYBACK_START_TICKS: usize = 80; // 0.4 s — watcher advances one transition/frame
+const PLAYBACK_TICKS: usize = 4000; // 20.0 s — get-up keyframes
+const ALARM_CLEAR_TICKS: usize = 400; // 2.0 s — stable upright dwell before Idle
 
 /// Reproduces the control-loop ordering of `RockyStudioApp::update_frame()`
-/// without egui: host packet -> transport exchange -> telemetry ingest ->
-/// fall watcher. Returns the telemetry frame observed this tick.
+/// without egui: host packet -> fixed transport ticks -> telemetry ingest ->
+/// fall watcher. Returns the telemetry frame observed after this tick.
 fn step(app: &mut RockyStudioApp) -> rk_proto::McuToHost {
-    let pkt = app.model.build_next_host_packet(DT);
+    let pkt = app.model.build_next_host_packet(FRAME_DT);
     let telem = app
         .transport
-        .step_exchange(DT, &pkt)
+        .step_fixed(TICKS_PER_FRAME, &pkt, FRAME_DT)
         .expect("sim transport always returns a frame");
     app.model.ingest_telemetry(telem.clone());
-    app.update_fall_watcher(DT);
+    app.update_fall_watcher(FRAME_DT);
     telem
 }
 
@@ -50,6 +68,12 @@ fn viewport_alarm(telem: &rk_proto::McuToHost) -> bool {
 
 #[test]
 fn e2e_forward_shove_to_prone_get_up_and_back_to_guard() {
+    // The harness clock is process-global; serialize with the other app-level
+    // fixed-step tests so parallel threads cannot advance it underneath us.
+    let _guard = super::e2e_fixed_step_tests::E2E_HARNESS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
     let mut app = RockyStudioApp::new(Box::new(NoopSaver));
     assert_eq!(app.recovery_state, RecoveryState::Idle);
     assert!(!app.fall_event_active);
@@ -64,7 +88,7 @@ fn e2e_forward_shove_to_prone_get_up_and_back_to_guard() {
     // Step the plant until a fall latches (FallTuck 40 ms + margin).
     let mut fell = None;
     let mut peak_pitch = 0.0_f32;
-    for _ in 0..200 {
+    for _ in 0..FALL_LATCH_TICKS {
         let telem = step(&mut app);
         peak_pitch = peak_pitch.max(telem.imu.pitch_rad.abs());
         if telem.faults.contains(FaultFlags::TILT_FALL_CUTOFF) {
@@ -109,7 +133,7 @@ fn e2e_forward_shove_to_prone_get_up_and_back_to_guard() {
     // TILT_FALL_CUTOFF bit is STILL latched in telemetry at this point — the
     // watcher must not wait for `!fall_fault` before queueing ClearFaults.
     let mut saw_clearing_fault = false;
-    for _ in 0..200 {
+    for _ in 0..CLEAR_FAULT_TICKS {
         let telem = step(&mut app);
         assert!(
             app.model.requested_mode != ControlMode::Drive,
@@ -135,7 +159,7 @@ fn e2e_forward_shove_to_prone_get_up_and_back_to_guard() {
     // Step until the fault-clear config command has traversed the wire and
     // telemetry no longer reports the fall. The alarm must stay raised.
     let mut fault_cleared = false;
-    for _ in 0..200 {
+    for _ in 0..CLEAR_FAULT_TICKS {
         let telem = step(&mut app);
         assert!(
             app.fall_event_active,
@@ -157,7 +181,7 @@ fn e2e_forward_shove_to_prone_get_up_and_back_to_guard() {
     // been requested (or playback started) by the time the fault-clear loop
     // exited. Assert the observable end state rather than a transient state.
     let mut started = false;
-    for _ in 0..40 {
+    for _ in 0..PLAYBACK_START_TICKS {
         if app.model.playback.is_some() {
             started = true;
             break;
@@ -175,7 +199,7 @@ fn e2e_forward_shove_to_prone_get_up_and_back_to_guard() {
 
     // --- 5. Playback plays to completion across many real control ticks ---
     let mut ticks_playing = 0usize;
-    while app.model.playback.is_some() && ticks_playing < 2000 {
+    while app.model.playback.is_some() && ticks_playing < PLAYBACK_TICKS {
         step(&mut app);
         ticks_playing += 1;
     }
@@ -195,7 +219,8 @@ fn e2e_forward_shove_to_prone_get_up_and_back_to_guard() {
     );
 
     // --- 6. Alarm clears after stable upright dwell ---
-    for _ in 0..80 {
+    // A 0.45 s dwell now takes 90 fixed ticks rather than ~29 variable-dt frames.
+    for _ in 0..ALARM_CLEAR_TICKS {
         step(&mut app);
         if app.recovery_state == RecoveryState::Idle {
             break;

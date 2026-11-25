@@ -33,7 +33,7 @@ pub use mcp_bridge::NativeMcpListenerStatus;
 use rk_link::{RobotTransport, SimTransport, TransportKind};
 use rk_model::{AssetBundle, StudioModel};
 use rk_fw_core::replay::ReplayVerification;
-use rk_proto::{ControlMode, FallOrientation, FaultFlags, ModelFormat};
+use rk_proto::{ControlMode, FallOrientation, FaultFlags, ModelFormat, estimator_valid};
 use rk_viewport::{HumanoidViewport, ViewportInteraction};
 pub use responsive::{FormFactor, UiMetrics};
 use responsive::apply_responsive_style;
@@ -187,6 +187,13 @@ impl PlatformSaver for NoopSaver {
     }
 }
 
+/// One sampled telemetry frame for the live history plots in the config drawer.
+///
+/// The `world_pos`/`grf`/`contact` fields are simulator enrichment: `rk-sim`
+/// publishes the WORLD and GRF validity bits together with nonzero plant forces,
+/// while hardware v1 leaves them zero/clear. Sampling therefore gates every
+/// achieved signal on its validity bit and falls back to `0.0` so a v1 MCU (or a
+/// malformed packet) never produces misleading "achieved" traces.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TelemetryPoint {
     pub(crate) t_sec: f64,
@@ -198,6 +205,23 @@ pub(crate) struct TelemetryPoint {
     pub(crate) temp_c: f64,
     pub(crate) pitch_deg: f64,
     pub(crate) roll_deg: f64,
+    /// Achieved CoM lateral (right) position in the ground frame, metres.
+    /// Zero unless `estimator_valid::WORLD` is set.
+    pub(crate) com_x_m: f64,
+    /// Achieved CoM forward position in the ground frame, metres.
+    /// Zero unless `estimator_valid::WORLD` is set.
+    pub(crate) com_z_m: f64,
+    /// Achieved left-foot normal ground reaction force, newtons.
+    /// Zero unless `estimator_valid::GRF` is set (hardware v1 has no GRF sensors).
+    pub(crate) grf_left_n: f64,
+    /// Achieved right-foot normal ground reaction force, newtons.
+    /// Zero unless `estimator_valid::GRF` is set (hardware v1 has no GRF sensors).
+    pub(crate) grf_right_n: f64,
+    /// Simulated contact mask (bit 0 = right stance, bit 1 = left stance).
+    /// Zero unless `estimator_valid::GRF` is set.
+    pub(crate) contact_mask: u8,
+    /// Peak torso angular rate (pitch/roll/yaw) converted to deg/s from the IMU gyro.
+    pub(crate) tilt_rate_dps: f64,
 }
 
 /// Complete Rocky Studio UI state shared identically between Desktop, Web, and Tablet.
@@ -369,6 +393,11 @@ impl RockyStudioApp {
                 }
                 self.transport = Box::new(sim);
                 self.connected = true;
+                // A fresh SimTransport is the sim's clean-slate reset: new kernel,
+                // plant, fault flags, wire state and recorder. Clear host history
+                // as well so a reconnect starts a reproducible tuning run.
+                self.history.clear();
+                self.sim_time_sec = 0.0;
                 self.sim_control_accum_sec = 0.0;
                 self.sim_catchup_cap_hit = false;
                 self.query_mcu_model_info();
@@ -698,13 +727,37 @@ impl RockyStudioApp {
                 .min(self.model.rig.joints.len().saturating_sub(1));
             let err_deg = (self.model.target_rad[j] - self.model.latest_telemetry.measured_rad[j])
                 .to_degrees() as f64;
+            let telem = &self.model.latest_telemetry;
+            let world_valid = telem.estimator.valid_mask & estimator_valid::WORLD != 0;
+            let grf_valid = telem.estimator.valid_mask & estimator_valid::GRF != 0;
+            // WORLD/GRF are simulator-only enrichment. Gate each achieved signal on
+            // its validity bit so hardware v1 (which leaves both clear) samples zeros.
+            let com_x_m = if world_valid { telem.balance.world_pos_m[0] as f64 } else { 0.0 };
+            let com_z_m = if world_valid { telem.balance.world_pos_m[2] as f64 } else { 0.0 };
+            let grf_left_n = if grf_valid { telem.estimator.grf_left_n as f64 } else { 0.0 };
+            let grf_right_n = if grf_valid { telem.estimator.grf_right_n as f64 } else { 0.0 };
+            let contact_mask = if grf_valid { telem.estimator.contact_mask } else { 0 };
+            // Peak of the three gyro axes: one compact "tilt rate" trend for tuning.
+            let tilt_rate_dps = telem
+                .imu
+                .pitch_rate_rad_s
+                .abs()
+                .max(telem.imu.roll_rate_rad_s.abs())
+                .max(telem.imu.yaw_rate_rad_s.abs())
+                .to_degrees() as f64;
             self.history.push_back(TelemetryPoint {
                 t_sec: self.sim_time_sec,
                 err_deg,
-                current_ma: self.model.latest_telemetry.current_ma[j] as f64,
-                temp_c: self.model.latest_telemetry.temp_c[j] as f64,
-                pitch_deg: self.model.latest_telemetry.imu.pitch_rad.to_degrees() as f64,
-                roll_deg: self.model.latest_telemetry.imu.roll_rad.to_degrees() as f64,
+                current_ma: telem.current_ma[j] as f64,
+                temp_c: telem.temp_c[j] as f64,
+                pitch_deg: telem.imu.pitch_rad.to_degrees() as f64,
+                roll_deg: telem.imu.roll_rad.to_degrees() as f64,
+                com_x_m,
+                com_z_m,
+                grf_left_n,
+                grf_right_n,
+                contact_mask,
+                tilt_rate_dps,
             });
             while self.history.len() > TELEMETRY_HISTORY_LEN {
                 self.history.pop_front();
@@ -1444,6 +1497,11 @@ mod fall_recovery_tests {
 #[cfg(test)]
 #[path = "e2e_fall_recovery_test.rs"]
 mod e2e_fall_recovery_test;
+
+/// Headless, real-plant end-to-end tests on the fixed-step (`step_fixed`) path.
+#[cfg(test)]
+#[path = "e2e_fixed_step_tests.rs"]
+mod e2e_fixed_step_tests;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod native_mcp_bridge_tests {

@@ -592,6 +592,25 @@ impl McpHost for RockyStudioApp {
         self.model.reset_estop();
     }
 
+    fn reset_experiment(&mut self) -> Result<String, String> {
+        if self.transport.kind() != TransportKind::SimKernel {
+            return Err("Reset experiment is only supported on the Simulation transport.".to_string());
+        }
+        // Reset in place so the persistent Embassy executor and MCP bridge
+        // channel survive; the transport rebuilds kernel, plant, faults, wire
+        // state and recorder from its stored construction inputs.
+        self.transport.reset_experiment();
+        // Clear host command sequencing so scripts feed explicit packets rather
+        // than inheriting frame-derived seq values, playback or queued config.
+        self.model.reset_experiment_state();
+        // Drop host-side history/time too so tuning plots start from zero.
+        self.history.clear();
+        self.sim_time_sec = 0.0;
+        self.sim_control_accum_sec = 0.0;
+        self.sim_catchup_cap_hit = false;
+        Ok("Simulation experiment reset: kernel, plant, faults, wire, recorder, host sequencing and UI history are clean.".to_string())
+    }
+
     fn record_activity(&mut self, entry: McpActivityEntry) {
         self.mcp.last_activity_sim_time = self.sim_time_sec;
         self.mcp.activity.push_back(entry);

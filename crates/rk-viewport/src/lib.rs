@@ -6,6 +6,9 @@
 //! - Orange -> Red heat-tinting when joint `current_ma` > 70% rated current (1400 mA)
 //! - Always-fit-to-view auto-framing camera + 26-region Fusion 360 / Onshape style ViewCube (camera ONLY)
 //! - Direct 3D robot manipulation: drag joints (axis-plane FK + 3D protractor arc) or arms/hands (k Jacobian IK)
+//!
+//! Per-foot contact/GRF marks use simulator-only WORLD/GRF telemetry channels;
+//! hardware v1 reports zero, so feet are marked neutrally rather than falsely loaded.
 
 mod camera;
 mod scene;
@@ -79,6 +82,39 @@ impl Default for ViewportInteraction {
             ik_pose: None,
             is_dragging_robot: false,
             active_drag_label: None,
+        }
+    }
+}
+
+/// Per-foot contact/load signal used to color the rendered feet.
+///
+/// WORLD/GRF telemetry is simulator enrichment: `rk-sim` publishes the GRF
+/// validity bit together with nonzero plant forces, while hardware v1 leaves
+/// both the mask and the forces zero. A zero `grf_n` therefore means "unknown /
+/// unloaded" and the feet render dim rather than claiming a load.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FootContactState {
+    /// Bit 0 = right foot stance, bit 1 = left foot stance (wire `contact_mask`).
+    pub contact_mask: u8,
+    pub grf_left_n: f32,
+    pub grf_right_n: f32,
+}
+
+impl FootContactState {
+    /// `true` when the GRF channel is actually published. With no GRF bit there
+    /// is no trustworthy load information, so feet stay at their base color.
+    fn loaded(self, left: bool) -> bool {
+        let bit = if left { 0b10 } else { 0b01 };
+        // Require both the contact bit and a positive (finite) GRF so a v1 MCU
+        // that leaves GRF at zero never paints a phantom "loaded" foot.
+        self.contact_mask & bit != 0 && self.grf(left) > 0.0
+    }
+
+    fn grf(self, left: bool) -> f32 {
+        if left {
+            self.grf_left_n
+        } else {
+            self.grf_right_n
         }
     }
 }
@@ -192,6 +228,8 @@ pub struct HumanoidViewport {
     joint_pick_spheres: Vec<(usize, Point3<f32>, f32)>,
     view_cube: ViewCubeState,
     active_drag: Option<ActiveViewportDrag>,
+    /// Latest per-foot contact/GRF signal used to mark the rendered feet.
+    feet: FootContactState,
 }
 
 impl Drop for HumanoidViewport {
@@ -225,7 +263,27 @@ impl HumanoidViewport {
             joint_pick_spheres: Vec::new(),
             view_cube: ViewCubeState::default(),
             active_drag: None,
+            feet: FootContactState::default(),
         }
+    }
+
+    /// Updates the simulator-only per-foot contact/GRF signal used to mark the
+    /// feet. Hardware v1 reports a zero state, which leaves feet neutrally marked.
+    /// Non-finite force samples are treated as no load.
+    pub fn set_foot_contact_state(&mut self, state: FootContactState) {
+        self.feet = FootContactState {
+            contact_mask: state.contact_mask,
+            grf_left_n: if state.grf_left_n.is_finite() {
+                state.grf_left_n.max(0.0)
+            } else {
+                0.0
+            },
+            grf_right_n: if state.grf_right_n.is_finite() {
+                state.grf_right_n.max(0.0)
+            } else {
+                0.0
+            },
+        };
     }
 
     pub fn notify_rig_changed(&mut self) {
@@ -742,7 +800,95 @@ impl HumanoidViewport {
             paint_view_cube(&overlay_painter, &frame);
         }
 
+        // 4. Mark each foot with its contact/GRF state on top of the 3D scene.
+        //    Uses the already-computed per-foot world transforms, so this is just
+        //    two projected circles per frame (cheap, no extra GPU passes).
+        self.paint_foot_contact_markers(
+            &overlay_painter,
+            rect,
+            rig,
+            &world_transforms,
+            marker_radius,
+        );
+
         interaction
+    }
+
+    /// Draws a colored disc + halo at each foot's projected world position.
+    ///
+    /// Green intensity tracks GRF magnitude; swinging feet are dimmed. WORLD/GRF
+    /// are simulator-only enrichment — hardware v1 leaves them zero, so feet are
+    /// marked neutral rather than falsely "unloaded" or "loaded".
+    fn paint_foot_contact_markers(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        rig: &KinematicRig,
+        world_transforms: &HashMap<String, Isometry3<f32>>,
+        marker_radius: f32,
+    ) {
+        // Approximate full-load GRF for a 1/4-scale Rocky (~2 kg → ~20 N split
+        // between two feet). Only used to map Newtons to a visual intensity.
+        const GRF_FULL_SCALE_N: f32 = 12.0;
+
+        for vis in &rig.visuals {
+            let lower = vis.link_name.to_ascii_lowercase();
+            if !lower.contains("_foot") {
+                continue;
+            }
+            let is_left = lower.contains("l_foot") || lower.contains("left");
+            let is_right = lower.contains("r_foot") || lower.contains("right");
+            if !is_left && !is_right {
+                continue;
+            }
+            let Some(iso) = world_transforms.get(&vis.link_name) else {
+                continue;
+            };
+            let t = (iso * vis.local_offset).translation.vector;
+            let Some(pos) = self.project_world_to_screen(
+                Point3::new(t.x, t.y, t.z),
+                rect,
+            ) else {
+                continue;
+            };
+
+            let grf = if is_left { self.feet.grf_left_n } else { self.feet.grf_right_n };
+            let loaded = self.feet.loaded(is_left);
+            let radius = (marker_radius * 1.6).clamp(0.018, 0.05);
+            // Screen-space radius from world marker size via the camera projection.
+            let px = (self.project_world_to_screen(
+                Point3::new(t.x + radius, t.y, t.z),
+                rect,
+            )
+            .map(|p| (p.x - pos.x).abs()))
+            .unwrap_or(8.0)
+            .clamp(5.0, 26.0);
+
+            let (fill, ring) = if loaded {
+                let intensity = (grf / GRF_FULL_SCALE_N).clamp(0.25, 1.0);
+                (
+                    Color32::from_rgba_unmultiplied(
+                        (26.0 + 60.0 * (1.0 - intensity)) as u8,
+                        (140.0 + 82.0 * intensity) as u8,
+                        (60.0 + 40.0 * (1.0 - intensity)) as u8,
+                        200,
+                    ),
+                    Color32::from_rgba_unmultiplied(74, 222, 128, 230),
+                )
+            } else {
+                // Swinging / unmeasured foot: dim slate outline.
+                (
+                    Color32::from_rgba_unmultiplied(24, 32, 44, 140),
+                    Color32::from_rgba_unmultiplied(96, 124, 156, 170),
+                )
+            };
+            painter.circle_filled(pos, px, fill);
+            painter.circle_stroke(
+                pos,
+                px,
+                Stroke::new(if loaded { 2.4 } else { 1.2 }, ring),
+            );
+        }
     }
 
     fn pointer_ray(&self, pos: Pos2, rect: Rect) -> (Point3<f32>, Vector3<f32>) {
@@ -1083,6 +1229,41 @@ mod tests {
         let projected = vp.project_world_to_screen(target, rect).expect("project target");
         assert!((projected.x - 500.0).abs() < 1.0);
         assert!((projected.y - 400.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn foot_contact_requires_both_bit_and_positive_grf() {
+        // Left = bit 1, right = bit 0 (matches rk-sim contact_mask convention).
+        let s = FootContactState {
+            contact_mask: 0b10,
+            grf_left_n: 9.0,
+            grf_right_n: 0.0,
+        };
+        assert!(s.loaded(true));
+        assert!(!s.loaded(false), "right has no contact bit and no GRF");
+
+        // A stale contact bit with zero GRF (hardware v1 default) is not a load.
+        let hw = FootContactState {
+            contact_mask: 0b11,
+            grf_left_n: 0.0,
+            grf_right_n: 0.0,
+        };
+        assert!(!hw.loaded(true));
+        assert!(!hw.loaded(false));
+    }
+
+    #[test]
+    fn set_foot_contact_state_clamps_non_finite_grf_to_zero() {
+        let mut vp = HumanoidViewport::new();
+        vp.set_foot_contact_state(FootContactState {
+            contact_mask: 0b11,
+            grf_left_n: f32::NAN,
+            grf_right_n: f32::INFINITY,
+        });
+        assert_eq!(vp.feet.grf_left_n, 0.0);
+        assert_eq!(vp.feet.grf_right_n, 0.0);
+        assert!(!vp.feet.loaded(true));
+        assert!(!vp.feet.loaded(false));
     }
 
     #[test]

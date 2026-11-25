@@ -3,6 +3,12 @@
 //! Uses RP2350 `UART0` (`GPIO0` TX / `GPIO1` RX @ 1 Mbps) in a non-blocking mailbox pattern
 //! so `copper-rs` `ServoBusBridge` runs deterministically without blocking on slow serial reads.
 //! Ready to wire Feetech STS3215 / Dynamixel Protocol 2.0 half-duplex smart bus servos.
+//!
+//! **Legacy / unused:** `rk-multibus` (BareFOC register-pointer transactions over
+//! the external PIO I3C driver) is now the single servo wire path for the
+//! control application. This UART adapter is kept only as a bring-up placeholder
+//! for electrical-continuity checks on GPIO0/GPIO1; it is not part of the
+//! production servo bus and is enabled only by `--features uart-servo-bus`.
 
 #![cfg(feature = "uart-servo-bus")]
 

@@ -85,6 +85,15 @@ pub trait RobotTransport {
         None
     }
     fn inject_corrupted_frame(&mut self) {}
+    /// Status LED state from the firmware LED mode state machine (Sim mode only).
+    /// Default false for wired transports that have no simulated LED side effect.
+    /// Evaluated by `post_tick` outside the recorded kernel tick stream.
+    fn sim_led_on(&self) -> bool {
+        false
+    }
+    /// Resets the simulation experiment (kernel, plant, faults, wire and history)
+    /// while preserving the persistent executor. No-op for wired transports.
+    fn reset_experiment(&mut self) {}
     /// Injects a combat shove impulse into the simulated torso (Sim mode only).
     fn apply_push_impulse(&mut self, _pitch_impulse_rad_s: f32, _roll_impulse_rad_s: f32) {}
     /// Resets the simulated torso upright at 0 deg pitch/roll (Sim mode only).
@@ -124,6 +133,116 @@ pub trait RobotTransport {
     }
 }
 
+/// Deterministic subset of [`SimFaultInjection`] applied to the host -> MCU wire.
+#[derive(Clone, Copy, Default)]
+struct WireRxFaults {
+    crc_error: bool,
+    version_mismatch: bool,
+    truncated: bool,
+    fragmented: bool,
+}
+
+impl WireRxFaults {
+    fn from_injection(faults: &SimFaultInjection) -> Self {
+        Self {
+            crc_error: faults.rx_crc_error,
+            version_mismatch: faults.rx_version_mismatch,
+            truncated: faults.rx_truncated_frame,
+            fragmented: faults.rx_fragmented_frame,
+        }
+    }
+}
+
+/// Flips one COBS *data* byte (never a code byte or the delimiter) so the
+/// decoded payload/CRC changes while the frame stays structurally valid.
+///
+/// `CobsStreamFramer` then reports `CodecError::CrcMismatch` through the shared
+/// mailbox, exactly as a bit-flipped USB CDC-ACM transfer would on hardware.
+fn flip_cobs_data_byte(frame: &mut [u8]) {
+    // The final byte of an encoded frame is the 0x00 COBS delimiter.
+    let end = frame.len().saturating_sub(1);
+    let mut idx = 0usize;
+    while idx < end {
+        let code = frame[idx] as usize;
+        if code == 0 {
+            // Malformed frame: leave it to the decoder to count the error.
+            return;
+        }
+        idx += 1;
+        let data_end = (idx + code - 1).min(end);
+        if data_end > idx {
+            let target = idx + (data_end - idx) / 2;
+            // COBS data bytes are nonzero; keep the result nonzero so framing
+            // is unchanged and only the CRC check fails.
+            frame[target] = if frame[target] == 1 {
+                0x02
+            } else {
+                frame[target] ^ 1
+            };
+            return;
+        }
+        // `code == 1` (or a truncated final run): the next wire byte is the
+        // following group's code byte.
+        idx = data_end;
+    }
+}
+
+/// Encodes `host_pkt` with the real `rk_proto::encode_cobs`, optionally injects
+/// a deterministic wire fault, then decodes it through the *same*
+/// `CobsStreamFramer` / `decode_rx` path firmware uses.
+///
+/// Returns the typed command the MCU would actually have received, or `None`
+/// when the frame was rejected. Codec errors land in the runner's local
+/// mailbox and are copied into the next telemetry tick by `step_control_tick`.
+fn decode_wire_host_cmd(
+    runner: &mut CopperSimRunner,
+    host_pkt: &HostToMcu,
+    faults: WireRxFaults,
+    wire: &mut [u8; rk_proto::MAX_COBS_FRAME_BYTES],
+) -> Option<HostToMcu> {
+    // The protocol version lives inside the postcard payload that the CRC
+    // covers. Inject a mismatch by encoding a packet with the wrong version:
+    // the frame is structurally valid with a correct CRC, and the firmware's
+    // `validate_host_packet` rejects it as `VersionMismatch`. This avoids
+    // hard-coding a byte offset into a postcard payload.
+    let mut pkt = *host_pkt;
+    if faults.version_mismatch {
+        pkt.protocol_version = rk_proto::PROTOCOL_VERSION.wrapping_add(1);
+    }
+
+    let len = match rk_proto::encode_cobs(&pkt, wire) {
+        Ok(encoded) => encoded.len(),
+        Err(_) => return None,
+    };
+
+    if faults.crc_error {
+        flip_cobs_data_byte(&mut wire[..len]);
+    }
+
+    if faults.truncated && len >= 2 {
+        // Drop the final data byte but retain the COBS delimiter. The shared
+        // framer sees a complete-but-invalid frame, counts the framing error
+        // and resynchronises immediately, so the next clean tick is unaffected.
+        wire[len - 2] = 0x00;
+        return runner.decode_host_frame(&mut wire[..len - 1]);
+    }
+
+    if faults.fragmented {
+        // Exercise the streaming accumulator across several pushes, as USB
+        // CDC-ACM delivers ~120-byte packets in 64-byte chunks. The command
+        // arrives on the last chunk; partial chunks never emit a packet.
+        let mut decoded = None;
+        for chunk in wire[..len].chunks_mut(16) {
+            if let Some(pkt) = runner.decode_host_frame(chunk) {
+                decoded = Some(pkt);
+            }
+        }
+        decoded
+    } else {
+        runner.decode_host_frame(&mut wire[..len])
+    }
+}
+
 /// Stage 1 Software Simulation transport backed by `CopperSimRunner` (runs on both Desktop and WASM).
 pub struct SimTransport {
     runner: CopperSimRunner,
@@ -152,13 +271,15 @@ impl SimTransport {
 
     /// Advances the simulated MCU by `steps` fixed 5 ms control ticks.
     ///
-    /// Host commands are sampled once per rendered frame and repeated on every
-    /// tick so the deadman watchdog behaves as it does on the 200 Hz wire;
-    /// one-shot `ConfigCmd`s are applied only on the first tick. The simulated
-    /// heartbeat-drop fault suppresses all host commands for the frame, matching
-    /// the legacy `step_exchange` behaviour. COBS encoding of host commands is
-    /// intentionally bypassed here — `run_harness` queues typed commands
-    /// directly — while MCU telemetry still round-trips through COBS in
+    /// Host commands are sampled once per rendered frame, encoded with the real
+    /// `encode_cobs`, decoded through the same `CobsStreamFramer` / `decode_rx`
+    /// path firmware uses, then repeated on every tick so the deadman watchdog
+    /// behaves as it does on the 200 Hz wire; one-shot `ConfigCmd`s are applied
+    /// only on the first tick. Injected CRC/version/truncation/fragmentation
+    /// faults corrupt the wire before decoding, and the resulting codec errors
+    /// reach telemetry via the shared mailbox. The heartbeat-drop fault still
+    /// suppresses all host commands for the frame, matching the legacy
+    /// `step_exchange` behaviour. MCU telemetry round-trips through COBS in
     /// `RobotIo::publish_telemetry`.
     fn step_fixed_inner(
         &mut self,
@@ -185,11 +306,28 @@ impl SimTransport {
         // Keep the running gate in sync with the sampled command, as `tick()` did.
         self.runner.plant.set_running_config(host_pkt.walk.running);
 
+        // Snapshot the wire knobs before taking `&mut self.runner` for decoding.
+        let wire_faults = {
+            let f = self.runner.plant.faults();
+            WireRxFaults::from_injection(f)
+        };
+
+        // The wire is the single source of truth: even a clean frame is encoded
+        // and decoded before a typed command reaches the harness. A rejected
+        // frame supplies no command at all (same as a dropped heartbeat), so
+        // the control loop keeps ticking and the deadman logic can react.
+        let decoded = if dropped {
+            None
+        } else {
+            let mut wire = [0u8; rk_proto::MAX_COBS_FRAME_BYTES];
+            decode_wire_host_cmd(&mut self.runner, host_pkt, wire_faults, &mut wire)
+        };
+
         let mut cmds = Vec::with_capacity(steps);
-        if !dropped {
-            let mut later = *host_pkt;
+        if let Some(first) = decoded {
+            let mut later = first;
             later.config = ConfigCmd::None;
-            cmds.push(*host_pkt);
+            cmds.push(first);
             cmds.extend(std::iter::repeat(later).take(steps - 1));
         }
 
@@ -259,6 +397,14 @@ impl RobotTransport for SimTransport {
 
     fn inject_corrupted_frame(&mut self) {
         self.runner.inject_corrupted_frame();
+    }
+
+    fn sim_led_on(&self) -> bool {
+        self.runner.sim_led_on()
+    }
+
+    fn reset_experiment(&mut self) {
+        self.runner.reset_experiment();
     }
 
     fn apply_push_impulse(&mut self, pitch_impulse_rad_s: f32, roll_impulse_rad_s: f32) {
@@ -418,6 +564,7 @@ impl RobotTransport for UdpTransport {
 mod tests {
     use super::*;
     use rk_proto::ControlMode;
+    use rk_sim::verify_deterministic_replay;
     use std::sync::Mutex;
 
     // The Embassy mock clock and task pool are process-global in this workspace.
@@ -493,5 +640,227 @@ mod tests {
         for tick in &log.ticks[1..] {
             assert_eq!(tick.rx_cmd.expect("cmd").config, ConfigCmd::None);
         }
+    }
+
+    /// A clean COBS frame must decode bit-exactly to the sampled packet, and
+    /// the fixed-step path must remain replay-exact through the real wire.
+    #[test]
+    fn step_fixed_clean_wire_frame_is_bit_exact_and_replay_exact() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sim = sim();
+        sim.reset_mock_clock();
+
+        let mut target_rad = [0.0_f32; MAX_JOINTS];
+        for (i, value) in [0.1_f32, -0.2, 0.3, -0.4, 0.5, -0.6].iter().enumerate() {
+            target_rad[i] = *value;
+        }
+        let pkt = HostToMcu {
+            seq: 42,
+            mode: ControlMode::Drive,
+            torque_mask: 0b11_1111,
+            speed_limit_pct: 33,
+            target_rad,
+            command_mode: [1; MAX_JOINTS],
+            velocity_rad_s: [0.25; MAX_JOINTS],
+            config: ConfigCmd::SetZeroOffset {
+                joint: 2,
+                zero_rad: 0.3,
+            },
+            ..Default::default()
+        };
+
+        // Decode the same bytes the fixed-step path uses, directly through the
+        // runner's shared stream framer.
+        let mut wire = [0u8; rk_proto::MAX_COBS_FRAME_BYTES];
+        let decoded = decode_wire_host_cmd(&mut sim.runner, &pkt, WireRxFaults::default(), &mut wire);
+        assert_eq!(decoded, Some(pkt));
+        assert_eq!(sim.runner.wire_error_counts(), (0, 0));
+
+        sim.start_recording();
+        let telem = sim.step_fixed(4, &pkt, 0.020).expect("telemetry frame");
+        assert_eq!(telem.active_mode, ControlMode::Drive);
+        assert_eq!(telem.rx_crc_errors, 0);
+        assert_eq!(telem.rx_version_mismatches, 0);
+
+        let log = sim.stop_recording().expect("recorded replay");
+        assert_eq!(log.ticks.len(), 4);
+        assert_eq!(log.ticks[0].rx_cmd, Some(pkt));
+        let mut later = pkt;
+        later.config = ConfigCmd::None;
+        for tick in &log.ticks[1..] {
+            assert_eq!(tick.rx_cmd, Some(later));
+            assert_eq!(tick.wire_errors, (0, 0));
+        }
+        let check = verify_deterministic_replay(&log);
+        assert!(check.exact_match, "fixed-step wire replay must be exact: {check:?}");
+        assert_eq!(check.matched_ticks, check.total_ticks);
+    }
+
+    /// A flipped COBS byte must increment `rx_crc_errors` in telemetry and the
+    /// next clean tick must still deliver its command (no framer cross-talk).
+    #[test]
+    fn step_fixed_crc_fault_counts_error_and_recovers() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sim = sim();
+        sim.reset_mock_clock();
+        sim.start_recording();
+
+        let pkt = HostToMcu {
+            seq: 9,
+            ..Default::default()
+        };
+        sim.sim_faults_mut().expect("sim faults").rx_crc_error = true;
+        let telem = sim.step_fixed(2, &pkt, 0.010).expect("telemetry frame");
+        assert_eq!(telem.rx_crc_errors, 1, "CRC fault must reach kernel telemetry");
+        assert_eq!(telem.rx_version_mismatches, 0);
+        assert!(sim.runner.link_errors() >= 1, "framer must record the bad frame");
+        let log = sim.recorded_log().expect("recording active");
+        assert!(log.ticks.iter().all(|t| t.rx_cmd.is_none()));
+
+        sim.sim_faults_mut().expect("sim faults").rx_crc_error = false;
+        let clean = HostToMcu {
+            seq: 10,
+            ..Default::default()
+        };
+        let next = sim.step_fixed(1, &clean, 0.005).expect("telemetry frame");
+        assert_eq!(next.rx_crc_errors, 1, "counts are cumulative, not reset");
+        let log = sim.recorded_log().expect("recording active");
+        assert_eq!(log.ticks.last().expect("tick").rx_cmd, Some(clean));
+    }
+
+    /// A wrong `protocol_version` on the wire must increment only the version
+    /// mismatch counter, without a CRC or framing error.
+    #[test]
+    fn step_fixed_version_fault_counts_only_version_mismatch() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sim = sim();
+        sim.reset_mock_clock();
+        sim.start_recording();
+
+        let pkt = HostToMcu {
+            seq: 11,
+            ..Default::default()
+        };
+        sim.sim_faults_mut().expect("sim faults").rx_version_mismatch = true;
+        let telem = sim.step_fixed(1, &pkt, 0.005).expect("telemetry frame");
+        assert_eq!(telem.rx_version_mismatches, 1);
+        assert_eq!(telem.rx_crc_errors, 0);
+        assert!(sim.runner.link_errors() >= 1);
+        let log = sim.recorded_log().expect("recording active");
+        assert!(log.ticks.last().expect("tick").rx_cmd.is_none());
+
+        sim.sim_faults_mut()
+            .expect("sim faults")
+            .rx_version_mismatch = false;
+        let clean = HostToMcu {
+            seq: 12,
+            ..Default::default()
+        };
+        let next = sim.step_fixed(1, &clean, 0.005).expect("telemetry frame");
+        assert_eq!(next.rx_version_mismatches, 1);
+        let log = sim.recorded_log().expect("recording active");
+        assert_eq!(log.ticks.last().expect("tick").rx_cmd, Some(clean));
+    }
+
+    /// A truncated frame must be counted as a framing error, never panic, and
+    /// must not poison the next clean frame.
+    #[test]
+    fn step_fixed_truncated_fault_counts_frame_error_and_recovers() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sim = sim();
+        sim.reset_mock_clock();
+        sim.start_recording();
+
+        let pkt = HostToMcu {
+            seq: 13,
+            ..Default::default()
+        };
+        sim.sim_faults_mut().expect("sim faults").rx_truncated_frame = true;
+        let telem = sim.step_fixed(1, &pkt, 0.005).expect("telemetry frame");
+        assert_eq!(telem.rx_crc_errors, 0);
+        assert_eq!(telem.rx_version_mismatches, 0);
+        assert!(sim.runner.link_errors() >= 1, "framer must count the short frame");
+        let log = sim.recorded_log().expect("recording active");
+        assert!(log.ticks.last().expect("tick").rx_cmd.is_none());
+
+        sim.sim_faults_mut().expect("sim faults").rx_truncated_frame = false;
+        let clean = HostToMcu {
+            seq: 14,
+            ..Default::default()
+        };
+        let next = sim.step_fixed(1, &clean, 0.005).expect("telemetry frame");
+        assert_eq!(next.rx_crc_errors, 0);
+        assert_eq!(next.rx_version_mismatches, 0);
+        let log = sim.recorded_log().expect("recording active");
+        assert_eq!(log.ticks.last().expect("tick").rx_cmd, Some(clean));
+    }
+
+    /// Splitting a frame across several framer pushes must still deliver the
+    /// command, with no wire errors and an exact replay.
+    #[test]
+    fn step_fixed_fragmented_fault_reassembles_command() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sim = sim();
+        sim.reset_mock_clock();
+
+        let pkt = HostToMcu {
+            seq: 15,
+            mode: ControlMode::Drive,
+            torque_mask: 0b11,
+            target_rad: [0.2; MAX_JOINTS],
+            ..Default::default()
+        };
+        let mut wire = [0u8; rk_proto::MAX_COBS_FRAME_BYTES];
+        let decoded = decode_wire_host_cmd(
+            &mut sim.runner,
+            &pkt,
+            WireRxFaults {
+                fragmented: true,
+                ..Default::default()
+            },
+            &mut wire,
+        );
+        assert_eq!(decoded, Some(pkt));
+        assert_eq!(sim.runner.wire_error_counts(), (0, 0));
+
+        sim.sim_faults_mut().expect("sim faults").rx_fragmented_frame = true;
+        sim.start_recording();
+        let telem = sim.step_fixed(3, &pkt, 0.015).expect("telemetry frame");
+        assert_eq!(telem.active_mode, ControlMode::Drive);
+        assert_eq!(sim.runner.wire_error_counts(), (0, 0));
+
+        let log = sim.stop_recording().expect("recorded replay");
+        assert_eq!(log.ticks[0].rx_cmd, Some(pkt));
+        let mut later = pkt;
+        later.config = ConfigCmd::None;
+        for tick in &log.ticks[1..] {
+            assert_eq!(tick.rx_cmd, Some(later));
+        }
+        assert!(verify_deterministic_replay(&log).exact_match);
+    }
+
+    /// Heartbeat-drop suppression still wins over wire faults: no frame is put
+    /// on the wire, so no wire error is counted for that frame.
+    #[test]
+    fn step_fixed_dropped_heartbeat_still_suppresses_wire_faults() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sim = sim();
+        sim.reset_mock_clock();
+        sim.start_recording();
+
+        let pkt = HostToMcu {
+            seq: 16,
+            ..Default::default()
+        };
+        {
+            let faults = sim.sim_faults_mut().expect("sim faults");
+            faults.drop_heartbeat = true;
+            faults.rx_crc_error = true;
+            faults.rx_version_mismatch = true;
+        }
+        assert!(sim.step_fixed(2, &pkt, 0.010).is_none());
+        assert_eq!(sim.runner.wire_error_counts(), (0, 0));
+        let log = sim.recorded_log().expect("recording active");
+        assert!(log.ticks.iter().all(|t| t.rx_cmd.is_none()));
     }
 }
