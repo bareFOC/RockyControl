@@ -4,7 +4,7 @@ use rk_control::JointCalibration;
 use rk_proto::{
     ConfigCmd, HostToMcu, MAX_JOINTS, McuToHost, ModelFormat, ModelRequest, ModelResponse,
 };
-use rk_sim::{CopperReplayLog, CopperSimRunner, SimFaultInjection};
+use rk_sim::{CopperReplayLog, CopperSimRunner, SimFaultInjection, WalkQuality};
 
 /// Fixed period of one control tick (5 ms / 200 Hz).
 ///
@@ -74,6 +74,12 @@ pub trait RobotTransport {
     }
 
     fn stats(&self) -> LinkStats;
+    /// Snapshot of accumulated walk-quality metrics. Sim transports return the
+    /// recorder-backed metrics; wired transports have no such measurement and
+    /// return `None`.
+    fn walk_quality(&self) -> Option<WalkQuality> {
+        None
+    }
     fn sim_faults_mut(&mut self) -> Option<&mut SimFaultInjection> {
         None
     }
@@ -377,6 +383,10 @@ impl RobotTransport for SimTransport {
             link_errors: self.runner.link_errors(),
             connected: !dropped,
         }
+    }
+
+    fn walk_quality(&self) -> Option<WalkQuality> {
+        Some(self.runner.last_walk_quality())
     }
 
     fn sim_faults_mut(&mut self) -> Option<&mut SimFaultInjection> {

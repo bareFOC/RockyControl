@@ -18,6 +18,25 @@ pub const CAMERA_PRESETS: &[&str] = &[
 /// Available transport backend identifiers for `robot_connect`.
 pub const TRANSPORT_KINDS: &[&str] = &["sim", "usb_udp", "usb_serial"];
 
+/// Committed deterministic experiment fixtures exposed through
+/// `experiment_list`/`experiment_run_named`. The JSON bodies are embedded from
+/// these exact files by `tools.rs`, so this list is also available in the GUI
+/// bridge where confined file reads are unavailable.
+pub const EXPERIMENT_FIXTURES: &[(&str, &str)] = &[
+    (
+        "walk_nominal.json",
+        "Clean-sensor 4 s forward walk at 0.25 m/s; P4 acceptance band (800 ticks).",
+    ),
+    (
+        "walk_shove.json",
+        "Realistic sensor profile with a tick-300 shove; recovers without latched faults (800 ticks).",
+    ),
+    (
+        "fall_recover.json",
+        "Fall at tick 30, consented get-up sweep, ends upright (400 ticks).",
+    ),
+];
+
 fn num(desc: &str) -> Value {
     json!({"type": "number", "description": desc})
 }
@@ -102,6 +121,13 @@ pub fn tool_definitions() -> Vec<Value> {
                 }),
                 &[],
             ),
+            Effect::ReadOnly,
+        ),
+        tool(
+            "quality_snapshot",
+            "Read Walk Quality Snapshot",
+            "Returns all 14 accumulated walk-quality metrics (speed, tilt, CoM height/drift, foot slip, GRF, support counts, currents, margins and contact swaps) plus the acceptance `bounds`, per-metric `violations` and `pass` verdict. Metrics are null on wired transports.",
+            object(json!({}), &[]),
             Effect::ReadOnly,
         ),
         // --- Robot Model & Configuration ---
@@ -236,6 +262,13 @@ pub fn tool_definitions() -> Vec<Value> {
                 }),
                 &[],
             ),
+            Effect::Edits,
+        ),
+        tool(
+            "balance_reset_defaults",
+            "Reset UVC Balance Gains to Defaults",
+            "Restores all 14 balance gains to BalanceGains::default(), queues ConfigCmd::SetBalanceGains and steps two ticks when connected. Returns the restored gains and gait settings.",
+            object(json!({}), &[]),
             Effect::Edits,
         ),
         tool(
@@ -430,7 +463,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "run_experiment",
             "Run Scripted Experiment (Sim)",
-            "Runs a deterministic experiment script (typed host packets, timed plant events, PRNG seed) from a clean simulation reset and returns bit-exact replay verification. Supply `script` as ExperimentScript JSON, or a `file_path` confined to --automation-read-root on the native CLI.",
+            "Runs a deterministic experiment script (typed host packets, timed plant events, PRNG seed) from a clean simulation reset and returns bit-exact replay verification plus the run's walk quality. Supply `script` as ExperimentScript JSON, or a `file_path` confined to --automation-read-root on the native CLI.",
             object(
                 json!({
                     "script": json!({
@@ -440,6 +473,25 @@ pub fn tool_definitions() -> Vec<Value> {
                     "file_path": string("Path to a JSON experiment script inside --automation-read-root (native CLI only)")
                 }),
                 &[],
+            ),
+            Effect::Edits,
+        ),
+        tool(
+            "experiment_list",
+            "List Committed Experiments",
+            "Lists the committed deterministic experiment fixtures (walk_nominal, walk_shove, fall_recover) with descriptions. Available in both the native CLI and GUI bridge.",
+            object(json!({}), &[]),
+            Effect::ReadOnly,
+        ),
+        tool(
+            "experiment_run_named",
+            "Run a Committed Experiment by Name",
+            "Runs a committed fixture by name (as listed by experiment_list; .json suffix optional) through the same deterministic run_experiment path and returns the identical replay verdict and walk-quality response. Prefers a confined file read when available, otherwise uses the embedded fixture bytes.",
+            object(
+                json!({
+                    "name": string("Fixture name from experiment_list, e.g. walk_nominal.json or walk_nominal")
+                }),
+                &["name"],
             ),
             Effect::Edits,
         ),
@@ -495,6 +547,12 @@ pub fn resource_definitions() -> Vec<Value> {
             "uri": "rocky://actions",
             "name": "Action & Combat Library",
             "description": "Available keyframe actions and active playback progress.",
+            "mimeType": "application/json"
+        }),
+        json!({
+            "uri": "rocky://quality",
+            "name": "Walk Quality Metrics",
+            "description": "All 14 accumulated walk-quality metrics plus acceptance bounds, violations and pass verdict from the simulation recorder (metrics null on wired transports).",
             "mimeType": "application/json"
         }),
     ]

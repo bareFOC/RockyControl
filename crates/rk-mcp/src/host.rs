@@ -3,8 +3,17 @@
 use rk_fw_core::replay::{ReplayVerification, verify_deterministic_replay};
 use rk_link::{RobotTransport, TransportKind};
 use rk_model::{AssetBundle, StudioModel};
-use rk_sim::{CopperSimRunner, ExperimentScript};
+use rk_proto::ConfigCmd;
+use rk_sim::{CopperSimRunner, ExperimentScript, WalkQuality};
 use serde::{Deserialize, Serialize};
+
+/// Outcome of a scripted experiment: the bit-exact replay verdict together with
+/// the walk-quality metrics accumulated by the simulator during that run.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct ExperimentResult {
+    pub verification: ReplayVerification,
+    pub quality: Option<WalkQuality>,
+}
 
 /// Guarded autonomy policy controlling external MCP agent permissions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +71,12 @@ pub trait McpHost {
     fn transport(&self) -> &dyn RobotTransport;
     fn transport_mut(&mut self) -> &mut dyn RobotTransport;
 
+    /// Accumulated walk-quality metrics of the active transport, if it measures
+    /// them. Mirrors [`RobotTransport::walk_quality`] for host implementations.
+    fn walk_quality(&self) -> Option<WalkQuality> {
+        self.transport().walk_quality()
+    }
+
     fn is_connected(&self) -> bool;
     fn connect(&mut self, kind: TransportKind) -> Result<String, String>;
     fn disconnect(&mut self);
@@ -114,19 +129,35 @@ pub trait McpHost {
     /// Host-side sequencing is reset first to keep seq values independent of
     /// prior UI activity. The default works for both the headless CLI host and
     /// the live GUI bridge without requiring transport-specific access.
-    fn run_experiment(&mut self, script: &ExperimentScript) -> Result<ReplayVerification, String> {
+    ///
+    /// The script is cloned before use: tick 0 is rewritten with the host's
+    /// current tuned `BalanceGains` (`ConfigCmd::SetBalanceGains`) so scripted
+    /// runs exercise the same gains as live tuning, and caller-owned scripts are
+    /// never mutated. A config already on packet 0 is replaced (there is one
+    /// config slot per packet), so other configs belong on later ticks. The
+    /// response carries both replay verification and the run's walk quality.
+    fn run_experiment(&mut self, script: &ExperimentScript) -> Result<ExperimentResult, String> {
         if self.transport().kind() != TransportKind::SimKernel {
             return Err("Scripted experiments require the Simulation transport.".to_string());
         }
         self.model_mut().reset_experiment_state();
         let model = self.model();
-        let mut runner = CopperSimRunner::new(
-            model.rig.joints.len().max(1),
-            &model.calibration,
-            model.rig.default_pose(),
-        );
-        let log = runner.run_script(script);
-        Ok(verify_deterministic_replay(&log))
+        let gains = model.balance_gains;
+        let joint_count = model.rig.joints.len().max(1);
+        let calibration = model.calibration.clone();
+        let pose = model.rig.default_pose();
+
+        let mut script = script.clone();
+        if let Some(first) = script.packets.first_mut() {
+            first.config = ConfigCmd::SetBalanceGains(gains);
+        }
+
+        let mut runner = CopperSimRunner::new(joint_count, &calibration, pose);
+        let log = runner.run_script(&script);
+        Ok(ExperimentResult {
+            verification: verify_deterministic_replay(&log),
+            quality: Some(runner.last_walk_quality()),
+        })
     }
 
     fn record_activity(&mut self, entry: McpActivityEntry);

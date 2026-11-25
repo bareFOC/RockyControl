@@ -2047,7 +2047,7 @@ impl ServoBusPort for SimulatedServoPlant {
 /// consumes; no separate measurement model. Fractions are per sampled tick and
 /// `single_support_grf_ratio` is the sample with the largest deviation from 1
 /// (loaded-foot GRF / body weight), so both under- and over-support are visible.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
 pub struct WalkQuality {
     /// Mean achieved forward speed (m/s).
     pub mean_forward_speed_m_s: f32,
@@ -2079,6 +2079,234 @@ pub struct WalkQuality {
     pub catch_step_fraction: f32,
     /// Support-foot swaps observed by the plant.
     pub contact_swap_count: u32,
+}
+
+/// Machine-readable acceptance bands for [`WalkQuality`], mirroring
+/// `docs/SIM_ACCEPTANCE.md`. This is the single source of truth shared by the
+/// simulator tests and the MCP acceptance tools; tuning scripts may override
+/// individual fields (e.g. wider disturbance bands) without duplicating the
+/// comparison logic.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct WalkQualityBounds {
+    /// Effective forward velocity command (`WalkCmd.vx * WALK_SPEED_SCALE`) in m/s.
+    pub command_forward_speed_m_s: f32,
+    /// Allowed relative error around `command_forward_speed_m_s` (±10% by default).
+    pub speed_tolerance_fraction: f32,
+    /// Exclusive upper bound on peak torso tilt (rad).
+    pub peak_tilt_rad_max: f32,
+    /// Exclusive upper bound on trailing-second torso tilt (rad).
+    pub steady_tilt_rad_max: f32,
+    /// Exclusive upper bound on lateral CoM drift (m).
+    pub lateral_drift_m_max: f32,
+    /// Nominal world CoM height (m) used as the centre of the acceptance band.
+    pub com_height_nominal_m: f32,
+    /// Allowed absolute deviation of min/max CoM height from nominal (m).
+    pub com_height_tolerance_m: f32,
+    /// Nominal loaded-sole GRF / body-weight ratio (1.0 == full weight).
+    pub single_support_grf_ratio_nominal: f32,
+    /// Allowed absolute deviation of the worst single-support GRF ratio.
+    pub single_support_grf_ratio_tolerance: f32,
+    /// Maximum total flight ticks. One tick is the plant initialization sample
+    /// before the first control output; steady walking must add none.
+    pub max_flight_ticks: u32,
+    /// Exclusive upper bound on peak joint current (mA).
+    pub max_current_ma: u16,
+    /// Exclusive upper bound on the fraction of ticks with a negative margin.
+    pub margin_negative_fraction_max: f32,
+    /// Exclusive upper bound on the fraction of genuine catch-step ticks.
+    pub catch_step_fraction_max: f32,
+    /// Exclusive upper bound on per-plant-step foot slip (m).
+    pub max_foot_slip_m: f32,
+    /// Minimum number of support-foot swaps across the run.
+    pub min_contact_swap_count: u32,
+}
+
+impl Default for WalkQualityBounds {
+    fn default() -> Self {
+        Self {
+            command_forward_speed_m_s: 0.5_f32 * 0.5_f32,
+            speed_tolerance_fraction: 0.10_f32,
+            peak_tilt_rad_max: 0.08_f32,
+            steady_tilt_rad_max: 0.03_f32,
+            lateral_drift_m_max: 0.03_f32,
+            com_height_nominal_m: 0.72_f32,
+            com_height_tolerance_m: 0.03_f32,
+            single_support_grf_ratio_nominal: 1.0_f32,
+            single_support_grf_ratio_tolerance: 0.15_f32,
+            max_flight_ticks: 1,
+            max_current_ma: 1950,
+            margin_negative_fraction_max: 0.30_f32,
+            catch_step_fraction_max: 0.30_f32,
+            max_foot_slip_m: 0.05_f32,
+            min_contact_swap_count: 6,
+        }
+    }
+}
+
+/// One failed acceptance bound. `field` matches the [`WalkQuality`] metric name,
+/// and `measured`/`bound` carry JSON numbers (or `[low, high]` for range bands)
+/// so MCP agents can reason about the failure without parsing prose.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct QualityViolation {
+    pub field: String,
+    pub message: String,
+    pub measured: serde_json::Value,
+    pub bound: serde_json::Value,
+}
+
+impl QualityViolation {
+    fn new(
+        field: &str,
+        message: String,
+        measured: serde_json::Value,
+        bound: serde_json::Value,
+    ) -> Self {
+        Self {
+            field: field.to_string(),
+            message,
+            measured,
+            bound,
+        }
+    }
+}
+
+/// Result of checking a [`WalkQuality`] snapshot against [`WalkQualityBounds`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct QualityEvaluation {
+    pub metrics: WalkQuality,
+    pub bounds: WalkQualityBounds,
+    pub violations: Vec<QualityViolation>,
+    pub pass: bool,
+}
+
+impl WalkQualityBounds {
+    /// Evaluates every bounded metric. Comparisons are written as `!(allowed)`
+    /// so non-finite measurements fail instead of silently passing.
+    pub fn evaluate(&self, metrics: &WalkQuality) -> QualityEvaluation {
+        use serde_json::json;
+
+        let mut violations = Vec::new();
+        let speed_lo = self.command_forward_speed_m_s * (1.0_f32 - self.speed_tolerance_fraction);
+        let speed_hi = self.command_forward_speed_m_s * (1.0_f32 + self.speed_tolerance_fraction);
+        if !(metrics.mean_forward_speed_m_s >= speed_lo && metrics.mean_forward_speed_m_s <= speed_hi) {
+            violations.push(QualityViolation::new(
+                "mean_forward_speed_m_s",
+                format!(
+                    "mean speed {:.3} m/s outside ±{:.0}% of {:.3} m/s",
+                    metrics.mean_forward_speed_m_s,
+                    self.speed_tolerance_fraction * 100.0_f32,
+                    self.command_forward_speed_m_s
+                ),
+                json!(metrics.mean_forward_speed_m_s),
+                json!([speed_lo, speed_hi]),
+            ));
+        }
+        if !(metrics.peak_tilt_rad < self.peak_tilt_rad_max) {
+            violations.push(QualityViolation::new(
+                "peak_tilt_rad",
+                format!("peak tilt {:.3} rad exceeds {:.3}", metrics.peak_tilt_rad, self.peak_tilt_rad_max),
+                json!(metrics.peak_tilt_rad),
+                json!(self.peak_tilt_rad_max),
+            ));
+        }
+        if !(metrics.steady_tilt_rad < self.steady_tilt_rad_max) {
+            violations.push(QualityViolation::new(
+                "steady_tilt_rad",
+                format!("steady tilt {:.3} rad exceeds {:.3}", metrics.steady_tilt_rad, self.steady_tilt_rad_max),
+                json!(metrics.steady_tilt_rad),
+                json!(self.steady_tilt_rad_max),
+            ));
+        }
+        for (field, height) in [
+            ("com_height_min_m", metrics.com_height_min_m),
+            ("com_height_max_m", metrics.com_height_max_m),
+        ] {
+            let lo = self.com_height_nominal_m - self.com_height_tolerance_m;
+            let hi = self.com_height_nominal_m + self.com_height_tolerance_m;
+            if !(height >= lo && height <= hi) {
+                violations.push(QualityViolation::new(
+                    field,
+                    format!("CoM height {:.3} m outside {:.3}..{:.3} m", height, lo, hi),
+                    json!(height),
+                    json!([lo, hi]),
+                ));
+            }
+        }
+        if !(metrics.lateral_drift_m < self.lateral_drift_m_max) {
+            violations.push(QualityViolation::new(
+                "lateral_drift_m",
+                format!("lateral drift {:.3} m exceeds {:.3}", metrics.lateral_drift_m, self.lateral_drift_m_max),
+                json!(metrics.lateral_drift_m),
+                json!(self.lateral_drift_m_max),
+            ));
+        }
+        if !(metrics.max_foot_slip_m < self.max_foot_slip_m) {
+            violations.push(QualityViolation::new(
+                "max_foot_slip_m",
+                format!("foot slip {:.4} m exceeds {:.4}", metrics.max_foot_slip_m, self.max_foot_slip_m),
+                json!(metrics.max_foot_slip_m),
+                json!(self.max_foot_slip_m),
+            ));
+        }
+        let grf_lo = self.single_support_grf_ratio_nominal - self.single_support_grf_ratio_tolerance;
+        let grf_hi = self.single_support_grf_ratio_nominal + self.single_support_grf_ratio_tolerance;
+        if !(metrics.single_support_grf_ratio >= grf_lo && metrics.single_support_grf_ratio <= grf_hi) {
+            violations.push(QualityViolation::new(
+                "single_support_grf_ratio",
+                format!("single-support GRF {:.3} outside {:.3}..{:.3}", metrics.single_support_grf_ratio, grf_lo, grf_hi),
+                json!(metrics.single_support_grf_ratio),
+                json!([grf_lo, grf_hi]),
+            ));
+        }
+        if metrics.flight_ticks > self.max_flight_ticks {
+            violations.push(QualityViolation::new(
+                "flight_ticks",
+                format!("{} flight ticks exceeds {} (one plant-init tick allowed)", metrics.flight_ticks, self.max_flight_ticks),
+                json!(metrics.flight_ticks),
+                json!(self.max_flight_ticks),
+            ));
+        }
+        if metrics.max_current_ma >= self.max_current_ma {
+            violations.push(QualityViolation::new(
+                "max_current_ma",
+                format!("peak current {} mA exceeds {}", metrics.max_current_ma, self.max_current_ma),
+                json!(metrics.max_current_ma),
+                json!(self.max_current_ma),
+            ));
+        }
+        if !(metrics.margin_negative_fraction < self.margin_negative_fraction_max) {
+            violations.push(QualityViolation::new(
+                "margin_negative_fraction",
+                format!("negative margin on {:.3} of ticks exceeds {:.3}", metrics.margin_negative_fraction, self.margin_negative_fraction_max),
+                json!(metrics.margin_negative_fraction),
+                json!(self.margin_negative_fraction_max),
+            ));
+        }
+        if !(metrics.catch_step_fraction < self.catch_step_fraction_max) {
+            violations.push(QualityViolation::new(
+                "catch_step_fraction",
+                format!("catch steps on {:.3} of ticks exceeds {:.3}", metrics.catch_step_fraction, self.catch_step_fraction_max),
+                json!(metrics.catch_step_fraction),
+                json!(self.catch_step_fraction_max),
+            ));
+        }
+        if metrics.contact_swap_count < self.min_contact_swap_count {
+            violations.push(QualityViolation::new(
+                "contact_swap_count",
+                format!("{} support swaps below {}", metrics.contact_swap_count, self.min_contact_swap_count),
+                json!(metrics.contact_swap_count),
+                json!(self.min_contact_swap_count),
+            ));
+        }
+
+        let pass = violations.is_empty();
+        QualityEvaluation {
+            metrics: *metrics,
+            bounds: *self,
+            violations,
+            pass,
+        }
+    }
 }
 
 /// Per-tick accumulator behind [`WalkQuality`]. Kept inside `SimRobotIo` so the
@@ -4019,78 +4247,27 @@ mod tests {
         assert!(last.balance.world_vel_m_s[2] > 0.0_f32, "achieved speed must be forward");
 
         // --- Final P4 walk-quality acceptance --------------------------------
-        // A loaded sole must carry the full body weight; frictional unloading
-        // may reduce it slightly but never by more than 15%.
+        // One shared evaluation replaces the duplicated test literals; it is
+        // the same code path MCP agents use through `quality_snapshot`.
+        let evaluation = WalkQualityBounds::default().evaluate(&quality);
         assert!(
-            (quality.single_support_grf_ratio - 1.0_f32).abs() < 0.15_f32,
-            "single-support GRF ratio {:.3} must be within 15% of body weight",
-            quality.single_support_grf_ratio
+            evaluation.pass,
+            "P4 walk-quality bounds violated: {:?}",
+            evaluation.violations
         );
         assert_eq!(
             steady_flight_ticks, 0,
             "steady walking must not go airborne, got {steady_flight_ticks} ticks"
         );
-        // The single flight sample is plant tick 1, before the first control
-        // output reaches the joints; the swing-sole dwell removes every other
-        // flight tick including all support swaps.
         assert!(
-            quality.flight_ticks <= 1,
-            "walking must have no flight beyond plant initialization, got {} ticks",
-            quality.flight_ticks
-        );
-        assert!(
-            !last.faults.contains(FaultFlags::OVER_CURRENT)
-                && quality.max_current_ma < 1950,
-            "walking must stay below the 1950 mA advisory, peak {} mA",
-            quality.max_current_ma
-        );
-        assert!(
-            quality.max_foot_slip_m < 0.05_f32,
-            "per-plant-step slip {:.4} m must stay below 0.05 m",
-            quality.max_foot_slip_m
-        );
-
-        // `v_des = vx * WALK_SPEED_SCALE` (0.5) is the documented effective
-        // command, so vx=0.5 targets 0.25 m/s. Allow ±10%.
-        const COMMAND_M_S: f32 = 0.5_f32 * 0.5_f32;
-        assert!(
-            (quality.mean_forward_speed_m_s - COMMAND_M_S).abs() <= 0.10_f32 * COMMAND_M_S,
-            "mean speed {:.3} m/s outside ±10% of {COMMAND_M_S:.3}",
-            quality.mean_forward_speed_m_s
-        );
-        assert!(
-            quality.peak_tilt_rad < 0.08_f32 && quality.steady_tilt_rad < 0.03_f32,
-            "peak/steady tilt {:.3}/{:.3} rad exceeds 0.08/0.03",
-            quality.peak_tilt_rad,
-            quality.steady_tilt_rad
-        );
-        assert!(
-            quality.lateral_drift_m < 0.03_f32,
-            "lateral drift {:.3} m exceeds 0.03 m",
-            quality.lateral_drift_m
-        );
-        // Default `h_com_m` is 0.72 m; the walk must keep the mass-model CoM
-        // within ±0.03 m of it.
-        assert!(
-            (quality.com_height_min_m - 0.72_f32).abs() <= 0.03_f32
-                && (quality.com_height_max_m - 0.72_f32).abs() <= 0.03_f32,
-            "CoM height range {:.3}..{:.3} m outside 0.72 ± 0.03 m",
-            quality.com_height_min_m,
-            quality.com_height_max_m
-        );
-        assert!(
-            quality.margin_negative_fraction < 0.30_f32,
-            "capturability margin negative on {:.3} of ticks (>=0.30)",
-            quality.margin_negative_fraction
+            !last.faults.contains(FaultFlags::OVER_CURRENT),
+            "walking must not latch over-current: {:?}",
+            last.faults
         );
         // uvc.rs has no distinct WALKING wire code, so `catch_step_fraction`
         // counts only non-walking or margin-breached catch-step ticks (see the
-        // recorder). Steady walking must not be reported as constant catching.
-        assert!(
-            quality.catch_step_fraction < 0.5_f32,
-            "steady walk misreported as catch steps: {:.3}",
-            quality.catch_step_fraction
-        );
+        // recorder). The shared bound caps it at 0.30; genuine margin breaches
+        // must still engage at least once.
         assert!(
             quality.catch_step_fraction > 0.0_f32,
             "genuine margin-breach catch steps must still engage"
@@ -5534,6 +5711,89 @@ mod tests {
         let retried = pull_staged_model(&mut sim, info);
         assert_eq!(retried, blob, "retry must reproduce the staged bytes exactly");
         assert_eq!(crc32(&retried), info.crc32);
+    }
+
+    /// The documented acceptance band passes a measured clean walk, and every
+    /// bounded metric has a violation path that reports its field and bound.
+    #[test]
+    fn walk_quality_bounds_evaluate_pass_and_violations() {
+        let bounds = WalkQualityBounds::default();
+        // Measured values from the committed `walk_nominal.json` fixture.
+        let nominal = WalkQuality {
+            mean_forward_speed_m_s: 0.26149026,
+            peak_tilt_rad: 0.036814988,
+            steady_tilt_rad: 0.027806226,
+            com_height_min_m: 0.72275025,
+            com_height_max_m: 0.74495524,
+            lateral_drift_m: 0.016711839,
+            max_foot_slip_m: 0.009929657,
+            single_support_grf_ratio: 0.9445279,
+            flight_ticks: 1,
+            double_support_ticks: 68,
+            max_current_ma: 1786,
+            margin_negative_fraction: 0.20875,
+            catch_step_fraction: 0.20875,
+            contact_swap_count: 12,
+        };
+        let pass = bounds.evaluate(&nominal);
+        assert!(pass.pass, "clean walk must pass: {:?}", pass.violations);
+        assert!(pass.violations.is_empty());
+        assert_eq!(pass.metrics, nominal);
+        assert_eq!(pass.bounds, bounds);
+
+        let bad_cases = [
+            (WalkQuality { mean_forward_speed_m_s: 0.30, ..nominal }, "mean_forward_speed_m_s"),
+            (WalkQuality { peak_tilt_rad: 0.10, ..nominal }, "peak_tilt_rad"),
+            (WalkQuality { steady_tilt_rad: 0.05, ..nominal }, "steady_tilt_rad"),
+            (WalkQuality { com_height_min_m: 0.60, ..nominal }, "com_height_min_m"),
+            (WalkQuality { com_height_max_m: 0.80, ..nominal }, "com_height_max_m"),
+            (WalkQuality { lateral_drift_m: 0.10, ..nominal }, "lateral_drift_m"),
+            (WalkQuality { max_foot_slip_m: 0.08, ..nominal }, "max_foot_slip_m"),
+            (WalkQuality { single_support_grf_ratio: 0.5, ..nominal }, "single_support_grf_ratio"),
+            (WalkQuality { flight_ticks: 5, ..nominal }, "flight_ticks"),
+            (WalkQuality { max_current_ma: 2000, ..nominal }, "max_current_ma"),
+            (WalkQuality { margin_negative_fraction: 0.5, ..nominal }, "margin_negative_fraction"),
+            (WalkQuality { catch_step_fraction: 0.5, ..nominal }, "catch_step_fraction"),
+            (WalkQuality { contact_swap_count: 2, ..nominal }, "contact_swap_count"),
+            (WalkQuality { mean_forward_speed_m_s: f32::NAN, ..nominal }, "mean_forward_speed_m_s"),
+        ];
+        for (metrics, field) in bad_cases {
+            let evaluation = bounds.evaluate(&metrics);
+            assert!(!evaluation.pass, "violation case {field} must fail");
+            assert!(
+                evaluation.violations.iter().any(|v| v.field == field),
+                "missing violation for {field}: {:?}",
+                evaluation.violations
+            );
+            assert!(evaluation.violations.iter().all(|v| !v.message.is_empty()));
+            assert!(evaluation.violations.iter().all(|v| !v.bound.is_null()));
+        }
+
+        // Disturbance bands can be overridden without changing evaluation code.
+        let loose = WalkQualityBounds {
+            peak_tilt_rad_max: 0.35,
+            steady_tilt_rad_max: 0.05,
+            lateral_drift_m_max: 0.08,
+            ..bounds
+        };
+        let shoved = WalkQuality {
+            mean_forward_speed_m_s: 0.26415452,
+            peak_tilt_rad: 0.14303492,
+            steady_tilt_rad: 0.033832103,
+            com_height_min_m: 0.6960549,
+            com_height_max_m: 0.74495524,
+            lateral_drift_m: 0.045657936,
+            max_foot_slip_m: 0.00999999,
+            single_support_grf_ratio: 0.9386519,
+            flight_ticks: 1,
+            double_support_ticks: 61,
+            max_current_ma: 1839,
+            margin_negative_fraction: 0.21125,
+            catch_step_fraction: 0.21125,
+            contact_swap_count: 12,
+        };
+        assert!(!bounds.evaluate(&shoved).pass, "shove must exceed nominal bands");
+        assert!(loose.evaluate(&shoved).pass, "shove must pass disturbance bands");
     }
 
 }

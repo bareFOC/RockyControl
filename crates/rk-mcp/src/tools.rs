@@ -7,14 +7,14 @@ use rk_link::TransportKind;
 use rk_model::nalgebra::Point3;
 use rk_model::{AssetBundle, samples};
 use rk_fw_core::replay::verify_deterministic_replay;
-use rk_proto::{ControlMode, FallOrientation, ModelRequest, ModelResponse, uvc_phase};
-use rk_sim::ExperimentScript;
+use rk_proto::{BalanceGains, ControlMode, FallOrientation, ModelRequest, ModelResponse, uvc_phase};
+use rk_sim::{ExperimentScript, WalkQualityBounds};
 use serde_json::{Value, json};
 
 use crate::host::{McpActivityEntry, McpCallOutcome, McpHost};
 use crate::schema::{
-    URDF_PRESETS, prompt_definitions, resource_definitions, resource_template_definitions,
-    tool_definitions,
+    EXPERIMENT_FIXTURES, URDF_PRESETS, prompt_definitions, resource_definitions,
+    resource_template_definitions, tool_definitions,
 };
 
 const MAX_URDF_BYTES: usize = 2 * 1024 * 1024;
@@ -25,6 +25,30 @@ const MAX_STEP_TICKS: usize = 400;
 const MAX_SCRIPT_TICKS: usize = 20_000;
 
 static NEXT_ACTIVITY_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Compile-time copies of the committed fixtures. Native hosts prefer a confined
+/// file read so edited fixtures are honoured; the GUI bridge (no filesystem)
+/// uses these exact bytes, keeping replay identical in both paths.
+fn embedded_experiment(name: &str) -> Option<&'static str> {
+    match name {
+        "walk_nominal.json" => Some(include_str!("../../../tests/experiments/walk_nominal.json")),
+        "walk_shove.json" => Some(include_str!("../../../tests/experiments/walk_shove.json")),
+        "fall_recover.json" => Some(include_str!("../../../tests/experiments/fall_recover.json")),
+        _ => None,
+    }
+}
+
+/// Canonical fixture name for a tool argument; accepts `walk_nominal` and
+/// `walk_nominal.json` but never an arbitrary path.
+fn resolve_experiment_name(requested: &str) -> Option<&'static str> {
+    EXPERIMENT_FIXTURES
+        .iter()
+        .map(|(name, _)| *name)
+        .find(|name| {
+            *name == requested
+                || name.strip_suffix(".json") == Some(requested)
+        })
+}
 
 /// Standard `craft-mcp-server` server identity & bounded line length.
 pub const fn server_info() -> Info {
@@ -113,6 +137,48 @@ impl<'a, H: McpHost> RockyMcpTools<'a, H> {
         text_result(m, true)
     }
 
+    /// Structured tool error: the `content[0].text` is a JSON object with a
+    /// machine-readable `error.code` for agents that need to self-correct.
+    fn err_payload(&mut self, tool_name: &str, summary: impl Into<String>, payload: Value) -> Value {
+        let message = payload
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("tool error")
+            .to_string();
+        self.log(tool_name, summary, McpCallOutcome::Error, message);
+        text_result(
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string()),
+            true,
+        )
+    }
+
+    /// Invalid gain writes carry the offending field, its raw value and the
+    /// accepted band so an agent can retry without reading prose.
+    fn invalid_gain_result(
+        &mut self,
+        tool_name: &str,
+        field: &str,
+        value: Value,
+        lo: f32,
+        hi: f32,
+        message: String,
+    ) -> Value {
+        self.err_payload(
+            tool_name,
+            format!("invalid `{field}`"),
+            json!({
+                "error": {
+                    "code": "invalid_gain",
+                    "field": field,
+                    "value": value,
+                    "bounds": [lo, hi],
+                    "message": message,
+                }
+            }),
+        )
+    }
+
     fn guarded_result(&mut self, tool_name: &str, summary: impl Into<String>, msg: impl Into<String>) -> Value {
         let m = msg.into();
         self.log(tool_name, summary, McpCallOutcome::Guarded, m.clone());
@@ -163,6 +229,98 @@ impl<'a, H: McpHost> RockyMcpTools<'a, H> {
             return Err(format!("argument `{key}`={f32_val} outside [{min}, {max}]"));
         }
         Ok(Some(f32_val))
+    }
+
+    /// Full walk-quality snapshot: the 14 metrics both at the top level and
+    /// under `quality` (the same shape used by `run_experiment`), plus the
+    /// acceptance `bounds`, per-metric `violations` and `pass` verdict from the
+    /// shared `rk-sim` evaluator. Wired transports that cannot measure quality
+    /// return `{"quality": null, "pass": false}` with the bounds still present.
+    fn quality_json(&self) -> Value {
+        let bounds = WalkQualityBounds::default();
+        let bounds_json = serde_json::to_value(bounds).unwrap_or(Value::Null);
+        let Some(metrics) = self.host.walk_quality() else {
+            return json!({
+                "quality": Value::Null,
+                "bounds": bounds_json,
+                "violations": [],
+                "pass": false,
+            });
+        };
+        let evaluation = bounds.evaluate(&metrics);
+        let Ok(metrics_json) = serde_json::to_value(metrics) else {
+            return json!({
+                "quality": Value::Null,
+                "bounds": bounds_json,
+                "violations": [],
+                "pass": false,
+            });
+        };
+        let Value::Object(fields) = metrics_json else {
+            return json!({
+                "quality": Value::Null,
+                "bounds": bounds_json,
+                "violations": [],
+                "pass": false,
+            });
+        };
+        let mut payload = fields.clone();
+        payload.insert("quality".to_string(), Value::Object(fields));
+        payload.insert("bounds".to_string(), bounds_json);
+        payload.insert(
+            "violations".to_string(),
+            serde_json::to_value(evaluation.violations).unwrap_or(Value::Null),
+        );
+        payload.insert("pass".to_string(), json!(evaluation.pass));
+        Value::Object(payload)
+    }
+
+    /// Runs an already-parsed script and builds the shared `run_experiment`
+    /// response. Both the inline/file runner and `experiment_run_named` use it
+    /// so their verdict and quality payloads cannot diverge.
+    fn run_experiment_script(&mut self, name: &str, script: ExperimentScript) -> Value {
+        if script.max_ticks == 0 || script.packets.is_empty() {
+            return self.err_result(
+                name,
+                "empty script",
+                "A script needs at least one tick (`max_ticks > 0`) and one typed host packet.",
+            );
+        }
+        if script.max_ticks > MAX_SCRIPT_TICKS {
+            return self.err_result(
+                name,
+                "script too large",
+                format!("`max_ticks` exceeds the {MAX_SCRIPT_TICKS}-tick safety cap"),
+            );
+        }
+
+        match self.host.run_experiment(&script) {
+            Ok(result) => {
+                let check = result.verification;
+                let verification = json!({
+                    "exact_match": check.exact_match,
+                    "matched_ticks": check.matched_ticks,
+                    "total_ticks": check.total_ticks,
+                });
+                let quality = result
+                    .quality
+                    .and_then(|q| serde_json::to_value(q).ok())
+                    .unwrap_or(Value::Null);
+                self.ok_json(
+                    name,
+                    if check.exact_match { "experiment EXACT" } else { "experiment MISMATCH" },
+                    json!({
+                        // Top-level verdict keys are kept for existing agents.
+                        "exact_match": check.exact_match,
+                        "matched_ticks": check.matched_ticks,
+                        "total_ticks": check.total_ticks,
+                        "verification": verification,
+                        "quality": quality,
+                    }),
+                )
+            }
+            Err(e) => self.err_result(name, "experiment failed", e),
+        }
     }
 
     fn status_json(&self) -> Value {
@@ -419,7 +577,7 @@ impl<'a, H: McpHost> RockyMcpTools<'a, H> {
 
 impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
     fn instructions(&self) -> String {
-        "Rocky Studio Robotics MCP Server. Use resources (rocky://status, rocky://telemetry, rocky://robot, rocky://calibration, rocky://balance, rocky://actions) to inspect live robot state. Configuration, URDF loading, calibration, UVC balance tuning, and Teach posing are always permitted when MCP is enabled. Switching to energized Drive mode or commanding active locomotion requires the human operator to arm 'Allow Agent Drive' in Rocky Studio (or --allow-drive on CLI). E-Stop always cuts torque immediately and disarms Drive.".to_string()
+        "Rocky Studio Robotics MCP Server. Use resources (rocky://status, rocky://telemetry, rocky://quality, rocky://robot, rocky://calibration, rocky://balance, rocky://actions) to inspect live robot state. Configuration, URDF loading, calibration, UVC balance tuning, and Teach posing are always permitted when MCP is enabled. Switching to energized Drive mode or commanding active locomotion requires the human operator to arm 'Allow Agent Drive' in Rocky Studio (or --allow-drive on CLI). E-Stop always cuts torque immediately and disarms Drive.".to_string()
     }
 
     fn list(&mut self) -> Vec<Value> {
@@ -438,6 +596,7 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
         let result = match uri {
             "rocky://status" => Ok(Contents::json(&self.status_json())),
             "rocky://telemetry" => Ok(Contents::json(&self.telemetry_json())),
+            "rocky://quality" => Ok(Contents::json(&self.quality_json())),
             "rocky://robot" => Ok(Contents::json(&self.robot_json())),
             "rocky://calibration" => Ok(Contents::json(&self.calibration_json())),
             "rocky://balance" => Ok(Contents::json(&self.balance_json())),
@@ -598,6 +757,14 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
                     self.host.step_ticks(ticks, 0.01);
                 }
                 self.ok_json(name, format!("ticks={ticks}"), self.telemetry_json())
+            }
+            "quality_snapshot" => {
+                let is_sim = self.host.walk_quality().is_some();
+                self.ok_json(
+                    name,
+                    if is_sim { "walk quality" } else { "quality unavailable" },
+                    self.quality_json(),
+                )
             }
             "robot_list_presets" => {
                 let presets: Vec<Value> = URDF_PRESETS
@@ -783,7 +950,10 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
                     match Self::finite_f32(args, key, lo, hi) {
                         Ok(Some(v)) => *field = v,
                         Ok(None) => {}
-                        Err(e) => return self.err_result(name, key, e),
+                        Err(e) => {
+                            let raw = args.get(key).cloned().unwrap_or(Value::Null);
+                            return self.invalid_gain_result(name, key, raw, lo, hi, e);
+                        }
                     }
                 }
                 self.host.model_mut().update_balance_gains(g);
@@ -795,6 +965,14 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
                     format!("uvc=({:.2},{:.2})", g.uvc_gain_pitch, g.uvc_gain_roll),
                     self.balance_json(),
                 )
+            }
+            "balance_reset_defaults" => {
+                let defaults = BalanceGains::default();
+                self.host.model_mut().update_balance_gains(defaults);
+                if self.host.is_connected() {
+                    self.host.step_ticks(2, 0.01);
+                }
+                self.ok_json(name, "balance gains reset to defaults", self.balance_json())
             }
             "balance_set_enabled" => {
                 let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
@@ -1326,33 +1504,52 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
                         return self.err_result(name, "invalid script", format!("`script` is not a valid ExperimentScript: {e}"));
                     }
                 };
-                if script.max_ticks == 0 || script.packets.is_empty() {
+                self.run_experiment_script(name, script)
+            }
+            "experiment_list" => {
+                let experiments: Vec<Value> = EXPERIMENT_FIXTURES
+                    .iter()
+                    .map(|(name, description)| json!({"name": name, "description": description}))
+                    .collect();
+                self.ok_json(name, "committed experiments", json!({"experiments": experiments}))
+            }
+            "experiment_run_named" => {
+                let requested = args.get("name").and_then(Value::as_str).unwrap_or("");
+                let Some(fixture) = resolve_experiment_name(requested) else {
+                    let available: Vec<&str> = EXPERIMENT_FIXTURES.iter().map(|(n, _)| *n).collect();
                     return self.err_result(
                         name,
-                        "empty script",
-                        "A script needs at least one tick (`max_ticks > 0`) and one typed host packet.",
+                        "unknown experiment",
+                        format!("unknown experiment `{requested}`; available: {}", available.join(", ")),
                     );
-                }
-                if script.max_ticks > MAX_SCRIPT_TICKS {
-                    return self.err_result(
-                        name,
-                        "script too large",
-                        format!("`max_ticks` exceeds the {MAX_SCRIPT_TICKS}-tick safety cap"),
-                    );
-                }
-
-                match self.host.run_experiment(&script) {
-                    Ok(check) => self.ok_json(
-                        name,
-                        if check.exact_match { "experiment EXACT" } else { "experiment MISMATCH" },
-                        json!({
-                            "exact_match": check.exact_match,
-                            "matched_ticks": check.matched_ticks,
-                            "total_ticks": check.total_ticks,
-                        }),
-                    ),
-                    Err(e) => self.err_result(name, "experiment failed", e),
-                }
+                };
+                // Native CLI: honour a file under the confined read root when
+                // available. Otherwise use the bytes compiled from that exact
+                // committed fixture (GUI bridge has no filesystem access).
+                let script_value: Value = if let Ok(bytes) = self.host.read_confined_file(fixture) {
+                    match serde_json::from_slice(&bytes) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            return self.err_result(name, "invalid experiment file", format!("`{fixture}` is not valid JSON: {e}"));
+                        }
+                    }
+                } else if let Some(text) = embedded_experiment(fixture) {
+                    match serde_json::from_str(text) {
+                        Ok(parsed) => parsed,
+                        Err(e) => {
+                            return self.err_result(name, "invalid experiment fixture", format!("committed `{fixture}` is not valid JSON: {e}"));
+                        }
+                    }
+                } else {
+                    return self.err_result(name, "experiment unavailable", format!("no embedded content for `{fixture}`"));
+                };
+                let script: ExperimentScript = match serde_json::from_value(script_value) {
+                    Ok(script) => script,
+                    Err(e) => {
+                        return self.err_result(name, "invalid experiment", format!("`{fixture}` is not a valid ExperimentScript: {e}"));
+                    }
+                };
+                self.run_experiment_script(name, script)
             }
             "recording_control" => {
                 let action = args.get("action").and_then(Value::as_str).unwrap_or("");
@@ -1430,6 +1627,91 @@ mod tests {
     use crate::headless::{AutomationRoots, HeadlessHost};
     use crate::host::McpPolicy;
     use crate::test_support::TEST_LOCK;
+
+    #[test]
+    fn quality_snapshot_reports_all_walk_quality_metrics() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
+        let init = dispatch_json_rpc(
+            &mut host,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "robot_connect", "arguments": {"transport": "sim"}}
+            }),
+        )
+        .expect("connect reply");
+        assert!(init["result"]["isError"].is_null(), "{init}");
+        host.step_ticks(20, 0.01);
+
+        let reply = dispatch_json_rpc(
+            &mut host,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "quality_snapshot", "arguments": {}}
+            }),
+        )
+        .expect("quality reply");
+        assert!(reply["result"]["isError"].is_null(), "{reply}");
+        let body: Value =
+            serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let quality = &body["quality"];
+        assert!(!quality.is_null(), "sim transport must report quality: {body}");
+        for key in [
+            "mean_forward_speed_m_s",
+            "peak_tilt_rad",
+            "steady_tilt_rad",
+            "com_height_min_m",
+            "com_height_max_m",
+            "lateral_drift_m",
+            "max_foot_slip_m",
+            "single_support_grf_ratio",
+            "flight_ticks",
+            "double_support_ticks",
+            "max_current_ma",
+            "margin_negative_fraction",
+            "catch_step_fraction",
+            "contact_swap_count",
+        ] {
+            assert!(quality[key].is_number(), "missing metric `{key}`: {body}");
+            assert!(
+                body[key].is_number(),
+                "metric `{key}` must also be available at the top level: {body}"
+            );
+        }
+
+        let resource = dispatch_json_rpc(
+            &mut host,
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "resources/read",
+                "params": {"uri": "rocky://quality"}
+            }),
+        )
+        .expect("quality resource reply");
+        let text = resource["result"]["contents"][0]["text"]
+            .as_str()
+            .expect("quality resource text");
+        let from_resource: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(&from_resource["quality"], quality, "{from_resource}");
+
+        // Acceptance envelope comes from the same shared evaluator as the
+        // simulator tests and is mirrored by the resource.
+        for envelope in [&body, &from_resource] {
+            assert!(envelope["bounds"].is_object(), "missing bounds: {envelope}");
+            assert!(envelope["bounds"]["command_forward_speed_m_s"].is_number());
+            assert!(envelope["bounds"]["peak_tilt_rad_max"].is_number());
+            assert!(envelope["bounds"]["min_contact_swap_count"].is_number());
+            assert!(envelope["violations"].is_array(), "missing violations: {envelope}");
+            assert!(envelope["pass"].is_boolean(), "missing verdict: {envelope}");
+            assert_eq!(
+                envelope["pass"],
+                json!(envelope["violations"].as_array().unwrap().is_empty()),
+                "verdict must match violations: {envelope}"
+            );
+        }
+        assert_eq!(from_resource["bounds"], body["bounds"]);
+        assert_eq!(from_resource["violations"], body["violations"]);
+        assert_eq!(from_resource["pass"], body["pass"]);
+    }
 
     #[test]
     fn mcp_lifecycle_resources_templates_prompts_and_completions_work() {
@@ -1787,6 +2069,9 @@ mod tests {
         assert_eq!(body["exact_match"], true, "{body}");
         assert_eq!(body["total_ticks"], 100, "{body}");
         assert_eq!(body["matched_ticks"], body["total_ticks"], "{body}");
+        assert_eq!(body["verification"]["exact_match"], true, "{body}");
+        assert_eq!(body["verification"]["total_ticks"], 100, "{body}");
+        assert!(!body["quality"].is_null(), "{body}");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1832,6 +2117,8 @@ mod tests {
             serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(body["exact_match"], true, "{body}");
         assert_eq!(body["total_ticks"], 12, "{body}");
+        assert_eq!(body["verification"]["exact_match"], true, "{body}");
+        assert!(!body["quality"].is_null(), "{body}");
     }
 
     #[test]
@@ -1856,6 +2143,61 @@ mod tests {
             let text = reply["result"]["content"][0]["text"].as_str().unwrap();
             assert!(!text.is_empty(), "error must carry a readable message");
         }
+    }
+
+    #[test]
+    fn run_experiment_installs_tuned_gains_without_mutating_the_script() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
+        let reply = dispatch_json_rpc(
+            &mut host,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "balance_set_gains", "arguments": {
+                    "uvc_gain_pitch": 1.2, "gyro_damp_pitch": 0.5
+                }}
+            }),
+        )
+        .expect("set gains reply");
+        assert!(reply["result"]["isError"].is_null(), "{reply}");
+        let tuned = host.model().balance_gains;
+        assert_ne!(tuned.uvc_gain_pitch, rk_proto::BalanceGains::default().uvc_gain_pitch);
+
+        let script = ExperimentScript {
+            seed: 7,
+            events: Vec::new(),
+            packets: (0..160u32).map(rk_sim::scripted_walk_packet).collect(),
+            max_ticks: 160,
+        };
+        let original = script.clone();
+        let result = host.run_experiment(&script).expect("run_experiment");
+        assert_eq!(script.packets, original.packets, "caller script must stay untouched");
+        assert_eq!(script.events, original.events, "caller script must stay untouched");
+        assert!(result.verification.exact_match, "{:?}", result.verification);
+        let quality = result.quality.expect("sim experiment reports quality");
+
+        fn run_with_gains(
+            gains: rk_proto::BalanceGains,
+            script: &ExperimentScript,
+        ) -> rk_sim::WalkQuality {
+            let model = rk_model::StudioModel::new_default();
+            let mut runner = rk_sim::CopperSimRunner::new(
+                model.rig.joints.len().max(1),
+                &model.calibration,
+                model.rig.default_pose(),
+            );
+            let mut script = script.clone();
+            if let Some(first) = script.packets.first_mut() {
+                first.config = rk_proto::ConfigCmd::SetBalanceGains(gains);
+            }
+            runner.run_script(&script);
+            runner.last_walk_quality()
+        }
+
+        let tuned_quality = run_with_gains(tuned, &script);
+        let default_quality = run_with_gains(rk_proto::BalanceGains::default(), &script);
+        assert_eq!(quality, tuned_quality, "run_experiment must use host gains");
+        assert_ne!(quality, default_quality, "tuned gains must affect the scripted run");
     }
 
     #[test]
@@ -1926,6 +2268,165 @@ mod tests {
             for _ in 0..4 {
                 host.step_ticks(19, 0.01);
             }
+        }
+
+        #[test]
+        fn balance_reset_defaults_restores_all_fourteen_gains() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = new_host();
+            connect(&mut host);
+
+            let tuned = ok_body(&call(
+                &mut host,
+                3,
+                "balance_set_gains",
+                json!({"uvc_gain_pitch": 1.2, "gyro_damp_pitch": 0.5, "h_com_m": 0.5}),
+            ));
+            assert!(
+                (tuned["gains"]["uvc_gain_pitch"].as_f64().unwrap() - 1.2).abs() < 1e-6,
+                "{tuned}"
+            );
+            assert_ne!(host.model().balance_gains, BalanceGains::default());
+
+            let body = ok_body(&call(&mut host, 4, "balance_reset_defaults", json!({})));
+            assert_eq!(
+                body["gains"],
+                serde_json::to_value(BalanceGains::default()).unwrap(),
+                "{body}"
+            );
+            assert_eq!(host.model().balance_gains, BalanceGains::default());
+        }
+
+        #[test]
+        fn invalid_gain_write_returns_structured_error() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = new_host();
+            connect(&mut host);
+
+            let reply = call(&mut host, 3, "balance_set_gains", json!({"uvc_gain_pitch": 3.0}));
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            let body: Value = serde_json::from_str(
+                reply["result"]["content"][0]["text"].as_str().expect("error text"),
+            )
+            .expect("structured error JSON");
+            assert_eq!(body["error"]["code"], "invalid_gain", "{body}");
+            assert_eq!(body["error"]["field"], "uvc_gain_pitch", "{body}");
+            assert_eq!(body["error"]["value"], 3.0, "{body}");
+            assert_eq!(body["error"]["bounds"], json!([0.0, 1.5]), "{body}");
+            assert!(
+                body["error"]["message"].as_str().unwrap().contains("uvc_gain_pitch"),
+                "{body}"
+            );
+            assert_eq!(
+                host.model().balance_gains,
+                BalanceGains::default(),
+                "an invalid write must not mutate gains"
+            );
+        }
+
+        #[test]
+        fn acceptance_tools_are_advertised_in_tools_list() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = new_host();
+            let reply = dispatch_json_rpc(
+                &mut host,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            )
+            .expect("tools list");
+            let listed: Vec<&str> = reply["result"]["tools"]
+                .as_array()
+                .expect("tool array")
+                .iter()
+                .map(|t| t["name"].as_str().expect("tool name"))
+                .collect();
+            for name in [
+                "quality_snapshot",
+                "balance_reset_defaults",
+                "experiment_list",
+                "experiment_run_named",
+            ] {
+                assert!(listed.contains(&name), "missing tool schema for `{name}`");
+            }
+        }
+
+        #[test]
+        fn experiment_list_reports_committed_fixtures() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = new_host();
+            let body = ok_body(&call(&mut host, 2, "experiment_list", json!({})));
+            let experiments = body["experiments"].as_array().expect("experiment array");
+            let names: Vec<&str> = experiments
+                .iter()
+                .map(|e| e["name"].as_str().expect("experiment name"))
+                .collect();
+            assert_eq!(
+                names,
+                vec!["walk_nominal.json", "walk_shove.json", "fall_recover.json"]
+            );
+            for experiment in experiments {
+                assert!(
+                    experiment["description"].as_str().unwrap_or("").len() > 10,
+                    "missing description: {experiment}"
+                );
+            }
+        }
+
+        #[test]
+        fn experiment_run_named_replays_exactly_through_confined_read() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let read_root = std::fs::canonicalize(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/experiments"),
+            )
+            .expect("fixtures directory");
+            let mut host = HeadlessHost::new(
+                McpPolicy::default(),
+                AutomationRoots {
+                    read_root: Some(read_root),
+                    write_root: None,
+                },
+            );
+
+            let body = ok_body(&call(
+                &mut host,
+                2,
+                "experiment_run_named",
+                json!({"name": "walk_nominal.json"}),
+            ));
+            assert_eq!(body["exact_match"], true, "{body}");
+            assert_eq!(body["verification"]["exact_match"], true, "{body}");
+            assert_eq!(body["total_ticks"], 800, "{body}");
+            assert_eq!(body["matched_ticks"], 800, "{body}");
+            assert!(!body["quality"].is_null());
+
+            // A short name resolves to the same committed fixture.
+            let short = ok_body(&call(
+                &mut host,
+                3,
+                "experiment_run_named",
+                json!({"name": "walk_nominal"}),
+            ));
+            assert_eq!(short["quality"], body["quality"]);
+
+            let reply = call(&mut host, 4, "experiment_run_named", json!({"name": "../../evil.json"}));
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+        }
+
+        #[test]
+        fn experiment_run_named_uses_embedded_fixture_without_file_access() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // No --automation-read-root: the GUI bridge cannot read files, so
+            // the embedded fixture bytes must take over.
+            let mut host = new_host();
+            let body = ok_body(&call(
+                &mut host,
+                2,
+                "experiment_run_named",
+                json!({"name": "fall_recover.json"}),
+            ));
+            assert_eq!(body["exact_match"], true, "{body}");
+            assert_eq!(body["total_ticks"], 400, "{body}");
+            assert_eq!(body["verification"]["exact_match"], true, "{body}");
+            assert!(body["quality"]["peak_tilt_rad"].as_f64().unwrap() > 0.5, "{body}");
         }
 
         #[test]
@@ -2254,15 +2755,14 @@ mod tests {
         use rk_model::StudioModel;
         use rk_proto::{BalanceGains, ConfigCmd, ControlMode, FaultFlags, HostToMcu, WalkCmd};
         use rk_sim::{
-            CopperSimRunner, ExperimentScript, SimFaultInjection, WalkQuality, fault_snapshot,
-            scripted_walk_packet,
+            CopperSimRunner, ExperimentScript, SimFaultInjection, WalkQuality, WalkQualityBounds,
+            fault_snapshot, scripted_walk_packet,
         };
         use std::path::{Path, PathBuf};
 
         const NOMINAL_TICKS: usize = 800;
         const SHOVE_TICKS: usize = 800;
         const FALL_TICKS: usize = 400;
-        const COMMAND_M_S: f32 = 0.5_f32 * 0.5_f32;
 
         fn fixtures_dir() -> PathBuf {
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/experiments")
@@ -2276,8 +2776,9 @@ mod tests {
                 .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
         }
 
-        /// Mirrors `McpHost::run_experiment`: the same host inputs, the same shared
-        /// runner, and therefore the same `WalkQuality` the MCP tool observed.
+        /// Mirrors `McpHost::run_experiment`: the same host inputs (including the
+        /// tick-0 gain injection), the same shared runner, and therefore the same
+        /// `WalkQuality` the MCP tool observed.
         fn run_for_quality(script: &ExperimentScript) -> (WalkQuality, CopperReplayLog) {
             let model = StudioModel::new_default();
             let mut runner = CopperSimRunner::new(
@@ -2285,7 +2786,11 @@ mod tests {
                 &model.calibration,
                 model.rig.default_pose(),
             );
-            let log = runner.run_script(script);
+            let mut script = script.clone();
+            if let Some(first) = script.packets.first_mut() {
+                first.config = ConfigCmd::SetBalanceGains(model.balance_gains);
+            }
+            let log = runner.run_script(&script);
             (runner.last_walk_quality(), log)
         }
 
@@ -2310,9 +2815,21 @@ mod tests {
             assert_eq!(body["exact_match"], true, "{body}");
             assert_eq!(body["total_ticks"], ticks, "{body}");
             assert_eq!(body["matched_ticks"], ticks, "{body}");
+            assert_eq!(body["verification"]["exact_match"], true, "{body}");
+            assert_eq!(body["verification"]["total_ticks"], ticks, "{body}");
+            assert_eq!(body["verification"]["matched_ticks"], ticks, "{body}");
+            assert!(!body["quality"].is_null(), "{body}");
         }
 
-        fn assert_walking_bounds(label: &str, quality: &WalkQuality, log: &CopperReplayLog) {
+        /// Fault latching stays a telemetry assertion; every numeric band comes
+        /// from the shared `rk-sim` evaluator so the test cannot drift from the
+        /// acceptance bounds exposed to agents by `quality_snapshot`.
+        fn assert_walking_bounds(
+            label: &str,
+            quality: &WalkQuality,
+            log: &CopperReplayLog,
+            bounds: &WalkQualityBounds,
+        ) {
             let faults = log.ticks.last().expect("script ticks").tx_telem.faults;
             assert!(
                 !faults.contains(FaultFlags::TILT_FALL_CUTOFF)
@@ -2320,35 +2837,24 @@ mod tests {
                     && !faults.contains(FaultFlags::WATCHDOG_TIMEOUT),
                 "{label} latched faults: {faults:?}"
             );
+            let evaluation = bounds.evaluate(quality);
             assert!(
-                (quality.mean_forward_speed_m_s - COMMAND_M_S).abs() <= 0.10 * COMMAND_M_S,
-                "{label} speed {:.3} m/s outside ±10% of {COMMAND_M_S:.3}",
-                quality.mean_forward_speed_m_s
+                evaluation.pass,
+                "{label} walk-quality bounds violated: {:?}",
+                evaluation.violations
             );
-            assert!(
-                (quality.single_support_grf_ratio - 1.0).abs() < 0.15,
-                "{label} single-support GRF ratio {:.3} outside ±15%",
-                quality.single_support_grf_ratio
-            );
-            assert!(
-                quality.flight_ticks <= 1,
-                "{label} went airborne on {} ticks",
-                quality.flight_ticks
-            );
-            assert!(quality.max_current_ma < 1950, "{label} peak current too high");
-            assert!(
-                quality.margin_negative_fraction < 0.30,
-                "{label} capturability margin negative on {:.3} of ticks",
-                quality.margin_negative_fraction
-            );
-            assert!(quality.contact_swap_count > 0, "{label} never swapped support foot");
-            assert!(
-                (quality.com_height_min_m - 0.72).abs() <= 0.03
-                    && (quality.com_height_max_m - 0.72).abs() <= 0.03,
-                "{label} CoM height {:.3}..{:.3} outside 0.72 ± 0.03",
-                quality.com_height_min_m,
-                quality.com_height_max_m
-            );
+        }
+
+        /// The shove fixture uses the documented disturbance bands (peak tilt
+        /// 0.35, steady 0.05, lateral 0.08) while keeping every other bound
+        /// identical to the nominal acceptance matrix.
+        fn shove_bounds() -> WalkQualityBounds {
+            WalkQualityBounds {
+                peak_tilt_rad_max: 0.35,
+                steady_tilt_rad_max: 0.05,
+                lateral_drift_m_max: 0.08,
+                ..WalkQualityBounds::default()
+            }
         }
 
         #[test]
@@ -2370,9 +2876,13 @@ mod tests {
             ] {
                 let script = load_script(name);
                 assert_eq!(script.max_ticks, ticks, "{name} tick count changed");
-                assert_exact(&call_run_experiment(&mut host, id, name), ticks);
+                let body = call_run_experiment(&mut host, id, name);
+                assert_exact(&body, ticks);
+                let tool_quality: WalkQuality = serde_json::from_value(body["quality"].clone())
+                    .unwrap_or_else(|e| panic!("{name} tool quality: {e}"));
 
                 let (quality, log) = run_for_quality(&script);
+                assert_eq!(tool_quality, quality, "{name} tool quality must match the run");
                 assert_eq!(log.ticks.len(), ticks, "{name} recorded tick count");
                 assert!(
                     verify_deterministic_replay(&log).exact_match,
@@ -2382,7 +2892,7 @@ mod tests {
 
                 match name {
                     "walk_nominal.json" => {
-                        assert_walking_bounds(name, &quality, &log);
+                        assert_walking_bounds(name, &quality, &log, &WalkQualityBounds::default());
                         assert!(quality.peak_tilt_rad < 0.08, "nominal peak tilt");
                         assert!(quality.steady_tilt_rad < 0.03, "nominal steady tilt");
                         assert!(quality.lateral_drift_m < 0.03, "nominal lateral drift");
@@ -2394,7 +2904,7 @@ mod tests {
                         );
                     }
                     "walk_shove.json" => {
-                        assert_walking_bounds(name, &quality, &log);
+                        assert_walking_bounds(name, &quality, &log, &shove_bounds());
                         assert!(quality.peak_tilt_rad < 0.35, "shoved peak tilt");
                         assert!(quality.steady_tilt_rad < 0.05, "shoved steady tilt");
                         assert!(quality.lateral_drift_m < 0.08, "shoved lateral drift");
