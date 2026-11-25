@@ -471,7 +471,7 @@ impl RockyStudioApp {
             .changed();
         changed |= ui
             .add(
-                egui::Slider::new(&mut g.h_com_m, 0.12..=0.60)
+                egui::Slider::new(&mut g.h_com_m, 0.12..=0.80)
                     .suffix(" m")
                     .text("CoM Height (DCM/ZMP)"),
             )

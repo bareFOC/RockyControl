@@ -27,6 +27,34 @@ const FALL_TUCK_DURATION_SEC: f32 = 0.040_f32;
 const MAX_HALF_KNEE_RAD: f32 = 1.047_197_6_f32;
 /// Gravitational acceleration for the LIPM natural frequency `ω = sqrt(g / h_com)`.
 const GRAVITY_M_S2: f32 = 9.81_f32;
+/// Shortest/longest support half-cycle allowed by step-time adaptation (seconds).
+/// The lower bound keeps the 200 Hz gait clock below one π boundary per tick;
+/// the upper bound prevents a near-zero cadence from freezing the walk.
+const STEP_DUR_MIN_SEC: f32 = 0.16_f32;
+const STEP_DUR_MAX_SEC: f32 = 0.45_f32;
+
+/// Khadiv capture-error step-time adaptation, shared by the catch-step timer and
+/// the walking gait clock so both advance from the same law:
+/// `T = clamp(0.8 · ln(1 + margin / |ξ − p|) / ω, T_min, T_nom)`.
+///
+/// `nom` is the undisturbed half-cycle duration; without a capture breach it is
+/// returned unchanged (clamped to the admissible range). A breach shortens the
+/// half-cycle toward `T_min` so recovery/landing arrives sooner.
+fn adapt_step_duration(
+    capture_valid: bool,
+    capture_error: f32,
+    margin: f32,
+    omega: f32,
+    nom: f32,
+) -> f32 {
+    let nom = nom.clamp(STEP_DUR_MIN_SEC, STEP_DUR_MAX_SEC);
+    if capture_valid && capture_error > margin {
+        let ratio = margin / capture_error.max(1e-6_f32);
+        (0.8_f32 * logf(1.0_f32 + ratio) / omega).clamp(STEP_DUR_MIN_SEC, nom)
+    } else {
+        nom
+    }
+}
 
 /// Parameterized 6-DoF bipedal leg geometry in meters.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -281,10 +309,12 @@ pub struct UvcController {
     cal_samples: u32,
     /// Filtered step progress phase for telemetry.
     gait_phase_rad: f32,
-    /// Continuous P2 gait clock in `[0, 2π)`. Advanced by `2π·cadence·dt`
-    /// whenever `walk.walk_enabled`; its half-cycle selects the support foot
-    /// (right in `[0, π)`, left in `[π, 2π)`). Phase-locked to the synthetic
-    /// catch-step phase on `ActiveCatchStep` entry.
+    /// Continuous gait clock in `[0, 2π)`. Advanced by `π/step_dur · dt`
+    /// whenever `walk.walk_enabled`, where `step_dur` is the Khadiv-adapted
+    /// support half-cycle (nominal `0.5/cadence` when undisturbed); its
+    /// half-cycle selects the support foot (right in `[0, π)`, left in
+    /// `[π, 2π)`). Phase-locked to the synthetic catch-step phase on
+    /// `ActiveCatchStep` entry.
     phase_accum_rad: f32,
     /// Smoothly blends leg stance when UVC engages.
     initialized: bool,
@@ -523,11 +553,12 @@ impl UvcController {
         // Capture-point landing law (swing foot only). ξ and ċ come straight from the
         // estimator's authoritative telemetry — never reconstructed from the lossy hint.
         //   p = ξ_rel + K_v * (v_des - v_com) / ω,  ω = sqrt(g / h_com),  v_des = v_cmd * 0.5 m/s
-        // Default gains give h_com = 0.25 m -> ω ≈ 6.26 rad/s and K_v = dcm_step_gain.
+        // Default gains give h_com = 0.72 m -> ω ≈ 3.69 rad/s, matching the
+        // FK-derived sole-to-CoM height of the bundled model. K_v = dcm_step_gain.
         let h_com = if gains.h_com_m.is_finite() {
-            gains.h_com_m.clamp(0.12_f32, 0.60_f32)
+            gains.h_com_m.clamp(0.12_f32, 0.80_f32)
         } else {
-            0.25_f32
+            0.72_f32
         };
         let omega = sqrtf(GRAVITY_M_S2 / h_com);
         let capture_valid = estimator.valid_mask & estimator_valid::DCM != 0;
@@ -547,38 +578,59 @@ impl UvcController {
 
         let step_h_scale = walk.step_height.clamp(0.1_f32, 1.0_f32);
         let cadence = walk.cadence_hz.clamp(0.6_f32, 2.8_f32);
-        // ai2001 catch-step duration: 18 ticks @ 10 ms = 0.18 s; walk cadence modulates step speed
+        let walking_clock = walk.walk_enabled;
+        // Nominal support half-cycle = one gait half-cycle at the commanded cadence.
+        // The catch-step timer keeps its ai2001 18-tick @ 10 ms = 0.18 s duration,
+        // while the walking clock always uses the cadence-derived duration even
+        // if velocity is too small to actually walk.
+        let walk_step_dur_nom = (0.5_f32 / cadence).clamp(STEP_DUR_MIN_SEC, STEP_DUR_MAX_SEC);
         let step_dur_nom = if wants_walk {
-            (0.5_f32 / cadence).clamp(0.16_f32, 0.45_f32)
+            walk_step_dur_nom
         } else {
             0.18_f32
         };
-        // Khadiv step-time adaptation: shorten the (timer-driven) recovery step when the
-        // capture error exceeds the usable foot margin. The phase-locked walking cadence
-        // remains the single gait clock; only the synthetic catch-step duration is scaled.
-        //   T = clamp(0.8 * ln(1 + margin / |xi - p|) / omega, 0.16, T_nom)
+        // Khadiv step-time adaptation: a capture error beyond the usable foot
+        // margin shortens both the timer-driven recovery step and the walking
+        // half-cycle. The clock remains the single source of truth for walking
+        // phase; `step_dur` scales how fast its π boundary arrives.
+        //
+        // During steady walking a non-zero Raibert velocity correction is
+        // normal and must NOT saturate the clock at the minimum half-cycle
+        // (that swaps support before the lagged actuator lands the swing foot,
+        // producing flight). Walking therefore adapts only on a genuine
+        // support-polygon breach signalled by the estimator; catch steps keep
+        // the un-gated Khadiv response to their own capture error.
+        let adapt_step = !walking_clock || dcm.margin_breached;
         let foot_half = gains.foot_half_length_m.clamp(0.015_f32, 0.12_f32);
         let margin = if gains.foot_margin_m.is_finite() {
             gains.foot_margin_m.clamp(0.010_f32, foot_half)
         } else {
             0.028_f32
         };
-        let step_dur = if capture_valid && capture_error > margin {
-            let ratio = margin / capture_error.max(1e-6_f32);
-            (0.8_f32 * logf(1.0_f32 + ratio) / omega).clamp(0.16_f32, step_dur_nom)
+        let step_dur = if adapt_step {
+            adapt_step_duration(capture_valid, capture_error, margin, omega, step_dur_nom)
         } else {
             step_dur_nom
         };
+        let walk_step_dur = if adapt_step {
+            // Even on a breach, keep at least 85% of the nominal half-cycle:
+            // the lagged actuator needs that tail to plant the swing sole
+            // before the π boundary swaps support.
+            adapt_step_duration(capture_valid, capture_error, margin, omega, walk_step_dur_nom)
+                .max(0.85_f32 * walk_step_dur_nom)
+        } else {
+            walk_step_dur_nom
+        };
 
-        // P2 phase-locked gait clock. `step_dur` is one half gait cycle, so
-        // `2π·cadence·dt` advances exactly π per step. The accumulator is the
-        // single source of truth for walking phase and runs through every
-        // state while walking is engaged; the `dt`/`cadence` clamps guarantee
-        // a single subtraction is enough to wrap into `[0, 2π)`.
+        // Gait clock: `π/step_dur · dt` advances exactly π per undisturbed
+        // half-cycle (nominal cadence), and faster when a capture breach
+        // shortens `step_dur`. The accumulator is the single source of truth
+        // for walking phase and runs through every state while walking is
+        // engaged. `dt ≤ 0.05` and `step_dur ≥ 0.16` bound one increment to
+        // `< π`, so a single subtraction wraps into `[0, 2π)`.
         const TWO_PI: f32 = 2.0_f32 * PI;
-        let walking_clock = walk.walk_enabled;
         if walking_clock {
-            self.phase_accum_rad += TWO_PI * cadence * dt;
+            self.phase_accum_rad += (PI / walk_step_dur) * dt;
             if self.phase_accum_rad >= TWO_PI {
                 self.phase_accum_rad -= TWO_PI;
             }
@@ -737,20 +789,27 @@ impl UvcController {
                 if capture_valid {
                     self.dxis = capture_sag.clamp(-self.geom.max_swing_dx, self.geom.max_swing_dx);
                     // Right-positive world lateral -> outward-from-pelvis on the swing side.
-                    self.dyis =
-                        (capture_lat * swing_lat_sign).clamp(0.0_f32, self.geom.max_swing_dy);
+                    // Bidirectional: a negative capture offset places the swing sole
+                    // inward instead of clamping it to the nominal hip line. That
+                    // removes the one-sided lateral bias that used to push the CoP
+                    // away from the body every step.
+                    self.dyis = (capture_lat * swing_lat_sign)
+                        .clamp(-self.geom.max_swing_dy, self.geom.max_swing_dy);
                 } else {
-                    let dcm_swing_y = (dcm.swing_dy_m * swing_lat_sign).max(0.0_f32);
+                    let dcm_swing_y = dcm.swing_dy_m * swing_lat_sign;
                     self.dxis = (-self.dxi + dcm.swing_dx_m)
                         .clamp(-self.geom.max_swing_dx, self.geom.max_swing_dx);
-                    self.dyis = (self.dyi + dcm_swing_y).clamp(0.0_f32, self.geom.max_swing_dy);
+                    self.dyis = (self.dyi + dcm_swing_y)
+                        .clamp(-self.geom.max_swing_dy, self.geom.max_swing_dy);
                 }
+                // Keep the swing sole from crossing the stance sole even when
+                // the capture law asks for a large inward placement.
                 let anti_collide = self.dyi + self.dyis;
                 if anti_collide < 0.0_f32 {
                     self.dyis -= anti_collide;
                 }
 
-                // Sinusoidal swing foot clearance (`fh = fhMax * sin(PI * progress)`)
+                // Swing foot clearance envelope (dwell-shaped below)
                 let lift_scale = if wants_walk {
                     step_h_scale
                 } else {
@@ -760,7 +819,13 @@ impl UvcController {
                         .clamp(0.28_f32, 1.0_f32);
                     step_h_scale * offset_norm
                 };
-                swing_lift_m = self.geom.max_foot_lift * lift_scale * sinf(PI * progress);
+                // Toe-off / heel-strike dwell: sin²(π·p) keeps the swing sole
+                // near the ground while the support hand-off happens (p≈0/1)
+                // but retains the same mid-swing peak clearance. The old pure
+                // sine lifted too early and landed too late, so the plant saw
+                // 0b00 flight ticks at every steady support swap.
+                let lift_s = sinf(PI * progress);
+                swing_lift_m = self.geom.max_foot_lift * lift_scale * lift_s * lift_s;
 
                 // Pelvis waist/hip yaw twist (`feetCont1`: wt = 0.5 * atan2(dxi, dyi + half_hip))
                 let wt_geom = 0.35_f32 * atan2f(self.dxi, self.dyi + self.geom.half_hip_spacing);
@@ -865,6 +930,11 @@ impl UvcController {
             UvcPhase::FallTuck => {}
         }
 
+        // TODO (needs rk-proto): while `walk_enabled && !margin_breached` the
+        // machine is really WALKING, but rk-proto has no distinct wire code and
+        // `UvcStepOutput` cannot carry one. Consumers must use the existing
+        // `balance.walk_active` field to disambiguate from a genuine catch step;
+        // rk-sim's `WalkQuality.catch_step_fraction` does exactly that.
         // Telemetry always exposes the continuous accumulator while walking,
         // even in non-stepping states, so the phase never jumps between states.
         if walking_clock {
@@ -879,7 +949,7 @@ impl UvcController {
             .clamp(self.geom.min_height, self.geom.nominal_height);
 
         let swg_x = self.dxis;
-        let swg_y = (self.dyis + self.sway).max(0.0_f32);
+        let swg_y = (self.dyis + self.sway).clamp(-self.geom.max_swing_dy, self.geom.max_swing_dy);
         let swg_h = (self.auto_h - swing_lift_m)
             .clamp(self.geom.min_height * 0.85_f32, self.geom.nominal_height);
 
@@ -901,9 +971,12 @@ impl UvcController {
         let mut pitch_corr = 0.0_f32;
         let mut roll_corr = 0.0_f32;
         if walk.balance_enabled {
-            let damp_p = (-gains.gyro_damp_pitch * imu.pitch_rate_rad_s - 0.22_f32 * raw_pitch)
+            // Stronger direct ankle P-term: the lumped plant integrates the same
+            // correction as a torso restoring moment, so a weak P term leaves a
+            // permanent lean during steady walking (tens of milliradians).
+            let damp_p = (-gains.gyro_damp_pitch * imu.pitch_rate_rad_s - 0.80_f32 * raw_pitch)
                 .clamp(-0.35_f32, 0.35_f32);
-            let damp_r = (-gains.gyro_damp_roll * imu.roll_rate_rad_s - 0.22_f32 * raw_roll)
+            let damp_r = (-gains.gyro_damp_roll * imu.roll_rate_rad_s - 0.90_f32 * raw_roll)
                 .clamp(-0.30_f32, 0.30_f32);
 
             left_leg.ankle_pitch += damp_p;
@@ -1042,6 +1115,13 @@ pub fn apply_radial_deadband(pitch: f32, roll: f32, deadband: f32) -> (f32, f32)
 mod tests {
     use super::*;
 
+    /// Undisturbed gait-clock increment under the P3 law `π/step_dur · dt`.
+    /// For cadences whose nominal half-cycle is inside `[0.16, 0.45]` this is
+    /// exactly the historic `2π·cadence·dt` increment.
+    fn nominal_walk_phase_inc(cadence: f32, dt: f32) -> f32 {
+        (PI / (0.5_f32 / cadence).clamp(STEP_DUR_MIN_SEC, STEP_DUR_MAX_SEC)) * dt
+    }
+
     #[test]
     fn analytic_6dof_leg_ik_keeps_sole_strictly_parallel_on_khr_and_rocky() {
         for geom in [LegGeometry::khr_3hv(), LegGeometry::rocky_mk1()] {
@@ -1163,8 +1243,9 @@ mod tests {
         );
     }
 
-    /// Group 1 (P2): phase advances by exactly one fixed-dt increment every
-    /// tick while walking, including across 2π wraps and support swaps.
+    /// Group 1 (P3): phase advances by exactly one fixed-dt increment every
+    /// tick while walking, including across 2π wraps and support swaps. With
+    /// no capture telemetry the Khadiv law falls back to nominal cadence.
     #[test]
     fn walking_gait_phase_advances_continuously() {
         let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
@@ -1181,7 +1262,11 @@ mod tests {
             ..Default::default()
         };
         let gains = BalanceGains::default();
-        let expected_inc: f32 = 2.0_f32 * PI * cadence * dt;
+        let expected_inc = nominal_walk_phase_inc(cadence, dt);
+        assert!(
+            (expected_inc - 2.0_f32 * PI * cadence * dt).abs() < 1e-6_f32,
+            "undisturbed cadence must still advance at 2π·cadence·dt"
+        );
         let mut prev: Option<f32> = None;
         let mut wraps = 0;
         for _ in 0..400 {
@@ -1253,6 +1338,73 @@ mod tests {
         );
     }
 
+    /// P3: with `walk_enabled`, a capture-point breach shortens the gait
+    /// half-cycle so the next support swap arrives earlier than nominal cadence.
+    #[test]
+    fn walking_capture_breach_shortens_step() {
+        let dt = 0.005_f32;
+        let cadence = 1.55_f32;
+        let walk = WalkCmd {
+            walk_enabled: true,
+            balance_enabled: true,
+            vx: 0.5,
+            cadence_hz: cadence,
+            ..Default::default()
+        };
+        let imu = ImuState {
+            available: true,
+            ..Default::default()
+        };
+        let gains = BalanceGains::default();
+        let omega = sqrtf(GRAVITY_M_S2 / gains.h_com_m);
+        let v_des = walk.vx * 0.5_f32;
+
+        // Same valid capture telemetry in both runs; the disturbance adds a
+        // genuine support-polygon breach plus a large CoM velocity error.
+        let nominal = capture_telemetry(v_des / omega, v_des, true);
+        let breach = capture_telemetry(0.0, 2.0_f32, true);
+        let calm_hint = DcmSwingHint::default();
+        let breach_hint = DcmSwingHint {
+            margin_breached: true,
+            ..Default::default()
+        };
+
+        let first_left_support = |telem: EstimatorTelemetry, hint: DcmSwingHint| -> usize {
+            let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+            for tick in 1..=400 {
+                let out = ctrl.step_with_dcm(dt, imu, walk, gains, hint, telem);
+                if out.phase == UvcPhase::ActiveCatchStep && out.support_foot == 1 {
+                    return tick;
+                }
+            }
+            panic!("walking never swapped to left support");
+        };
+
+        let nominal_ticks = first_left_support(nominal, calm_hint);
+        let breach_ticks = first_left_support(breach, breach_hint);
+        eprintln!("support swap: nominal={nominal_ticks} ticks, breach={breach_ticks} ticks");
+        assert!(
+            breach_ticks + 8 < nominal_ticks,
+            "capture breach must advance the support swap by >= 40 ms ({breach_ticks} vs {nominal_ticks})"
+        );
+        // Nominal cadence must still be correct when undisturbed. A walking
+        // breach shortens the half-cycle but keeps 85% of nominal so the
+        // lagged actuator can plant the swing foot before the swap.
+        // Tick granularity is one increment, so allow one tick of slack.
+        assert!(
+            (nominal_ticks as f32 * nominal_walk_phase_inc(cadence, dt) - PI).abs()
+                < 2.0_f32 * nominal_walk_phase_inc(cadence, dt),
+            "undisturbed support swap must land at π, got tick {nominal_ticks}"
+        );
+        let shortened_dur =
+            0.85_f32 * (0.5_f32 / cadence).clamp(STEP_DUR_MIN_SEC, STEP_DUR_MAX_SEC);
+        let shortening_s = (nominal_ticks - breach_ticks) as f32 * dt;
+        assert!(
+            shortening_s > 0.0_f32 && shortening_s <= (0.5_f32 / cadence - shortened_dur) + dt,
+            "breach shortening {shortening_s:.3}s must be early but no shorter than the walking settling floor"
+        );
+    }
+
     /// Group 1 (P2): entering a catch step phase-locks the accumulator to the
     /// synthetic catch-step phase (progress 0 -> 0 or π) with no jump, and the
     /// very next tick continues advancing from that locked value.
@@ -1295,7 +1447,7 @@ mod tests {
         );
 
         let next = ctrl.step(dt, imu, walk, gains);
-        let expected_inc = 2.0_f32 * PI * cadence * dt;
+        let expected_inc = nominal_walk_phase_inc(cadence, dt);
         let delta = if next.gait_phase_rad >= entry.gait_phase_rad {
             next.gait_phase_rad - entry.gait_phase_rad
         } else {

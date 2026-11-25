@@ -50,6 +50,9 @@ static UART_BUS: Mutex<RefCell<UartBusState>> = Mutex::new(RefCell::new(UartBusS
         },
         i3c_timeout_count: 0,
         imu_source_mask: rk_proto::estimator_valid::LSM6DSV_OK,
+        contact_mask: 0,
+        grf_n: [0.0; 2],
+        contact_valid_mask: 0,
     },
     last_cmd: RawServoCommand {
         torque_mask: 0,

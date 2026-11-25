@@ -99,6 +99,7 @@ impl ServoBusPort for BenchLoopbackBus {
             imu: rk_proto::ImuState::default(),
             i3c_timeout_count: 0,
             imu_source_mask: 0,
+            ..Default::default()
         }
     }
 

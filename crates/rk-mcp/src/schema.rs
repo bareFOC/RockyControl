@@ -227,6 +227,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "arm_assist": num("Arm counter-spread balance assist gain (0.0..=1.5)"),
                     "fall_cutoff_rad": num("Protective fall tuck and torque cutoff tilt threshold in radians (0.30..=1.35)"),
                     "dcm_step_gain": num("Kinematic DCM swing-foot landing modulation gain (0.0..=1.5)"),
+                    "h_com_m": num("Fixed CoM height for DCM/ZMP in meters (0.12..=0.80, default 0.72)"),
                     "foot_half_length_m": num("Physical printed foot half-length in meters (default 0.035 m = 7 cm foot)"),
                     "foot_margin_m": num("Usable sagittal ankle/CoP margin before capture step (default 0.028 m = ±2.8 cm)"),
                     "ukemi_tilt_rad": num("Ukemi pre-fall torque relaxation tilt threshold in radians (0.25..=1.20)"),

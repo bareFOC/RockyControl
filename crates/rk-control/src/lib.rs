@@ -36,7 +36,7 @@ pub use impact::{
 use rk_proto::{
     BalanceGains, BalanceTelemetry, ConfigCmd, ControlMode, FaultFlags, HostToMcu, ImuState,
     JointCommandMode, MAX_JOINTS, McuToHost, PROTOCOL_VERSION, RunningConfig, WATCHDOG_TIMEOUT_MS,
-    WalkCmd, classify_fall, fall_orientation, uvc_phase,
+    WalkCmd, classify_fall, estimator_valid, fall_orientation, uvc_phase,
 };
 use serde::{Deserialize, Serialize};
 pub use slip::{FlightDetector, SlipConfig, SlipController, SlipInputs, SlipOutput, SlipPhase};
@@ -154,6 +154,17 @@ pub struct RawServoFeedback {
     pub i3c_timeout_count: u16,
     /// Active IMU source validity flags (`estimator_valid::LSM6DSV_OK` / `BNO055_OK`).
     pub imu_source_mask: u32,
+    /// Bit 0 = Right sole loaded, bit 1 = Left sole loaded (same wire convention as
+    /// `EstimatorTelemetry::contact_mask`). Meaningless unless `contact_valid_mask`
+    /// asserts `estimator_valid::CONTACT_SENSED`.
+    pub contact_mask: u8,
+    /// Normal ground reaction in Newtons indexed `[right, left]`. Meaningless
+    /// unless `contact_valid_mask` asserts `estimator_valid::GRF`.
+    pub grf_n: [f32; 2],
+    /// Validity mask for the sensed contact channels (`estimator_valid::CONTACT_SENSED`
+    /// gates `contact_mask`, `estimator_valid::GRF` gates `grf_n`). Hardware without
+    /// a contact sensor leaves this clear, so the kernel keeps its phase fallback.
+    pub contact_valid_mask: u32,
 }
 
 impl Default for RawServoFeedback {
@@ -168,6 +179,9 @@ impl Default for RawServoFeedback {
             imu: ImuState::default(),
             i3c_timeout_count: 0,
             imu_source_mask: rk_proto::estimator_valid::LSM6DSV_OK,
+            contact_mask: 0,
+            grf_n: [0.0; 2],
+            contact_valid_mask: 0,
         }
     }
 }
@@ -234,6 +248,10 @@ pub struct DirectServoKernel {
     last_walk_cmd: WalkCmd,
     uvc: UvcController,
     estimator: KinematicEstimator,
+    /// Last sensed loaded-foot mask. Held through an airborne sensed tick so a
+    /// brief loss of sole contact does not move the capture-point origin to the
+    /// pelvis (which would command a foot placement under the falling body).
+    last_support_mask: u8,
     uvc_blend: f32,
     /// Orientation captured at the most recent `TILT_FALL_CUTOFF` latch
     /// (`fall_orientation::*` wire code). Persists while the fault is latched.
@@ -281,6 +299,7 @@ impl DirectServoKernel {
             last_walk_cmd: WalkCmd::default(),
             uvc: UvcController::new(LegGeometry::rocky_mk1()),
             estimator: KinematicEstimator::new(),
+            last_support_mask: 0b11,
             uvc_blend: 0.0,
             fall_orientation: fall_orientation::UNKNOWN,
             rx_crc_errors: 0,
@@ -531,7 +550,7 @@ impl DirectServoKernel {
                             dcm_step_gain: g.dcm_step_gain.clamp(0.0, 1.5),
                             foot_half_length_m: foot_half,
                             foot_margin_m: g.foot_margin_m.clamp(0.010, foot_half),
-                            h_com_m: g.h_com_m.clamp(0.12, 0.60),
+                            h_com_m: g.h_com_m.clamp(0.12, 0.80),
                             ukemi_tilt_rad: g
                                 .ukemi_tilt_rad
                                 .clamp(0.25, (fall_cutoff - 0.03).max(0.25)),
@@ -638,6 +657,61 @@ impl DirectServoKernel {
             estimator_imu.roll_rad = comp_roll;
         }
 
+        // Sensed contact/GRF closes the support loop when a sensor publishes it.
+        // Hardware (and any replay log) with the validity bits clear keeps the
+        // exact phase-derived fallback path, including zero GRF telemetry.
+        let contact_sensed =
+            feedback.contact_valid_mask & estimator_valid::CONTACT_SENSED != 0;
+        let grf_valid = contact_sensed && feedback.contact_valid_mask & estimator_valid::GRF != 0;
+        // A sole counts as loaded only when it actually carries ground reaction.
+        // The plant's boolean contact can stay true through touchdown transitions
+        // with ~0 N; using GRF removes that flicker from the capture origin.
+        const MIN_LOADED_GRF_N: f32 = 1.0_f32;
+        let sensed_mask = if contact_sensed {
+            (if feedback.grf_n[0] > MIN_LOADED_GRF_N { 0b01 } else { 0 })
+                | (if feedback.grf_n[1] > MIN_LOADED_GRF_N { 0b10 } else { 0 })
+        } else {
+            0
+        };
+        let phase_mask = self.uvc.contact_mask();
+        // The estimator needs a support *origin* even during a brief flight
+        // tick. Hold the last loaded sole rather than snapping to the pelvis;
+        // telemetry still reports the raw sensed mask (including flight).
+        // While walking, a sensed sole that disagrees with the gait's support
+        // foot is a foot that has not landed yet: use the phase support for the
+        // capture origin so the swing trajectory cannot chase a stale sole.
+        let support_mask = if contact_sensed && sensed_mask != 0 {
+            // A sensed sole that disagrees with the controller's support foot is
+            // a sole still in transition (swing/landing), not a stable origin.
+            // Keep the commanded support for the capture origin; telemetry still
+            // reports the raw sensed mask. This holds both while walking and
+            // while a catch step is settling after a shove.
+            if sensed_mask != phase_mask
+                && (self.last_walk_cmd.walk_enabled || max_tilt < 0.15_f32)
+            {
+                phase_mask
+            } else {
+                self.last_support_mask = sensed_mask;
+                sensed_mask
+            }
+        } else if contact_sensed {
+            self.last_support_mask
+        } else {
+            phase_mask
+        };
+        let reported_mask = if contact_sensed {
+            // Telemetry reports the sensor's raw contact mask; only the capture
+            // origin uses the GRF-refined / phase-gated support selection.
+            feedback.contact_mask & 0b11
+        } else {
+            support_mask
+        };
+        let sensed_grf_n = if contact_sensed {
+            feedback.grf_n
+        } else {
+            [0.0_f32; 2]
+        };
+
         let (mut estimator_telem, dcm_hint) = self.estimator.step(
             dt,
             self.joint_count,
@@ -645,11 +719,17 @@ impl DirectServoKernel {
             &measured_vel_rad_s,
             estimator_imu,
             self.uvc.geometry().nominal_height,
-            self.uvc.contact_mask(),
+            support_mask,
+            sensed_grf_n,
+            grf_valid,
+            self.last_walk_cmd.walk_enabled,
             feedback.imu_source_mask,
             ukemi_active,
             self.balance_gains,
         );
+        // Publish exactly the sensed mask the kernel consumed this tick. During
+        // flight this is 0 even though the estimator holds the last origin.
+        estimator_telem.contact_mask = reported_mask;
 
         // 5b. Compute MCU-native UVC upper-body balance + locomotion overlay
         let mut desired_rad = self.last_host_target_rad;

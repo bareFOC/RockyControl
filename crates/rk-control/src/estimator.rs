@@ -38,7 +38,16 @@ const REF_EST_DT_SEC: f32 = 0.005_f32;
 const VEL_EMA_ALPHA_200HZ: f32 = 0.30_f32;
 /// Clamping bounds for the configurable CoM height (matches the MCU config clamp).
 const H_COM_MIN_M: f32 = 0.12_f32;
-const H_COM_MAX_M: f32 = 0.60_f32;
+const H_COM_MAX_M: f32 = 0.80_f32;
+/// Forward/lateral reach of the next swing-foot landing while walking. Matches
+/// `LegGeometry::rocky_mk1().max_swing_dx`; a capture point beyond
+/// `support margin + reach` cannot be recovered by the next step. Only used for
+/// the walking capturability margin — a standing shove keeps the raw foot margin.
+const NEXT_STEP_REACH_M: f32 = 0.22_f32;
+/// Lateral distance from pelvis centerline to one hip axis. The opposite foot
+/// can be placed `NEXT_STEP_REACH_M` outward from the pelvis, so the reachable
+/// lateral capture region extends hip-spacing + swing reach from the stance sole.
+const HIP_HALF_SPACING_M: f32 = 0.095_f32;
 /// Joint count required for the validated mass-weighted FK path.
 const FK_JOINT_COUNT: usize = 21;
 
@@ -84,6 +93,25 @@ pub struct KinematicEstimator {
     prev_vel: [f32; 3],
     com_acc: [f32; 3],
     prev_support: Support,
+    /// Last known support origin/velocity in the pelvis frame. Held during a
+    /// sensed flight tick so the capture point stays referenced to the sole
+    /// that was actually carrying the body instead of snapping to the pelvis.
+    last_support_pos: [f32; 3],
+    last_support_vel: [f32; 3],
+    /// Filtered support origin. A support swap re-targets both legs at once, so
+    /// the raw FK foot origin jumps laterally by tens of centimetres; feeding
+    /// that jump straight into ξ produces a spurious catch-step trigger. An
+    /// asymmetric EMA (slow on swap, fast while settled) keeps the capture
+    /// origin continuous without hiding a genuine, sustained support change.
+    support_pos_f: [f32; 3],
+    support_vel_f: [f32; 3],
+    support_init: bool,
+    /// Support-relative CoM from the *midpoint of both soles*. The gait's
+    /// alternating single-foot origin jumps when legs are re-targeted; the
+    /// midpoint is continuous and is the effective support polygon while
+    /// walking, so it is used for the walking capturability margin only.
+    com_mid_pos: [f32; 3],
+    com_mid_vel: [f32; 3],
     last_telemetry: EstimatorTelemetry,
 }
 
@@ -102,6 +130,13 @@ impl KinematicEstimator {
             prev_vel: [0.0; 3],
             com_acc: [0.0; 3],
             prev_support: Support::Double,
+            last_support_pos: [0.0; 3],
+            last_support_vel: [0.0; 3],
+            support_pos_f: [0.0; 3],
+            support_vel_f: [0.0; 3],
+            support_init: false,
+            com_mid_pos: [0.0; 3],
+            com_mid_vel: [0.0; 3],
             last_telemetry: EstimatorTelemetry {
                 com_pos_m: [0.0, 0.48, 0.0],
                 com_vel_m_s: [0.0; 3],
@@ -123,6 +158,11 @@ impl KinematicEstimator {
         self.prev_vel = [0.0; 3];
         self.com_acc = [0.0; 3];
         self.prev_support = Support::Double;
+        self.last_support_pos = [0.0; 3];
+        self.last_support_vel = [0.0; 3];
+        self.support_init = false;
+        self.com_mid_pos = [0.0; 3];
+        self.com_mid_vel = [0.0; 3];
     }
 
     pub const fn last_telemetry(&self) -> EstimatorTelemetry {
@@ -134,6 +174,12 @@ impl KinematicEstimator {
     /// `measured_vel_rad_s` is the calibrated joint-rate array (same joint
     /// indexing as `measured_rad`). For 21-DoF robots it drives the analytic
     /// mass-weighted CoM Jacobian in [`crate::com_fk`].
+    ///
+    /// `contact_mask` is the sensed support mask when the kernel's validity
+    /// check passed, otherwise the phase-derived fallback. `grf_n` is indexed
+    /// `[right, left]` and is published only when `grf_valid` is true.
+    /// `walk_enabled` selects the step-reach-aware capturability margin used
+    /// during locomotion; standing balance keeps the raw foot margin.
     #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
@@ -144,6 +190,9 @@ impl KinematicEstimator {
         imu: ImuState,
         hip_height_m: f32,
         contact_mask: u8,
+        grf_n: [f32; 2],
+        grf_valid: bool,
+        walk_enabled: bool,
         imu_source_mask: u32,
         ukemi_active: bool,
         gains: BalanceGains,
@@ -156,6 +205,22 @@ impl KinematicEstimator {
         let (com_pos, raw_vel): ([f32; 3], [f32; 3]) = if joint_count == FK_JOINT_COUNT {
             // Validated mass-weighted FK path: joint encoders + joint rates only.
             let fk = compute_state(measured_rad, measured_vel_rad_s);
+            // Continuous double-support reference used only for the walking
+            // capturability margin (the reported DCM stays support-relative).
+            let mid_pos = [
+                0.5_f32 * (fk.left_foot[0] + fk.right_foot[0]),
+                0.5_f32 * (fk.left_foot[1] + fk.right_foot[1]),
+                0.5_f32 * (fk.left_foot[2] + fk.right_foot[2]),
+            ];
+            let mid_vel = [
+                0.5_f32 * (fk.left_foot_vel[0] + fk.right_foot_vel[0]),
+                0.5_f32 * (fk.left_foot_vel[1] + fk.right_foot_vel[1]),
+                0.5_f32 * (fk.left_foot_vel[2] + fk.right_foot_vel[2]),
+            ];
+            for axis in 0..3 {
+                self.com_mid_pos[axis] = fk.com[axis] - mid_pos[axis];
+                self.com_mid_vel[axis] = fk.com_vel[axis] - mid_vel[axis];
+            }
             let (support_pos, support_vel) = match support {
                 Support::Left => (fk.left_foot, fk.left_foot_vel),
                 Support::Right => (fk.right_foot, fk.right_foot_vel),
@@ -171,12 +236,45 @@ impl KinematicEstimator {
                         0.5_f32 * (fk.left_foot_vel[2] + fk.right_foot_vel[2]),
                     ],
                 ),
-                Support::None => ([0.0; 3], [0.0; 3]),
+                // Airborne: keep the last loaded origin. Snapping to the pelvis
+                // would make ξ jump to zero and command a foot placement under
+                // the body at the exact moment the swing foot must still reach.
+                Support::None => (self.last_support_pos, self.last_support_vel),
             };
+            if support != Support::None {
+                self.last_support_pos = support_pos;
+                self.last_support_vel = support_vel;
+            }
+            // Smooth the support origin so a simultaneous leg re-target at a
+            // swap cannot inject a tens-of-centimetres jump into ξ. Track quickly
+            // while settled, slowly right after a swap.
+            if !self.support_init {
+                self.support_pos_f = support_pos;
+                self.support_vel_f = support_vel;
+                self.support_init = true;
+            } else {
+                // Standing balance can flicker between soles while a catch step
+                // settles, so move the origin slowly. Walking keeps the origin
+                // close to the gait-clock support (fast tracking) — filtering it
+                // more heavily desynchronises the swing target and causes flight.
+                let alpha = if support_swapped {
+                    if walk_enabled { 0.25_f32 } else { 0.12_f32 }
+                } else if walk_enabled {
+                    0.9_f32
+                } else {
+                    (18.0_f32 * dt).clamp(0.0_f32, 0.9_f32)
+                };
+                for axis in 0..3 {
+                    self.support_pos_f[axis] +=
+                        alpha * (support_pos[axis] - self.support_pos_f[axis]);
+                    self.support_vel_f[axis] +=
+                        alpha * (support_vel[axis] - self.support_vel_f[axis]);
+                }
+            }
+            let support_pos = self.support_pos_f;
+            let support_vel = self.support_vel_f;
             // Support origin is expressed in the pelvis frame; subtracting it
-            // gives ground/support-relative position and velocity. Because
-            // both fields are continuous in joint state, a support swap does
-            // not introduce a velocity spike.
+            // gives ground/support-relative position and velocity.
             (
                 [
                     fk.com[0] - support_pos[0],
@@ -227,10 +325,15 @@ impl KinematicEstimator {
         }
         self.prev_support = support;
         let com_pos = com_pos; // use raw support-relative position (not smoothed)
+        // TODO(P2 cross-file, coordinating agent): `uvc.rs:527-530` still clamps
+        // h_com to 0.60 with a 0.25 fallback. With the new 0.72 default UVC's ω
+        // disagrees with this estimator's ω. That file is not owned by this P2
+        // agent; it needs clamp `[0.12, 0.80]` and fallback `0.72` (plus the
+        // stale comment at uvc.rs:526) to restore a single source of truth.
         let h_com = if gains.h_com_m.is_finite() {
             gains.h_com_m.clamp(H_COM_MIN_M, H_COM_MAX_M)
         } else {
-            0.25_f32
+            0.72_f32
         };
 
         // 3. LIPM natural frequency & support-relative Capture Point.
@@ -256,11 +359,38 @@ impl KinematicEstimator {
         } else {
             usable_margin
         };
-        let sag_remaining = usable_margin - dcm_z.abs();
-        let lat_remaining = lat_margin - dcm_x.abs();
+        // While walking, the capture region is the current sole *plus the next
+        // reachable swing-foot landing*. A capture point past the sole edge is
+        // normal mid-stance locomotion and must not latch a permanent step
+        // trigger; only a point beyond the next step's reach is uncapturable.
+        // Standing balance keeps the strict support-foot margin so a shove is
+        // still reported as a breach.
+        let (sag_remaining, lat_remaining) = if walk_enabled {
+            // Both axes use the capture point relative to the continuous
+            // double-support midpoint, whose support polygon spans both feet
+            // plus the next swing-foot reach. The single-foot origin jumps tens
+            // of cm when UVC re-targets the legs at a swap, which would report a
+            // breach without the body actually moving.
+            let mid_dcm_x = self.com_mid_pos[0] + self.com_mid_vel[0] * inv_omega;
+            let mid_dcm_z = self.com_mid_pos[2] + self.com_mid_vel[2] * inv_omega;
+            (
+                (usable_margin + NEXT_STEP_REACH_M) - mid_dcm_z.abs(),
+                (lat_margin + NEXT_STEP_REACH_M + HIP_HALF_SPACING_M) - mid_dcm_x.abs(),
+            )
+        } else {
+            (usable_margin - dcm_z.abs(), lat_margin - dcm_x.abs())
+        };
         let signed_margin = sag_remaining.min(lat_remaining);
 
         // 6. Swing-foot landing modulation (strictly swing-foot only when margin breached)
+        // TODO(P2 cross-file, coordinating agent): `uvc.rs` keeps the robot in
+        // `UvcPhase::ActiveCatchStep` for the entire walk (`wants_walk` re-enters
+        // it from ReadyWatch/PostStepSettle, and the walking clock has no exit
+        // path), so `catch_step_fraction` stays 1.0 even with a healthy margin.
+        // Needed uvc.rs change: add a dedicated Walking phase (or report a
+        // `uvc_phase::WALKING` wire code while `walk_enabled && !margin_breached`)
+        // and gate `enter_catch_step` on an actual support-polygon breach or a
+        // tilted torso instead of `wants_walk` alone.
         let margin_breached = signed_margin < 0.0_f32;
         let dcm_gain = gains.dcm_step_gain.clamp(0.0_f32, 1.5_f32);
         let swing_dx_m = if dcm_z.abs() > usable_margin {
@@ -276,9 +406,10 @@ impl KinematicEstimator {
             0.0_f32
         };
 
-        // 7. Explicit channel validity bitmask: v1 NEVER sets GRF or MOMENTUM!
-        //    CoM & DCM are published only while the IMU is live; a dropout must
-        //    not publish stale kinematic state as authoritative.
+        // 7. Explicit channel validity bitmask: MOMENTUM is never set on v1, and
+        //    GRF is set only when the kernel received a valid sensed contact
+        //    snapshot. CoM & DCM are published only while the IMU is live; a
+        //    dropout must not publish stale kinematic state as authoritative.
         let imu_bits = if imu.available {
             let masked =
                 imu_source_mask & (estimator_valid::LSM6DSV_OK | estimator_valid::BNO055_OK);
@@ -290,10 +421,17 @@ impl KinematicEstimator {
         } else {
             0
         };
-        let valid_mask = if imu.available {
+        let mut valid_mask = if imu.available {
             estimator_valid::COM | estimator_valid::DCM | imu_bits
         } else {
             0
+        };
+        // Feedback GRF is `[right, left]`; telemetry keeps the named channels.
+        let (grf_left_n, grf_right_n) = if grf_valid {
+            valid_mask |= estimator_valid::GRF;
+            (grf_n[1], grf_n[0])
+        } else {
+            (0.0_f32, 0.0_f32)
         };
 
         let telemetry = EstimatorTelemetry {
@@ -302,8 +440,8 @@ impl KinematicEstimator {
             dcm_xy_m: [dcm_x, dcm_z],
             zmp_xy_m: [zmp_x, zmp_z],
             foot_margin_m: signed_margin,
-            grf_left_n: 0.0,
-            grf_right_n: 0.0,
+            grf_left_n,
+            grf_right_n,
             contact_mask,
             ukemi_active,
             valid_mask,
@@ -383,23 +521,40 @@ mod tests {
         }
     }
 
+    /// Helper for the common "no sensed contact, standing balance" test case.
+    fn step_quiet(
+        est: &mut KinematicEstimator,
+        angles: &[f32; MAX_JOINTS],
+        vel: &[f32; MAX_JOINTS],
+        imu: ImuState,
+        contact_mask: u8,
+        imu_source_mask: u32,
+        gains: BalanceGains,
+    ) -> (EstimatorTelemetry, DcmSwingHint) {
+        est.step(
+            0.005,
+            21,
+            angles,
+            vel,
+            imu,
+            0.4,
+            contact_mask,
+            [0.0; 2],
+            false,
+            false,
+            imu_source_mask,
+            false,
+            gains,
+        )
+    }
+
     #[test]
     fn fk_path_zero_pose_keeps_dcm_inside_margin() {
         let mut est = KinematicEstimator::new();
         let angles = [0.0_f32; MAX_JOINTS];
         let vel = [0.0_f32; MAX_JOINTS];
-        let (telem, _) = est.step(
-            0.005,
-            21,
-            &angles,
-            &vel,
-            imu_upright(),
-            0.4,
-            0b11,
-            0,
-            false,
-            gains(),
-        );
+        let (telem, _) =
+            step_quiet(&mut est, &angles, &vel, imu_upright(), 0b11, 0, gains());
         assert!(
             telem.foot_margin_m > 0.0,
             "quiet 21-DoF stance must be inside the support margin: {}",
@@ -433,18 +588,7 @@ mod tests {
         angles: &[f32; MAX_JOINTS],
         vel: &[f32; MAX_JOINTS],
     ) -> EstimatorTelemetry {
-        let (t, _) = est.step(
-            0.005,
-            21,
-            angles,
-            vel,
-            imu_upright(),
-            0.4,
-            0b11,
-            tick,
-            false,
-            gains(),
-        );
+        let (t, _) = step_quiet(est, angles, vel, imu_upright(), 0b11, tick, gains());
         t
     }
 
@@ -461,18 +605,8 @@ mod tests {
         }
         let before = est.last_telemetry().com_vel_m_s;
         // Switch to left stance (contact_mask 0b01).
-        let (after, _) = est.step(
-            0.005,
-            21,
-            &angles,
-            &vel,
-            imu_upright(),
-            0.4,
-            0b01,
-            20,
-            false,
-            gains(),
-        );
+        let (after, _) =
+            step_quiet(&mut est, &angles, &vel, imu_upright(), 0b01, 20, gains());
         for axis in 0..3 {
             let delta = (after.com_vel_m_s[axis] - before[axis]).abs();
             assert!(
@@ -492,22 +626,11 @@ mod tests {
             let mut est = KinematicEstimator::new();
             let mut g = gains();
             g.h_com_m = h;
-            let (telem, _) = est.step(
-                0.005,
-                21,
-                &angles,
-                &vel,
-                imu_upright(),
-                0.4,
-                0b11,
-                0,
-                false,
-                g,
-            );
+            let (telem, _) = step_quiet(&mut est, &angles, &vel, imu_upright(), 0b11, 0, g);
             telem.dcm_xy_m
         };
         let low = dcm_for(0.12);
-        let high = dcm_for(0.60);
+        let high = dcm_for(0.80);
         // Larger h_com -> smaller omega -> larger v/omega sagittal excursion.
         assert!(
             high[1].abs() > low[1].abs(),
@@ -520,7 +643,7 @@ mod tests {
         assert!(clamped.iter().all(|v| v.is_finite()));
         let clamped_hi = dcm_for(100.0);
         assert!(clamped_hi.iter().all(|v| v.is_finite()));
-        assert_eq!(clamped_hi, dcm_for(0.60));
+        assert_eq!(clamped_hi, dcm_for(0.80));
     }
 
     #[test]
@@ -530,7 +653,144 @@ mod tests {
         let vel = [0.0_f32; MAX_JOINTS];
         let mut imu = imu_upright();
         imu.pitch_rad = 0.05;
-        let (telem, _) = est.step(0.005, 17, &angles, &vel, imu, 0.4, 0b11, 0, false, gains());
+        let (telem, _) = est.step(
+            0.005, 17, &angles, &vel, imu, 0.4, 0b11, [0.0; 2], false, false, 0, false, gains(),
+        );
         assert!(telem.valid_mask & estimator_valid::COM != 0);
+    }
+
+    #[test]
+    fn sensed_contact_and_grf_are_published_with_validity() {
+        let mut est = KinematicEstimator::new();
+        let angles = [0.0_f32; MAX_JOINTS];
+        let vel = [0.0_f32; MAX_JOINTS];
+        let (telem, _) = est.step(
+            0.005,
+            21,
+            &angles,
+            &vel,
+            imu_upright(),
+            0.4,
+            0b10, // sensed left stance; a stale phase mask would be 0b01
+            [20.0_f32, 7.0_f32], // `[right, left]` GRF
+            true,
+            false,
+            0,
+            false,
+            gains(),
+        );
+        assert_eq!(telem.contact_mask, 0b10);
+        assert_eq!(telem.grf_right_n, 20.0);
+        assert_eq!(telem.grf_left_n, 7.0);
+        assert_ne!(telem.valid_mask & estimator_valid::GRF, 0);
+
+        // Clear validity: the kernel supplies the fallback mask and zero GRF,
+        // and the GRF channel must stay invalid (never read as 0 N free-fall).
+        let (invalid, _) = est.step(
+            0.005,
+            21,
+            &angles,
+            &vel,
+            imu_upright(),
+            0.4,
+            0b11,
+            [0.0; 2],
+            false,
+            false,
+            0,
+            false,
+            gains(),
+        );
+        assert_eq!(invalid.contact_mask, 0b11);
+        assert_eq!((invalid.grf_left_n, invalid.grf_right_n), (0.0, 0.0));
+        assert_eq!(invalid.valid_mask & estimator_valid::GRF, 0);
+    }
+
+    #[test]
+    fn walking_margin_includes_next_step_reach_but_stance_breach_does_not() {
+        let angles = [0.0_f32; MAX_JOINTS];
+        let mut vel = [0.0_f32; MAX_JOINTS];
+        vel[11] = -0.5_f32;
+        vel[17] = -0.5_f32;
+        let standing = {
+            let mut est = KinematicEstimator::new();
+            step_quiet(&mut est, &angles, &vel, imu_upright(), 0b11, 0, gains()).0
+        };
+        let walking = {
+            let mut est = KinematicEstimator::new();
+            let (telem, _) = est.step(
+                0.005,
+                21,
+                &angles,
+                &vel,
+                imu_upright(),
+                0.4,
+                0b11,
+                [0.0; 2],
+                false,
+                true, // walk_enabled
+                0,
+                false,
+                gains(),
+            );
+            telem
+        };
+        assert!(
+            standing.foot_margin_m < 0.0,
+            "stationary disturbance must still breach the support footprint"
+        );
+        assert!(
+            walking.foot_margin_m > standing.foot_margin_m + 0.10_f32,
+            "steady walking must be capturable with the next-step region: {} vs {}",
+            walking.foot_margin_m,
+            standing.foot_margin_m
+        );
+    }
+
+    #[test]
+    fn default_h_com_matches_fk_sole_to_com_height_at_nominal_crouch() {
+        // P2 golden test: the configurable balance height must agree with the
+        // bundled URDF mass table / shared FK, not the IK hip height.
+        use crate::com_fk::compute_state;
+        use crate::uvc::{LegGeometry, solve_leg_ik};
+        use rk_proto::WalkCmd;
+
+        let geom = LegGeometry::rocky_mk1();
+        let crouch = WalkCmd::default().stance_crouch.clamp(0.0_f32, 1.0_f32);
+        let hip_h = (geom.nominal_height
+            - crouch * (geom.nominal_height - geom.min_height) * 0.45_f32)
+            .clamp(geom.min_height, geom.nominal_height);
+        let left = solve_leg_ik(0.0_f32, 0.0_f32, hip_h, 0.0_f32, true, &geom);
+        let right = solve_leg_ik(0.0_f32, 0.0_f32, hip_h, 0.0_f32, false, &geom);
+        let mut angles = [0.0_f32; MAX_JOINTS];
+        angles[9..15].copy_from_slice(&[
+            left.hip_yaw,
+            left.hip_roll,
+            left.hip_pitch,
+            left.knee_pitch,
+            left.ankle_pitch,
+            left.ankle_roll,
+        ]);
+        angles[15..21].copy_from_slice(&[
+            right.hip_yaw,
+            right.hip_roll,
+            right.hip_pitch,
+            right.knee_pitch,
+            right.ankle_pitch,
+            right.ankle_roll,
+        ]);
+        let fk = compute_state(&angles, &[0.0_f32; MAX_JOINTS]);
+        let sole_y = 0.5_f32 * (fk.left_foot[1] + fk.right_foot[1]);
+        let sole_to_com_m = fk.com[1] - sole_y;
+        eprintln!(
+            "FK golden: hip_h={hip_h:.4} sole_y={sole_y:.4} com_y={:.4} height={sole_to_com_m:.4}",
+            fk.com[1]
+        );
+        assert!(
+            (BalanceGains::default().h_com_m - sole_to_com_m).abs() < 0.03_f32,
+            "default h_com_m {} must match FK sole-to-CoM {:.4} m within 0.03 m",
+            BalanceGains::default().h_com_m,
+            sole_to_com_m
+        );
     }
 }

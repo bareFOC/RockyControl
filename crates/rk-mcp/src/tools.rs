@@ -343,6 +343,7 @@ impl<'a, H: McpHost> RockyMcpTools<'a, H> {
                 "dcm_step_gain": g.dcm_step_gain,
                 "foot_half_length_m": g.foot_half_length_m,
                 "foot_margin_m": g.foot_margin_m,
+                "h_com_m": g.h_com_m,
                 "ukemi_tilt_rad": g.ukemi_tilt_rad,
                 "ukemi_torque_scale": g.ukemi_torque_scale,
                 "compliance_scale": g.compliance_scale,
@@ -762,7 +763,7 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
             "balance_get_gains" => self.ok_json(name, "read", self.balance_json()),
             "balance_set_gains" => {
                 let mut g = self.host.model().balance_gains;
-                let updates: [(&str, f32, f32, &mut f32); 13] = [
+                let updates: [(&str, f32, f32, &mut f32); 14] = [
                     ("uvc_gain_pitch", 0.0, 1.5, &mut g.uvc_gain_pitch),
                     ("uvc_gain_roll", 0.0, 1.5, &mut g.uvc_gain_roll),
                     ("tilt_deadband_rad", 0.005, 0.15, &mut g.tilt_deadband_rad),
@@ -773,6 +774,7 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
                     ("dcm_step_gain", 0.0, 1.5, &mut g.dcm_step_gain),
                     ("foot_half_length_m", 0.015, 0.12, &mut g.foot_half_length_m),
                     ("foot_margin_m", 0.010, 0.12, &mut g.foot_margin_m),
+                    ("h_com_m", 0.12, 0.80, &mut g.h_com_m),
                     ("ukemi_tilt_rad", 0.25, 1.20, &mut g.ukemi_tilt_rad),
                     ("ukemi_torque_scale", 0.05, 0.50, &mut g.ukemi_torque_scale),
                     ("compliance_scale", 0.10, 1.0, &mut g.compliance_scale),

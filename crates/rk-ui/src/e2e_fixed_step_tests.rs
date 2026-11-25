@@ -84,16 +84,44 @@ fn e2e_fixed_step_walking_translates_with_alternating_contacts() {
     app.model.set_authority_mode(ControlMode::Drive);
 
     let mut start_z = None;
-    let mut prev_mask: Option<u8> = None;
+    let mut start_x = None;
+    let mut speed_sum = 0.0_f32;
+    let mut peak_tilt_rad = 0.0_f32;
+    let mut recent_tilt = [0.0_f32; 200]; // trailing 1 s at 5 ms/tick
+    let mut com_height_min = f32::INFINITY;
+    let mut com_height_max = f32::NEG_INFINITY;
+    let mut lateral_drift = 0.0_f32;
+    // The corrected plant publishes genuine double-support frames, so a strict
+    // `0b01 -> 0b10` mask transition misses most step swaps. Track the sole
+    // carrying the larger GRF instead — this mirrors rk-sim's plant-derived
+    // `WalkQuality.contact_swap_count` and keeps the alternation intent.
+    let mut dominant_foot: Option<u8> = None;
     let mut swaps = 0_u32;
     let mut contact_ticks = [0_u32; 2];
-    let mut last = rk_proto::McuToHost::default();
+    let mut worst_grf_deviation = 0.0_f32;
+    let mut steady_flight_ticks = 0_u32;
+    let mut max_current_ma = 0_u16;
+    let body_weight = (app.model.walk_cmd.running.mass_kg * 9.81_f32).max(1.0e-3_f32);
+    // 250 ticks = 1.25 s at 200 Hz. Gait ramp-up/contact settling lasts
+    // ~1.05 s; with the P4 toe-off/heel-strike dwell only the pre-control plant
+    // tick 1 is airborne, so the steady-state no-flight assertion excludes it.
+    const STARTUP_TICKS: usize = 250;
 
-    for _ in 0..WALK_TICKS {
+    let mut last = rk_proto::McuToHost::default();
+    for tick in 1..=WALK_TICKS {
         let telem = step(&mut app);
         if start_z.is_none() {
             start_z = Some(telem.balance.world_pos_m[2]);
+            start_x = Some(telem.balance.world_pos_m[0]);
         }
+        speed_sum += telem.balance.world_vel_m_s[2];
+        let tilt = peak_tilt(&telem);
+        peak_tilt_rad = peak_tilt_rad.max(tilt);
+        recent_tilt[tick % recent_tilt.len()] = tilt;
+        com_height_min = com_height_min.min(telem.balance.world_pos_m[1]);
+        com_height_max = com_height_max.max(telem.balance.world_pos_m[1]);
+        lateral_drift = lateral_drift
+            .max((telem.balance.world_pos_m[0] - start_x.expect("start x")).abs());
         last = telem;
         assert_eq!(
             app.recovery_state,
@@ -104,6 +132,7 @@ fn e2e_fixed_step_walking_translates_with_alternating_contacts() {
             !last.faults.contains(FaultFlags::TILT_FALL_CUTOFF),
             "walking must stay below the fall cutoff"
         );
+        max_current_ma = max_current_ma.max(last.current_ma.iter().copied().max().unwrap_or(0));
 
         // Contacts are plant-derived and published with the GRF validity bit;
         // never consume them unconditionally (hardware v1 leaves GRF clear).
@@ -115,12 +144,38 @@ fn e2e_fixed_step_walking_translates_with_alternating_contacts() {
             if mask & 0b10 != 0 {
                 contact_ticks[1] += 1;
             }
-            if let Some(prev) = prev_mask {
-                if (prev == 0b01 && mask == 0b10) || (prev == 0b10 && mask == 0b01) {
-                    swaps += 1;
+            let right = last.estimator.grf_right_n;
+            let left = last.estimator.grf_left_n;
+            let loaded = if right > 1.0e-3_f32 && left > 1.0e-3_f32 {
+                Some(if right >= left { 0 } else { 1 })
+            } else if right > 1.0e-3_f32 {
+                Some(0)
+            } else if left > 1.0e-3_f32 {
+                Some(1)
+            } else {
+                None
+            };
+            if let Some(foot) = loaded {
+                if let Some(prev) = dominant_foot {
+                    if prev != foot {
+                        swaps += 1;
+                    }
                 }
+                dominant_foot = Some(foot);
+                if mask.count_ones() == 1 {
+                    let grf = if foot == 0 { right } else { left };
+                    worst_grf_deviation = worst_grf_deviation.max((grf / body_weight - 1.0).abs());
+                }
+            } else if tick > STARTUP_TICKS
+                && last.estimator.valid_mask & estimator_valid::GRF != 0
+                && right <= 0.0_f32
+                && left <= 0.0_f32
+            {
+                // Real flight is defined by zero ground reaction, not by the
+                // reported contact mask: the kernel may publish a brief 0b00
+                // while the plant still carries load (one-tick sensing delay).
+                steady_flight_ticks += 1;
             }
-            prev_mask = Some(mask);
         }
     }
 
@@ -151,6 +206,54 @@ fn e2e_fixed_step_walking_translates_with_alternating_contacts() {
     assert!(
         last.balance.world_vel_m_s[2] > 0.0,
         "achieved speed must be forward"
+    );
+
+    // P1 plant-quality assertions mirrored from rk-sim's walking test: with
+    // GRF normalized, single support carries the full body weight, steady
+    // walking never goes airborne, and current stays below the advisory.
+    assert!(
+        worst_grf_deviation < 0.15_f32,
+        "single-support GRF deviated {:.3} from body weight (>{:0.3})",
+        worst_grf_deviation,
+        0.15_f32
+    );
+    // The app sees the sensed GRF one control tick after the plant; a single
+    // stale zero-GRF frame is therefore expected. Real plant flight is asserted
+    // to be zero in rk-sim's walking test (`ground_reaction_total_n`).
+    assert!(
+        steady_flight_ticks <= 1,
+        "steady walking must not go airborne, got {steady_flight_ticks} ticks"
+    );
+    assert!(
+        !last.faults.contains(FaultFlags::OVER_CURRENT) && max_current_ma < 1950,
+        "walking must stay below the 1950 mA advisory, peak {max_current_ma} mA"
+    );
+
+    // Final P4 acceptance through the exact app-level call path (including the
+    // host packet builder and telemetry ingestion), not just the sim harness.
+    let mean_speed = speed_sum / WALK_TICKS as f32;
+    let steady_tilt = recent_tilt.iter().copied().fold(0.0_f32, f32::max);
+    eprintln!(
+        "ui walk: speed={mean_speed:.3} peak_tilt={peak_tilt_rad:.3} steady_tilt={steady_tilt:.3} \
+         drift={lateral_drift:.3} com={com_height_min:.3}..{com_height_max:.3} peak_ma={max_current_ma}"
+    );
+    const COMMAND_M_S: f32 = 0.5_f32 * 0.5_f32;
+    assert!(
+        (mean_speed - COMMAND_M_S).abs() <= 0.10_f32 * COMMAND_M_S,
+        "UI mean speed {mean_speed:.3} outside ±10% of {COMMAND_M_S:.3}"
+    );
+    assert!(
+        peak_tilt_rad < 0.08_f32 && steady_tilt < 0.03_f32,
+        "UI peak/steady tilt {peak_tilt_rad:.3}/{steady_tilt:.3} exceeds 0.08/0.03"
+    );
+    assert!(
+        lateral_drift < 0.03_f32,
+        "UI lateral drift {lateral_drift:.3} exceeds 0.03 m"
+    );
+    assert!(
+        (com_height_min - 0.72_f32).abs() <= 0.03_f32
+            && (com_height_max - 0.72_f32).abs() <= 0.03_f32,
+        "UI CoM height {com_height_min:.3}..{com_height_max:.3} outside 0.72 ± 0.03"
     );
 }
 

@@ -1521,8 +1521,11 @@ mod native_mcp_bridge_tests {
         app.attach_mcp_bridge(rx);
 
         // `submit` blocks on the oneshot reply, so enqueue from a worker thread.
+        // The worker signals once submit has returned; pump repeatedly until
+        // then because the worker may not enqueue before the first pump runs.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
-            tx.submit(
+            let reply = tx.submit(
                 json!({
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -1530,11 +1533,18 @@ mod native_mcp_bridge_tests {
                     "params": {},
                 }),
                 Duration::from_secs(5),
-            )
+            );
+            let _ = done_tx.send(());
+            reply
         });
 
-        // One pump drains the queue, dispatches against the live app, and replies.
-        app.pump_mcp_bridge(&Context::default());
+        for _ in 0..1000 {
+            if done_rx.try_recv().is_ok() {
+                break;
+            }
+            app.pump_mcp_bridge(&Context::default());
+            thread::sleep(Duration::from_millis(2));
+        }
 
         let reply = worker
             .join()

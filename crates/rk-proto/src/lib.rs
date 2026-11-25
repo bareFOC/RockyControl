@@ -81,6 +81,10 @@ pub mod estimator_valid {
     /// Hardware that has no world estimate leaves it clear; the viewport then keeps
     /// the robot at the origin instead of snapping to an unmeasured position.
     pub const WORLD: u32 = 1 << 8;
+    /// Sensed contact/GRF channels on `RawServoFeedback` are live. When clear the
+    /// kernel falls back to the UVC gait-phase-derived support mask and reports
+    /// no GRF, so hardware without a contact sensor stays bit-identical.
+    pub const CONTACT_SENSED: u32 = 1 << 9;
 }
 
 #[repr(u8)]
@@ -410,7 +414,8 @@ pub struct BalanceGains {
     pub foot_margin_m: f32,
     /// Fixed CoM height above the support sole in meters for the LIPM natural
     /// frequency `omega = sqrt(g / h_com_m)` and the kinematic ZMP estimate.
-    /// Independent of UVC's IK `hip_height_m` (~0.62 m); default `0.25` m.
+    /// Independent of UVC's IK `hip_height_m` (~0.62 m); default `0.72` m, the
+    /// mass-weighted FK sole-to-CoM height at nominal stance crouch.
     pub h_com_m: f32,
     /// Ukemi pre-fall torque relaxation threshold in radians (default ~32 deg = `0.56` rad < `fall_cutoff_rad`).
     pub ukemi_tilt_rad: f32,
@@ -433,7 +438,7 @@ impl Default for BalanceGains {
             dcm_step_gain: 0.65,
             foot_half_length_m: 0.035,
             foot_margin_m: 0.028,
-            h_com_m: 0.25,
+            h_com_m: 0.72,
             ukemi_tilt_rad: 0.56,
             ukemi_torque_scale: 0.15,
             compliance_scale: 1.0,
@@ -1396,7 +1401,7 @@ mod tests {
         let n = encode_cobs(&ok, &mut wire).expect("encode").len();
         let decoded = decode_host_cobs(&mut wire[..n]).expect("decode");
         match decoded.config {
-            ConfigCmd::SetBalanceGains(g) => assert_eq!(g.h_com_m, 0.25),
+            ConfigCmd::SetBalanceGains(g) => assert_eq!(g.h_com_m, 0.72),
             _ => panic!("expected SetBalanceGains"),
         }
     }

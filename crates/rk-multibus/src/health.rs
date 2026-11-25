@@ -51,6 +51,9 @@ impl MultibusBusTracker {
                 },
                 i3c_timeout_count: 0,
                 imu_source_mask: 0,
+                contact_mask: 0,
+                grf_n: [0.0; 2],
+                contact_valid_mask: 0,
             },
         }
     }

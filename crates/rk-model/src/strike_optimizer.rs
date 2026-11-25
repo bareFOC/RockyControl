@@ -83,7 +83,8 @@ pub struct StrikeParams {
     pub joint_inertia_kg_m2: f32,
     /// Whole-robot mass used to turn contact impulse into CoM recoil.
     pub total_mass_kg: f32,
-    /// CoM height used for `ω = √(g/h)` (match the shared estimator's 0.48 m).
+    /// CoM height used for `ω = √(g/h)` (match the shared estimator default,
+    /// 0.72 m, the FK sole-to-CoM height at nominal stance crouch).
     pub com_height_m: f32,
     /// Half-width of the usable support region (foot margin, metres).
     pub support_margin_m: f32,
@@ -108,7 +109,7 @@ impl StrikeParams {
             distal_mass_kg: 0.20,
             joint_inertia_kg_m2: 0.002,
             total_mass_kg: 1.5,
-            com_height_m: 0.48,
+            com_height_m: 0.72,
             support_margin_m: 0.028,
             restitution: 0.1,
             max_joint_velocity_rad_s: 6.0,
