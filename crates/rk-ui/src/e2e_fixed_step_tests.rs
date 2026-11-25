@@ -14,8 +14,12 @@
 
 use std::sync::Mutex;
 
+use rk_mcp::McpHost;
 use rk_model::StudioModel;
-use rk_proto::{ControlMode, FaultFlags, WalkCmd, estimator_valid, uvc_phase};
+use rk_proto::{
+    ControlMode, FallOrientation, FaultFlags, HostToMcu, JointCommandMode, MAX_JOINTS,
+    RunningConfig, WalkCmd, estimator_valid, uvc_phase,
+};
 
 use super::{CONTROL_STEP_SEC, NoopSaver, RecoveryState, RockyStudioApp};
 
@@ -65,6 +69,49 @@ fn arm_drive_with_balance(app: &mut RockyStudioApp) {
 
 fn peak_tilt(telem: &rk_proto::McuToHost) -> f32 {
     telem.imu.pitch_rad.abs().max(telem.imu.roll_rad.abs())
+}
+
+/// `running_packet` with an explicit per-joint torque ceiling (keeps the
+/// current-limited plant out of the over-current latch during running/CBF tests).
+fn running_packet_limited(app: &RockyStudioApp, seq: u32, cfg: RunningConfig, limit: f32) -> HostToMcu {
+    let mut pkt = running_packet(app, seq, cfg);
+    pkt.torque_limit_nm = [limit; MAX_JOINTS];
+    pkt
+}
+
+/// One fixed tick driven by an explicit typed packet (rather than the model's
+/// packet builder). This is the same `step_fixed` call ordering as `step()` but
+/// lets a scenario set the running gate/gains on the wire exactly as the MCU
+/// receives them.
+fn step_packet(app: &mut RockyStudioApp, pkt: HostToMcu) -> rk_proto::McuToHost {
+    let telem = app
+        .transport
+        .step_fixed(1, &pkt, FRAME_DT)
+        .expect("sim transport always returns a frame");
+    app.model.ingest_telemetry(telem.clone());
+    app.update_fall_watcher(FRAME_DT);
+    telem
+}
+
+/// Torque-mode Drive packet with the running/SLIP gate wired to `cfg`.
+fn running_packet(app: &RockyStudioApp, seq: u32, cfg: RunningConfig) -> HostToMcu {
+    let dof = app.model.rig.joints.len().min(MAX_JOINTS);
+    HostToMcu {
+        seq,
+        mode: ControlMode::Drive,
+        torque_mask: (1_u32 << dof) - 1,
+        speed_limit_pct: 100,
+        target_rad: app.model.rig.default_pose(),
+        command_mode: [JointCommandMode::Torque.to_wire(); MAX_JOINTS],
+        torque_limit_nm: [1.8; MAX_JOINTS],
+        walk: WalkCmd {
+            balance_enabled: false,
+            walk_enabled: false,
+            running: cfg,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 /// The app must translate the plant forward through `step_fixed`, with the
@@ -233,10 +280,6 @@ fn e2e_fixed_step_walking_translates_with_alternating_contacts() {
     // host packet builder and telemetry ingestion), not just the sim harness.
     let mean_speed = speed_sum / WALK_TICKS as f32;
     let steady_tilt = recent_tilt.iter().copied().fold(0.0_f32, f32::max);
-    eprintln!(
-        "ui walk: speed={mean_speed:.3} peak_tilt={peak_tilt_rad:.3} steady_tilt={steady_tilt:.3} \
-         drift={lateral_drift:.3} com={com_height_min:.3}..{com_height_max:.3} peak_ma={max_current_ma}"
-    );
     const COMMAND_M_S: f32 = 0.5_f32 * 0.5_f32;
     assert!(
         (mean_speed - COMMAND_M_S).abs() <= 0.10_f32 * COMMAND_M_S,
@@ -365,4 +408,344 @@ fn e2e_fixed_step_shove_recovers_upright() {
         last.imu.roll_rad
     );
     assert!(!app.fall_event_active);
+}
+
+/// A shove applied through `step_fixed` must produce a genuine joint-current
+/// spike that the kernel's impact stage reports on the IMPACT telemetry
+/// channel, without tripping fall handling at a moderate magnitude.
+#[test]
+fn e2e_fixed_step_impact_detector_through_app() {
+    let _guard = E2E_HARNESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = fresh_app();
+    arm_drive_with_balance(&mut app);
+    for _ in 0..DRIVE_WARMUP_TICKS {
+        step(&mut app);
+    }
+    assert_eq!(app.model.latest_telemetry.active_mode, ControlMode::Drive);
+
+    // The shove injects a velocity step on the loaded stance leg so the
+    // Plant's PD controller develops a real current jump — the kernel's impact
+    // observer watches current, not the torso angular impulse itself.
+    app.transport.apply_push_impulse(1.5, -1.05);
+
+    let mut saw_impact = false;
+    let mut peak_magnitude_nm = 0.0_f32;
+    let mut last = rk_proto::McuToHost::default();
+    for tick in 0..SHOVE_RECOVERY_TICKS {
+        let telem = step(&mut app);
+        last = telem;
+        assert_ne!(
+            last.estimator.valid_mask & estimator_valid::IMPACT,
+            0,
+            "impact telemetry must always be marked valid at tick {tick}"
+        );
+        if last.balance.impact_detected {
+            saw_impact = true;
+            peak_magnitude_nm = peak_magnitude_nm.max(last.balance.impact_magnitude_nm);
+        }
+        assert!(
+            !last.faults.contains(FaultFlags::TILT_FALL_CUTOFF),
+            "moderate impact must not latch a fall at tick {tick}"
+        );
+        assert_eq!(app.recovery_state, RecoveryState::Idle);
+        assert!(!app.fall_event_active);
+    }
+    assert!(saw_impact, "shove must trip the kernel impact detector");
+    assert!(
+        peak_magnitude_nm
+            > rk_control::impact::DEFAULT_CURRENT_SPIKE_MA
+                / rk_control::impact::DEFAULT_MA_PER_NM,
+        "impact magnitude {peak_magnitude_nm:.4} N·m must reflect a real current jump"
+    );
+    assert_eq!(last.active_mode, ControlMode::Drive, "impact alone must not abort Drive");
+}
+
+/// Latch a real fall through the plant + watcher, then seed every piece of
+/// operator consent/recovery residue before any clean-state operation.
+fn latch_fall_with_consent(app: &mut RockyStudioApp) {
+    arm_drive_with_balance(app);
+    app.transport.apply_push_impulse(6.0, 0.0);
+    let mut latched = false;
+    for _ in 0..400 {
+        let telem = step(app);
+        if telem.faults.contains(FaultFlags::TILT_FALL_CUTOFF)
+            && app.recovery_state == RecoveryState::FallLatched
+        {
+            latched = true;
+            break;
+        }
+    }
+    assert!(latched, "violent shove must latch a fall");
+    assert!(app.fall_event_active);
+    assert_eq!(app.fall_orientation, FallOrientation::Prone);
+
+    // Residue that a reset/reconnect must never carry into the next run.
+    app.operator_confirmed = true;
+    app.get_up_requested = true;
+    app.fall_dwell_sec = 0.25;
+    app.saved_recovery_gains = Some((app.model.balance_gains, true));
+}
+
+fn assert_fall_state_clean(app: &RockyStudioApp) {
+    assert!(!app.fall_event_active, "stale fall alarm survived reset");
+    assert_eq!(app.fall_orientation, FallOrientation::Unknown);
+    assert_eq!(app.recovery_state, RecoveryState::Idle);
+    assert_eq!(app.fall_dwell_sec, 0.0);
+    assert!(!app.operator_confirmed, "stale consent survived reset");
+    assert!(!app.get_up_requested, "stale Get Up request survived reset");
+    assert!(app.saved_recovery_gains.is_none(), "stale gains survived reset");
+}
+
+/// fall -> MCP `reset_experiment` -> shove: the second shove must behave exactly
+/// like a fresh balanced session, with no stale alarm, consent or recovery.
+#[test]
+fn e2e_experiment_reset_clears_fall_state_before_next_shove() {
+    let _guard = E2E_HARNESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = fresh_app();
+    latch_fall_with_consent(&mut app);
+
+    let message = McpHost::reset_experiment(&mut app).expect("sim reset succeeds");
+    assert!(message.contains("fall/recovery state"));
+    assert_fall_state_clean(&mut app);
+
+    // The pre-reset telemetry frame still carries the fall fault, so open the
+    // safety gate explicitly and let the fresh kernel publish clean telemetry
+    // before re-arming Drive.
+    app.model.reset_estop();
+    for _ in 0..5 {
+        step(&mut app);
+    }
+    assert!(!app.model.latest_telemetry.faults.contains(FaultFlags::TILT_FALL_CUTOFF));
+    arm_drive_with_balance(&mut app);
+    for _ in 0..DRIVE_WARMUP_TICKS {
+        step(&mut app);
+    }
+    assert_eq!(app.model.latest_telemetry.active_mode, ControlMode::Drive);
+
+    app.transport.apply_push_impulse(1.0, -0.7);
+    let mut saw_catch_step = false;
+    for tick in 0..SHOVE_RECOVERY_TICKS {
+        let telem = step(&mut app);
+        assert!(!app.fall_event_active, "post-reset fall alarm at tick {tick}");
+        assert_eq!(app.recovery_state, RecoveryState::Idle, "stale recovery at tick {tick}");
+        assert!(!app.operator_confirmed && !app.get_up_requested);
+        assert!(
+            !telem.faults.contains(FaultFlags::TILT_FALL_CUTOFF),
+            "post-reset shove must not re-latch a fall at tick {tick}"
+        );
+        if telem.balance.uvc_phase == uvc_phase::ACTIVE_CATCH_STEP {
+            saw_catch_step = true;
+        }
+    }
+    assert!(saw_catch_step, "post-reset shove must get a normal UVC catch step");
+    assert_eq!(app.model.latest_telemetry.active_mode, ControlMode::Drive);
+}
+
+/// A transport reconnect builds a fresh session and must clear the same state.
+#[test]
+fn e2e_reconnect_clears_fall_state() {
+    let _guard = E2E_HARNESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = fresh_app();
+    latch_fall_with_consent(&mut app);
+
+    app.connect_active_transport();
+    assert_fall_state_clean(&mut app);
+    assert!(app.connected, "sim reconnect stays connected");
+    // Let the fresh transport publish a frame; no stale alarm may reappear.
+    step(&mut app);
+    assert_fall_state_clean(&mut app);
+
+}
+
+/// The running gate must engage through the app's fixed-step path, publish real
+/// flight detection from the plant's free-fall IMU signature, and clear again
+/// as soon as the gate is disabled on the wire.
+#[test]
+fn e2e_fixed_step_running_gate_engages_and_detects_flight() {
+    let _guard = E2E_HARNESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = fresh_app();
+    let cfg = RunningConfig {
+        enabled: true,
+        hop_height_m: 0.03,
+        ..Default::default()
+    };
+    // Per-joint ceiling keeps the position-servo crouch from drawing rated
+    // current and latching OVER_CURRENT; the SLIP overlay still gets ample
+    // torque for a 3 cm hop.
+    const LIMIT_NM: f32 = 0.3_f32;
+    // Crouch in position mode first so the SLIP spring proxy is compressed.
+    let mut crouch = running_packet_limited(
+        &app,
+        0,
+        RunningConfig {
+            enabled: false,
+            ..cfg
+        },
+        LIMIT_NM,
+    );
+    crouch.command_mode = [JointCommandMode::Position.to_wire(); MAX_JOINTS];
+    for i in [11usize, 12, 13, 17, 18, 19] {
+        crouch.target_rad[i] = match i {
+            12 | 18 => 1.4,
+            _ => -0.7,
+        };
+    }
+    for seq in 1..=80 {
+        crouch.seq = seq;
+        step_packet(&mut app, crouch);
+    }
+
+    const RUN_TICKS: u32 = 300;
+    let mut saw_running = 0_usize;
+    let mut saw_flight = 0_usize;
+    let mut saw_running_valid = 0_usize;
+    let mut max_com = 0.0_f32;
+    let mut min_com = f32::INFINITY;
+    let mut max_current = 0_u16;
+    let mut last = rk_proto::McuToHost::default();
+    for seq in 81..=80 + RUN_TICKS {
+        let pkt = running_packet_limited(&app, seq, cfg, LIMIT_NM);
+        let telem = step_packet(&mut app, pkt);
+        if telem.balance.running_active {
+            saw_running += 1;
+        }
+        if telem.balance.flight_detected {
+            saw_flight += 1;
+        }
+        if telem.estimator.valid_mask & estimator_valid::RUNNING != 0 {
+            saw_running_valid += 1;
+        }
+        max_com = max_com.max(telem.balance.running_com_height_m);
+        min_com = min_com.min(telem.balance.running_com_height_m);
+        max_current = max_current.max(telem.current_ma.iter().copied().max().unwrap_or(0));
+        assert!(
+            !telem.faults.contains(FaultFlags::OVER_CURRENT),
+            "running overlay must respect the torque ceiling at tick {seq}"
+        );
+        last = telem;
+    }
+    assert_eq!(saw_running, RUN_TICKS as usize, "running gate must engage every tick");
+    assert_eq!(
+        saw_running_valid, RUN_TICKS as usize,
+        "running telemetry validity bit must be published with the overlay"
+    );
+    assert!(
+        saw_flight > 0 && saw_flight < RUN_TICKS as usize,
+        "plant flight must be observed by the kernel without latching forever: {saw_flight}/{RUN_TICKS}"
+    );
+    assert!(
+        max_com - min_com > 0.005_f32,
+        "CoM height must vary over the hop: {min_com:.4}..{max_com:.4} m"
+    );
+    assert!(
+        max_current < 1950,
+        "running must stay below the 1950 mA over-current trip, peak {max_current} mA"
+    );
+    assert!(!last.faults.contains(FaultFlags::TILT_FALL_CUTOFF));
+    assert_eq!(last.active_mode, ControlMode::Drive);
+
+    // Disabling the gate on the wire must immediately withdraw the overlay and
+    // its validity bit; no residual running telemetry may be published.
+    let off = RunningConfig {
+        enabled: false,
+        ..cfg
+    };
+    let off_pkt = running_packet_limited(&app, 381, off, LIMIT_NM);
+    let telem = step_packet(&mut app, off_pkt);
+    assert!(!telem.balance.running_active, "disabled gate must clear running_active");
+    assert_eq!(
+        telem.estimator.valid_mask & estimator_valid::RUNNING,
+        0,
+        "disabled gate must clear the RUNNING validity bit"
+    );
+}
+
+/// With the CBF shield enabled, a moderate shove during running must stay
+/// inside the tilt/current envelope and must not latch a fault or a fall for
+/// any kappa. Both kappa settings are checked against the same bounds; no
+/// behavioral *difference* between them is asserted. In the shared torque
+/// plant the SLIP torque is clamped at the host per-joint torque ceiling, so
+/// the shield saturates identically at 0.3 N·m for both kappas here — a delta
+/// assertion would test that clamp, not CBF behavior.
+#[test]
+fn e2e_fixed_step_cbf_running_shove_is_bounded() {
+    let _guard = E2E_HARNESS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    const LIMIT_NM: f32 = 0.3_f32;
+    const SHOVE_TICKS: usize = 220;
+
+    for kappa in [3.0_f32, 100.0_f32] {
+        let mut app = fresh_app();
+        let cfg = RunningConfig {
+            enabled: true,
+            cbf_kappa: kappa,
+            hop_height_m: 0.03,
+            leg_spring_n_m: 150.0,
+            ..Default::default()
+        };
+        // Compress the SLIP spring proxy in position mode under the same
+        // ceiling used for the running ticks (avoids an OVER_CURRENT latch).
+        let mut crouch = running_packet_limited(
+            &app,
+            0,
+            RunningConfig {
+                enabled: false,
+                ..cfg
+            },
+            LIMIT_NM,
+        );
+        crouch.command_mode = [JointCommandMode::Position.to_wire(); MAX_JOINTS];
+        for i in [11usize, 12, 13, 17, 18, 19] {
+            crouch.target_rad[i] = match i {
+                12 | 18 => 1.4,
+                _ => -0.7,
+            };
+        }
+        for seq in 1..=80 {
+            crouch.seq = seq;
+            step_packet(&mut app, crouch);
+        }
+        for seq in 81..=120 {
+            let pkt = running_packet_limited(&app, seq, cfg, LIMIT_NM);
+            step_packet(&mut app, pkt);
+        }
+
+        app.transport.apply_push_impulse(0.7, -0.49);
+        let mut peak_tilt_rad = 0.0_f32;
+        let mut peak_current_ma = 0_u16;
+        let mut running_ticks = 0_usize;
+        let mut valid_ticks = 0_usize;
+        for seq in 121..=120 + SHOVE_TICKS as u32 {
+            let pkt = running_packet_limited(&app, seq, cfg, LIMIT_NM);
+            let telem = step_packet(&mut app, pkt);
+            peak_tilt_rad = peak_tilt_rad.max(peak_tilt(&telem));
+            peak_current_ma = peak_current_ma.max(telem.current_ma.iter().copied().max().unwrap_or(0));
+            if telem.balance.running_active {
+                running_ticks += 1;
+            }
+            if telem.estimator.valid_mask & estimator_valid::RUNNING != 0 {
+                valid_ticks += 1;
+            }
+            assert!(
+                !telem.faults.contains(FaultFlags::TILT_FALL_CUTOFF)
+                    && !telem.faults.contains(FaultFlags::OVER_CURRENT),
+                "kappa={kappa}: moderate running shove must not latch a fault at tick {seq}: {:?}",
+                telem.faults
+            );
+        }
+
+        let cutoff = app.model.balance_gains.fall_cutoff_rad;
+        assert_eq!(running_ticks, SHOVE_TICKS, "kappa={kappa}: overlay must stay engaged");
+        assert_eq!(valid_ticks, SHOVE_TICKS, "kappa={kappa}: RUNNING validity must stay set");
+        assert!(
+            peak_tilt_rad > 0.05_f32 && peak_tilt_rad < cutoff,
+            "kappa={kappa}: shove tilt {peak_tilt_rad:.3} must be visible but below the {cutoff} cutoff"
+        );
+        assert!(
+            peak_current_ma < 1950,
+            "kappa={kappa}: peak current {peak_current_ma} mA exceeds the advisory"
+        );
+        assert!(!app.fall_event_active, "kappa={kappa}: shove must not raise a fall alarm");
+        assert_eq!(app.recovery_state, RecoveryState::Idle);
+        assert_eq!(app.model.latest_telemetry.active_mode, ControlMode::Drive);
+    }
 }

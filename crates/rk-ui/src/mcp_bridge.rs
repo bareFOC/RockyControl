@@ -618,6 +618,9 @@ impl McpHost for RockyStudioApp {
         // channel survive; the transport rebuilds kernel, plant, faults, wire
         // state and recorder from its stored construction inputs.
         self.transport.reset_experiment();
+        // A fresh experiment must not inherit a latched fall, an armed recovery,
+        // saved gains or operator consent from the previous run.
+        self.clear_fall_recovery_state();
         // Clear host command sequencing so scripts feed explicit packets rather
         // than inheriting frame-derived seq values, playback or queued config.
         self.model.reset_experiment_state();
@@ -626,7 +629,7 @@ impl McpHost for RockyStudioApp {
         self.sim_time_sec = 0.0;
         self.sim_control_accum_sec = 0.0;
         self.sim_catchup_cap_hit = false;
-        Ok("Simulation experiment reset: kernel, plant, faults, wire, recorder, host sequencing and UI history are clean.".to_string())
+        Ok("Simulation experiment reset: kernel, plant, faults, wire, recorder, host sequencing, fall/recovery state and UI history are clean.".to_string())
     }
 
     fn record_activity(&mut self, entry: McpActivityEntry) {

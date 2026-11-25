@@ -15,9 +15,10 @@ use rk_control::{
 };
 use rk_multibus::{
     CONTROL_TABLE_SIZE, ControlTableClient, FEEDBACK_BURST_LEN, FEEDBACK_BURST_REG, I2cTransport,
-    JOINT_NODE_BASE, JointFeedback, MAX_I2C_WRITE_FRAME, MAX_SERVO_JOINTS, OperatingMode, PioError,
-    PioI3c, PioI3cBus, REG_GOAL_CURRENT, REG_GOAL_POSITION, REG_GOAL_VELOCITY, REG_OPERATING_MODE,
-    REG_TORQUE_ENABLE, TorqueConstants, joint_node_addr, read_joint_feedback, write_joint_command,
+    JOINT_NODE_BASE, JointFeedback, MAX_I2C_WRITE_FRAME, MAX_SERVO_JOINTS, MultibusBusTracker,
+    OperatingMode, PioError, PioI3c, PioI3cBus, REG_GOAL_CURRENT, REG_GOAL_POSITION,
+    REG_GOAL_VELOCITY, REG_OPERATING_MODE, REG_TORQUE_ENABLE, TorqueConstants, joint_node_addr,
+    read_joint_feedback, write_joint_command,
 };
 use rk_fw_core::control_task::{RobotIo, step_control_tick};
 use rk_fw_core::copper::{ControlTask, ControlTick};
@@ -56,6 +57,11 @@ const RUNNING_MIN_THRUST_N: f32 = -120.0;
 const RUNNING_FLIGHT_DEBOUNCE_S: f32 = 0.012;
 /// Nominal torque used to translate commanded N·m into reported motor current.
 const RUNNING_NOMINAL_TORQUE_NM: f32 = 1.8;
+/// Specific force published by the IMU while the running plant is airborne.
+/// An accelerometer in free fall measures near zero, not the 1 g stance vector.
+/// The small residual keeps the sample finite and below the kernel's SLIP
+/// free-fall threshold (`freefall_fraction * g`, default `0.30 * 9.81`).
+const RUNNING_FREEFALL_SPECIFIC_FORCE_FRACTION: f32 = 0.10;
 
 // --- Ground-plane (world) locomotion plant constants ------------------------
 /// Vertical distance pelvis root -> hip-pitch pivot from `JOINT_KINEMATICS`
@@ -140,12 +146,17 @@ pub struct FootContact {
     pub slip_distance_m: f32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct SimFaultInjection {
     /// Pauses HostToMcu frame delivery so the 100 ms deadman watchdog trips in firmware.
     pub drop_heartbeat: bool,
     /// Per-joint mechanical stall flags (locks motion and spikes current > 2200 mA).
     pub stalled_joints: [bool; MAX_JOINTS],
+    /// Per-joint servo-bus degradation. A degraded node rejects every register
+    /// transaction while the other nodes keep replying, so bus isolation can be
+    /// exercised without taking the whole servo bus down.
+    #[serde(default)]
+    pub degraded_joints: [bool; MAX_JOINTS],
     /// Drops battery bus voltage below 10.5 V to exercise UNDER_VOLTAGE.
     pub voltage_sag: bool,
     /// Injects a servo bus communication error flag.
@@ -215,6 +226,7 @@ impl Default for SimFaultInjection {
         Self {
             drop_heartbeat: false,
             stalled_joints: [false; MAX_JOINTS],
+            degraded_joints: [false; MAX_JOINTS],
             voltage_sag: false,
             servo_bus_error: false,
             external_hand_wave: false,
@@ -273,6 +285,7 @@ pub fn fault_snapshot(faults: &SimFaultInjection) -> SimFaultSnapshot {
     SimFaultSnapshot {
         drop_heartbeat: faults.drop_heartbeat,
         stalled_joints: faults.stalled_joints,
+        degraded_joints: faults.degraded_joints,
         voltage_sag: faults.voltage_sag,
         servo_bus_error: faults.servo_bus_error,
         external_hand_wave: faults.external_hand_wave,
@@ -302,6 +315,7 @@ pub fn faults_from_snapshot(snapshot: &SimFaultSnapshot) -> SimFaultInjection {
     SimFaultInjection {
         drop_heartbeat: snapshot.drop_heartbeat,
         stalled_joints: snapshot.stalled_joints,
+        degraded_joints: snapshot.degraded_joints,
         voltage_sag: snapshot.voltage_sag,
         servo_bus_error: snapshot.servo_bus_error,
         external_hand_wave: snapshot.external_hand_wave,
@@ -377,6 +391,9 @@ pub struct SimMultibusPio {
     /// When set, every transaction fails with [`PioError::Bus`], mirroring the
     /// `servo_bus_error` fault injection used by the rest of the simulator.
     bus_error_injection: bool,
+    /// Per-joint degradation: only these nodes reject transactions. Indexed by
+    /// joint (not I3C address), so joints without servo nodes are simply unused.
+    degraded_joints: [bool; MAX_JOINTS],
 }
 
 /// The bus handle shared by all simulated joints.
@@ -391,12 +408,19 @@ impl SimMultibusPio {
             banks: [[0u8; CONTROL_TABLE_SIZE]; MAX_SERVO_JOINTS],
             latched: [None; MAX_SERVO_JOINTS],
             bus_error_injection: false,
+            degraded_joints: [false; MAX_JOINTS],
         }
     }
 
     /// Enable/disable injected bus failures (no transaction is accepted while on).
     pub fn set_bus_error_injection(&mut self, enabled: bool) {
         self.bus_error_injection = enabled;
+    }
+
+    /// Install the per-joint degradation mask. A degraded node rejects every
+    /// register transaction; every other node keeps replying normally.
+    pub fn set_degraded_joints(&mut self, degraded_joints: [bool; MAX_JOINTS]) {
+        self.degraded_joints = degraded_joints;
     }
 
     fn node_index(address: u8) -> Option<usize> {
@@ -433,6 +457,9 @@ impl PioI3c for SimMultibusPio {
             return Err(PioError::Bus);
         }
         let index = Self::node_index(address).ok_or(PioError::Bus)?;
+        if self.degraded_joints[index] {
+            return Err(PioError::Bus);
+        }
 
         // A pointer-less transaction is the burst half of a read. It must use
         // the pointer latched by the preceding two-byte write and leave that
@@ -491,6 +518,10 @@ pub struct SimulatedServoPlant {
     faults: SimFaultInjection,
     /// In-memory BareFOC register server and its pointer-latching bus.
     multibus: SimPioBus,
+    /// Timeout / degraded accounting shared with firmware (`rk-multibus`).
+    /// One failed burst is recorded per joint per feedback exchange; a joint
+    /// needs three consecutive misses before it is flagged degraded.
+    bus_tracker: MultibusBusTracker,
     /// N·m ↔ A conversion shared with firmware's register mapping.
     torque_constants: TorqueConstants,
     // Deterministic 2-axis stepping-aware LIPM torso dynamics + virtual IMU state
@@ -747,6 +778,7 @@ impl SimulatedServoPlant {
             },
             faults: SimFaultInjection::default(),
             multibus,
+            bus_tracker: MultibusBusTracker::new(joints),
             torque_constants: TorqueConstants::default(),
             torso_pitch_rad: 0.0,
             torso_roll_rad: 0.0,
@@ -802,6 +834,20 @@ impl SimulatedServoPlant {
         &mut self.faults
     }
 
+    /// Shared per-joint bus-health tracker (timeouts and degraded mask).
+    pub fn bus_tracker(&self) -> &MultibusBusTracker {
+        &self.bus_tracker
+    }
+
+    /// Push the current global and per-joint fault knobs into the register
+    /// server. Called before every exchange phase so live `faults_mut()` edits
+    /// take effect on the very next transaction.
+    fn sync_bus_faults(&mut self) {
+        let bus = self.multibus.bus_mut();
+        bus.set_bus_error_injection(self.faults.servo_bus_error);
+        bus.set_degraded_joints(self.faults.degraded_joints);
+    }
+
     /// Rebuild `last_cmd` from the goal registers written over the wire.
     ///
     /// This is the plant's only command input: firmware and simulation both
@@ -809,9 +855,7 @@ impl SimulatedServoPlant {
     /// plant decodes it back through a `ControlTableClient` before integrating.
     /// A failed (injected) transaction leaves that joint's previous goal intact.
     fn harvest_commands(&mut self) {
-        self.multibus
-            .bus_mut()
-            .set_bus_error_injection(self.faults.servo_bus_error);
+        self.sync_bus_faults();
         let mut decoded = self.last_cmd;
         for joint in 0..self.joint_count.min(MAX_SERVO_JOINTS) {
             let Some(node) = joint_node_addr(joint) else {
@@ -1576,6 +1620,17 @@ impl SimulatedServoPlant {
         let roll = self.torso_roll_rad + angle_bias[1];
         let yaw = self.torso_yaw_rad + angle_bias[2];
         let mut gravity = gravity_from_tilt(pitch, roll);
+        // Sensor fidelity: while the running hop plant is airborne there is no
+        // ground reaction, so an accelerometer measures near-zero specific
+        // force instead of the 1 g tilt vector seen in stance. Scaling the
+        // published vector (before bias/noise) lets the kernel's SLIP flight
+        // detector observe the same physical signature the plant simulates;
+        // the plant's own `in_flight()` flag remains unchanged.
+        if self.running_mode && self.running_in_flight {
+            for axis in &mut gravity {
+                *axis *= RUNNING_FREEFALL_SPECIFIC_FORCE_FRACTION;
+            }
+        }
         for axis in 0..AXES {
             gravity[axis] += accel_bias[axis]
                 + self.noise_rng.next_f32() * noise.imu_accel_noise_m_s2.max(0.0_f32);
@@ -1934,9 +1989,7 @@ impl ServoBusPort for SimulatedServoPlant {
         // bank and read it back over the real register-pointer wire encoding.
         let mut feedback = self.step_plant(dt_sec);
         self.publish_feedback(&feedback);
-        self.multibus
-            .bus_mut()
-            .set_bus_error_injection(self.faults.servo_bus_error);
+        self.sync_bus_faults();
         for joint in 0..self.joint_count.min(MAX_SERVO_JOINTS) {
             let Some(node) = joint_node_addr(joint) else {
                 break;
@@ -1944,15 +1997,37 @@ impl ServoBusPort for SimulatedServoPlant {
             let mut client = SimControlClient::new(node, I2cTransport::new(&mut self.multibus));
             // On a bus failure the values computed by `step_plant` remain in
             // place, so IMU/voltage/bus health stay independent of servo I/O.
-            let _ = read_joint_feedback(&mut client, joint, &mut feedback);
+            let reply = read_joint_feedback(&mut client, joint, &mut feedback);
+            drop(client);
+            // One accounting event per joint per exchange, exactly like the
+            // firmware's `exchange_joints`: a failed burst counts as a timeout
+            // for that joint only and never touches the other nodes.
+            if reply.is_ok() {
+                self.bus_tracker.record_reply(
+                    joint,
+                    JointFeedback {
+                        position_rad: feedback.raw_angle_rad[joint],
+                        velocity_rad_s: feedback.velocity_rad_s[joint],
+                        current_amps: feedback.current_ma[joint] as f32 * 0.001_f32,
+                        temperature_c: feedback.temp_c[joint] as f32,
+                    },
+                );
+            } else {
+                self.bus_tracker.record_timeout(joint);
+            }
+        }
+        // Surface the shared tracker's health in feedback. The legacy global
+        // injection remains visible immediately; per-joint degradation becomes
+        // visible once the tracker flags a joint after repeated misses.
+        if self.bus_tracker.degraded_mask() != 0 {
+            feedback.bus_error = true;
+            feedback.i3c_timeout_count = self.bus_tracker.total_timeout_count();
         }
         feedback
     }
 
     fn write_command(&mut self, cmd: &RawServoCommand) {
-        self.multibus
-            .bus_mut()
-            .set_bus_error_injection(self.faults.servo_bus_error);
+        self.sync_bus_faults();
         for joint in 0..self.joint_count.min(MAX_SERVO_JOINTS) {
             let Some(node) = joint_node_addr(joint) else {
                 break;
@@ -2181,6 +2256,10 @@ pub struct SimRobotIo {
     last_recorded_virtual_hand: Option<[f32; MAX_JOINTS]>,
     mcu_model_info: ModelInfo,
     mcu_model_blob: Vec<u8>,
+    /// One-shot deterministic corruption of the next `ReadChunk` response.
+    /// The chunk's advertised `crc32` is left untouched so the host's blob-level
+    /// CRC verification detects the injected wire error and can retry the pull.
+    model_chunk_crc_failure_pending: bool,
     // --- RobotIo backend state ---
     /// Lazily-created Embassy ticker driven by the harness mock clock.
     ticker: Option<Ticker>,
@@ -2226,6 +2305,7 @@ impl SimRobotIo {
             last_recorded_virtual_hand: None,
             mcu_model_info,
             mcu_model_blob,
+            model_chunk_crc_failure_pending: false,
             ticker: None,
             use_mock_clock: false,
             dt_override: None,
@@ -2249,6 +2329,15 @@ impl SimRobotIo {
         self.mcu_model_blob = blob;
     }
 
+    /// Injects a one-shot CRC failure into the next chunked model response.
+    ///
+    /// Only the payload byte is flipped: the advertised whole-blob `crc32` stays
+    /// intact, so a host that verifies the pulled bytes detects the corruption
+    /// exactly as it would for a real MCU-to-host wire error, then retries.
+    pub fn inject_model_chunk_crc_failure(&mut self) {
+        self.model_chunk_crc_failure_pending = true;
+    }
+
     /// Executes a full COBS-framed `ModelRequest` -> `ModelResponse` round-trip against the
     /// simulated MCU flash store, delegating request handling to the shared `FlashModelStore`.
     pub fn exchange_model_request(&mut self, req: ModelRequest) -> Option<ModelResponse> {
@@ -2260,7 +2349,16 @@ impl SimRobotIo {
             self.mcu_model_info,
             &self.mcu_model_blob,
         );
-        let mcu_resp = store.handle_request(mcu_req);
+        let mut mcu_resp = store.handle_request(mcu_req);
+
+        if self.model_chunk_crc_failure_pending {
+            self.model_chunk_crc_failure_pending = false;
+            if let ModelResponse::Chunk(chunk) = &mut mcu_resp {
+                if chunk.len > 0 {
+                    chunk.data[0] ^= 0x01;
+                }
+            }
+        }
 
         let mut resp_wire = [0u8; MAX_MODEL_COBS_FRAME_BYTES];
         let resp_len = encode_model_resp_cobs(&mcu_resp, &mut resp_wire).ok()?.len();
@@ -3079,6 +3177,7 @@ impl CopperSimRunner {
         io.event_tick_index = 0;
         io.last_recorded_faults = None;
         io.last_recorded_virtual_hand = None;
+        io.model_chunk_crc_failure_pending = false;
 
         // Keep the task driven by the same mock clock (no reset, no re-spawn).
         io.use_mock_clock = true;
@@ -3147,7 +3246,7 @@ impl CopperSimRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rk_proto::{ControlMode, FaultFlags, WalkCmd};
+    use rk_proto::{ControlMode, FaultFlags, MODEL_CHUNK_BYTES, WalkCmd, crc32};
     use std::sync::Mutex;
 
     /// `embassy_time::MockDriver` is process-global. Tests that reset the clock
@@ -3605,43 +3704,63 @@ mod tests {
         cmd
     }
 
-    /// Drives one deterministic SLIP hop: seeds a touchdown at `-sqrt(2 g H)` and
-    /// cancels the stance spring with signed thrust so the CoM accelerates at
-    /// `+PUSH_ACCEL` until the target takeoff velocity is reached, then coasts to
-    /// liftoff. This is a validation driver only; the plant stays a pure physics model.
-    fn drive_single_hop(cfg: RunningConfig, ticks: usize) -> (SimulatedServoPlant, usize) {
+    /// One deterministic SLIP-hop driver, shared by every hop validation test.
+    /// Seeds a touchdown at `-sqrt(2 g H)` and cancels the stance spring with
+    /// signed thrust so the CoM accelerates at `+PUSH_ACCEL` until the takeoff
+    /// velocity is reached, then coasts to liftoff. The plant stays a pure
+    /// physics model; only the published IMU sample is observed here.
+    struct HopObservation {
+        plant: SimulatedServoPlant,
+        flight_steps: usize,
+        min_airborne_specific_force_m_s2: f32,
+    }
+
+    fn drive_single_hop_observed(cfg: RunningConfig, ticks: usize) -> HopObservation {
         const PUSH_ACCEL: f32 = 20.0_f32;
         const DT: f32 = 0.001_f32;
         let mut plant = SimulatedServoPlant::new(21, [0.0; MAX_JOINTS]);
         plant.set_running_config(cfg);
-        let takeoff_vel = (2.0 * RUNNING_G_M_S2 * cfg.hop_height_m).sqrt();
+        let takeoff_vel = (2.0_f32 * RUNNING_G_M_S2 * cfg.hop_height_m).sqrt();
         plant.set_running_state(cfg.leg_rest_length_m, -takeoff_vel, false);
 
-        let mut flight_steps = 0usize;
+        let mut flight_steps = 0_usize;
+        let mut min_airborne_specific_force_m_s2 = f32::INFINITY;
         for _ in 0..ticks {
             let h = plant.com_height_m();
             let v = plant.com_velocity_z_m_s();
             let stance = h <= cfg.leg_rest_length_m + 1.0e-4_f32;
             let a_des = if !stance {
-                0.0
+                0.0_f32
             } else if v < takeoff_vel {
                 PUSH_ACCEL
             } else {
-                0.0
+                0.0_f32
             };
             let thrust = if stance {
                 (cfg.mass_kg * (a_des + RUNNING_G_M_S2) - plant.ground_reaction_n())
                     .clamp(RUNNING_MIN_THRUST_N, RUNNING_MAX_THRUST_N)
             } else {
-                0.0
+                0.0_f32
             };
             plant.write_command(&running_thrust_cmd(thrust));
-            let _ = plant.step_plant(DT);
+            let fb = plant.step_plant(DT);
             if plant.in_flight() {
                 flight_steps += 1;
+                let g = fb.imu.gravity;
+                min_airborne_specific_force_m_s2 = min_airborne_specific_force_m_s2
+                    .min((g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt());
             }
         }
-        (plant, flight_steps)
+        HopObservation {
+            plant,
+            flight_steps,
+            min_airborne_specific_force_m_s2,
+        }
+    }
+
+    fn drive_single_hop(cfg: RunningConfig, ticks: usize) -> (SimulatedServoPlant, usize) {
+        let observed = drive_single_hop_observed(cfg, ticks);
+        (observed.plant, observed.flight_steps)
     }
 
     #[test]
@@ -3693,6 +3812,43 @@ mod tests {
             let _ = settled.step_plant(0.005_f32);
         }
         assert!(!settled.in_flight(), "flight must clear at touchdown");
+    }
+
+    /// An airborne accelerometer measures near-zero specific force. This is the
+    /// sensor signature the kernel's SLIP detector needs: a low leg-current sum
+    /// alone is not enough because the kernel also requires `|a_imu| < 0.30 g`.
+    #[test]
+    fn running_flight_publishes_free_fall_specific_force() {
+        const KERNEL_FREEFALL_THRESHOLD_M_S2: f32 = 0.30_f32 * 9.81_f32;
+        let cfg = RunningConfig {
+            enabled: true,
+            hop_height_m: 0.03,
+            ..Default::default()
+        };
+        let observed = drive_single_hop_observed(cfg, 170);
+        assert!(observed.flight_steps > 0, "hop must produce plant-side flight");
+        let min_airborne_force = observed.min_airborne_specific_force_m_s2;
+        assert!(
+            min_airborne_force > 0.0_f32 && min_airborne_force < KERNEL_FREEFALL_THRESHOLD_M_S2,
+            "airborne IMU specific force {min_airborne_force:.3} must be finite and below the kernel's {KERNEL_FREEFALL_THRESHOLD_M_S2:.3} m/s² free-fall gate"
+        );
+
+        // On touchdown the published vector returns to the 1 g stance reading.
+        let zero = running_thrust_cmd(0.0_f32);
+        let mut settled = observed.plant;
+        let mut grounded_force = 0.0_f32;
+        for _ in 0..120 {
+            settled.write_command(&zero);
+            let fb = settled.step_plant(0.005_f32);
+            if !settled.in_flight() {
+                let g = fb.imu.gravity;
+                grounded_force = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+            }
+        }
+        assert!(
+            (grounded_force - RUNNING_G_M_S2).abs() < 0.05_f32,
+            "grounded IMU specific force {grounded_force:.3} must recover to 1 g"
+        );
     }
 
     /// Drops the plant from its apex with zero thrust and records the landing peak.
@@ -4694,6 +4850,7 @@ mod tests {
         let mut faults = SimFaultInjection::default();
         faults.drop_heartbeat = true;
         faults.stalled_joints[7] = true;
+        faults.degraded_joints[3] = true;
         faults.voltage_sag = true;
         faults.servo_bus_error = true;
         faults.external_hand_wave = true;
@@ -4719,6 +4876,67 @@ mod tests {
         let snapshot = fault_snapshot(&faults);
         let restored = faults_from_snapshot(&snapshot);
         assert_eq!(fault_snapshot(&restored), snapshot);
+    }
+
+    /// The portable snapshot default and the simulator default are two separate
+    /// structs; comparing each against its own constant cannot catch drift.
+    /// Convert both ways and require field-by-field equality instead.
+    #[test]
+    fn fault_defaults_match_snapshot_defaults_field_by_field() {
+        let native = SimFaultInjection::default();
+        let snapshot = SimFaultSnapshot::default();
+        assert_eq!(faults_from_snapshot(&snapshot), native);
+        assert_eq!(fault_snapshot(&native), snapshot);
+        assert_eq!(native.servo_lag_factor, 0.20);
+    }
+
+    /// One degraded node must fail its register transactions while its
+    /// neighbours keep replying, with the shared bus tracker isolating it.
+    #[test]
+    fn single_degraded_joint_is_isolated_by_shared_bus_tracker() {
+        let mut plant = SimulatedServoPlant::new(6, [0.0; MAX_JOINTS]);
+        plant.faults_mut().degraded_joints[3] = true;
+        let mut cmd = RawServoCommand::default();
+        cmd.torque_mask = 0b11_1111;
+        for target in cmd.raw_target_rad.iter_mut().take(6) {
+            *target = 0.5_f32;
+        }
+        for _ in 0..20 {
+            plant.write_command(&cmd);
+            let _ = plant.read_feedback(0.01);
+        }
+
+        let tracker = plant.bus_tracker();
+        assert_eq!(tracker.degraded_mask(), 1u32 << 3);
+        assert!(tracker.is_degraded(3));
+        assert_eq!(tracker.total_timeout_count(), 20);
+        assert_eq!(tracker.consecutive_timeouts(3), 20);
+        for joint in [0usize, 1, 2, 4, 5] {
+            assert!(!tracker.is_degraded(joint), "joint {joint} must stay healthy");
+            assert_eq!(tracker.consecutive_timeouts(joint), 0);
+            assert!(
+                tracker.snapshot().raw_angle_rad[joint] > 0.0_f32,
+                "joint {joint} must keep replying"
+            );
+        }
+        assert_eq!(tracker.snapshot().raw_angle_rad[3], 0.0_f32, "no reply from joint 3");
+        assert!(tracker.snapshot().bus_error);
+
+        // Goals never reached the degraded node, so it stayed put while the
+        // healthy joints tracked their commanded pose.
+        let angles = plant.raw_angles();
+        assert!(angles[0] > 0.05_f32 && angles[5] > 0.05_f32);
+        assert!(angles[3].abs() < 1.0e-3_f32, "degraded joint must not move");
+
+        // Removing the fault restores the node and clears its degraded bit
+        // while preserving the cumulative timeout count.
+        plant.faults_mut().degraded_joints[3] = false;
+        plant.write_command(&cmd);
+        let _ = plant.read_feedback(0.01);
+        let tracker = plant.bus_tracker();
+        assert_eq!(tracker.degraded_mask(), 0);
+        assert_eq!(tracker.consecutive_timeouts(3), 0);
+        assert_eq!(tracker.total_timeout_count(), 20);
     }
 
     /// The shove@40 + fault@80 script must replay identically from a clean
@@ -5228,4 +5446,94 @@ mod tests {
         );
         assert_eq!(last.active_mode, ControlMode::Drive);
     }
+
+    /// Pulls a staged MCU model through the shared `FlashModelStore` using the
+    /// exact chunked wire protocol the desktop/browser clients use.
+    fn pull_staged_model(sim: &mut CopperSimRunner, info: ModelInfo) -> Vec<u8> {
+        let mut pulled = Vec::with_capacity(info.total_bytes as usize);
+        while (pulled.len() as u32) < info.total_bytes {
+            let offset = pulled.len() as u32;
+            let response = sim
+                .exchange_model_request(ModelRequest::ReadChunk {
+                    offset,
+                    max_len: MODEL_CHUNK_BYTES as u16,
+                })
+                .expect("chunk response");
+            match response {
+                ModelResponse::Chunk(chunk) => {
+                    assert_eq!(chunk.offset, offset, "chunks must arrive in order");
+                    assert!(chunk.len > 0, "non-final chunk must carry data");
+                    assert_eq!(chunk.total_bytes, info.total_bytes);
+                    assert_eq!(chunk.crc32, info.crc32);
+                    pulled.extend_from_slice(chunk.payload());
+                }
+                other => panic!("expected ModelResponse::Chunk, got {other:?}"),
+            }
+        }
+        pulled
+    }
+
+    /// A staged model must survive a chunked pull with an injected wire CRC
+    /// failure: the first pass is detected as corrupt, and a clean retry yields
+    /// exactly the staged bytes with a matching whole-blob CRC32.
+    #[test]
+    fn staged_mcu_model_chunked_pull_retries_after_crc_failure() {
+        let _guard = HARNESS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sim = CopperSimRunner::new(
+            21,
+            &[JointCalibration::default(); 21],
+            [0.0_f32; MAX_JOINTS],
+        );
+
+        // Multi-chunk, deterministic source blob (distinct from the bundled URDF).
+        let blob: Vec<u8> = (0..720_u32)
+            .map(|i| ((i.wrapping_mul(37).wrapping_add(11)) & 0xff) as u8)
+            .collect();
+        sim.stage_mcu_model("staged_crc_test", ModelFormat::UrdfXml, blob.clone(), 21);
+
+        let info = match sim.exchange_model_request(ModelRequest::GetInfo).expect("info response") {
+            ModelResponse::Info(info) => info,
+            other => panic!("expected ModelResponse::Info, got {other:?}"),
+        };
+        assert_eq!(info.name_str(), "staged_crc_test");
+        assert_eq!(info.total_bytes as usize, blob.len());
+        assert_eq!(info.joint_count, 21);
+        assert_eq!(info.format, ModelFormat::UrdfXml);
+        assert_eq!(info.crc32, crc32(&blob));
+
+        // First pass: flip one payload byte in the second chunk while leaving
+        // the advertised CRC intact, exactly like a real wire bit flip.
+        let mut corrupted = Vec::with_capacity(info.total_bytes as usize);
+        let mut injected = false;
+        while (corrupted.len() as u32) < info.total_bytes {
+            let offset = corrupted.len() as u32;
+            if !injected && offset >= MODEL_CHUNK_BYTES as u32 {
+                sim.inject_model_chunk_crc_failure();
+                injected = true;
+            }
+            match sim
+                .exchange_model_request(ModelRequest::ReadChunk {
+                    offset,
+                    max_len: MODEL_CHUNK_BYTES as u16,
+                })
+                .expect("chunk response")
+            {
+                ModelResponse::Chunk(chunk) => {
+                    assert_eq!(chunk.offset, offset);
+                    corrupted.extend_from_slice(chunk.payload());
+                }
+                other => panic!("expected ModelResponse::Chunk, got {other:?}"),
+            }
+        }
+        assert!(injected, "the pull must span at least two chunks");
+        assert_eq!(corrupted.len(), blob.len());
+        assert_ne!(crc32(&corrupted), info.crc32, "injected error must fail CRC verification");
+        assert_ne!(corrupted, blob, "injected error must change at least one byte");
+
+        // Retry (fresh client buffer, as the UI does after a failed validation).
+        let retried = pull_staged_model(&mut sim, info);
+        assert_eq!(retried, blob, "retry must reproduce the staged bytes exactly");
+        assert_eq!(crc32(&retried), info.crc32);
+    }
+
 }

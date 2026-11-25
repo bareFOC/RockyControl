@@ -1816,4 +1816,710 @@ mod tests {
         .expect("disabled error");
         assert_eq!(resp["error"]["code"], -32000);
     }
+
+    /// Behavior coverage for the tool surfaces that previously had only schema
+    /// coverage (`sim-verification-complete` Phase C). Every case drives a real
+    /// `HeadlessHost` and asserts the simulator/model state actually changed.
+    mod tool_behavior {
+        use super::*;
+        use crate::headless::{AutomationRoots, HeadlessHost};
+        use crate::host::McpPolicy;
+        use crate::test_support::TEST_LOCK;
+
+        fn new_host() -> HeadlessHost {
+            HeadlessHost::new(McpPolicy::default(), AutomationRoots::default())
+        }
+
+        fn call(host: &mut HeadlessHost, id: u64, name: &str, args: Value) -> Value {
+            dispatch_json_rpc(
+                host,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": args}
+                }),
+            )
+            .unwrap_or_else(|| panic!("{name} produced no reply"))
+        }
+
+        /// Unwraps a successful tool result into its JSON payload.
+        fn ok_body(reply: &Value) -> Value {
+            assert!(reply["result"]["isError"].is_null(), "tool failed: {reply}");
+            let text = reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing tool text: {reply}"));
+            serde_json::from_str(text).unwrap_or_else(|e| panic!("tool text is not JSON ({e}): {text}"))
+        }
+
+        fn connect(host: &mut HeadlessHost) {
+            let reply = call(host, 1, "robot_connect", json!({"transport": "sim"}));
+            assert!(reply["result"]["isError"].is_null(), "{reply}");
+            assert!(host.is_connected());
+        }
+
+        fn arm_drive(host: &mut HeadlessHost) {
+            host.set_drive_armed(true);
+            let reply = call(host, 2, "mode_set", json!({"mode": "drive"}));
+            assert!(reply["result"]["isError"].is_null(), "{reply}");
+            assert_eq!(host.model().requested_mode, ControlMode::Drive);
+            // One packet per batch: a single packet held for >100 ms latches the
+            // deadman watchdog, so warm up in sub-deadman batches.
+            for _ in 0..4 {
+                host.step_ticks(19, 0.01);
+            }
+        }
+
+        #[test]
+        fn action_play_and_stop_control_real_playback() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = new_host();
+            connect(&mut host);
+            arm_drive(&mut host);
+
+            let move_idx = host.model().moves.iter().position(|m| m.name == "Get Up Prone").unwrap();
+            let name = host.model().moves[move_idx].name.clone();
+            let body = ok_body(&call(
+                &mut host,
+                3,
+                "action_play",
+                json!({"name": name, "step_ticks": 20}),
+            ));
+            assert_eq!(body["playback"]["name"], name, "{body}");
+            let pb = host.model().playback.as_ref().expect("playback started");
+            assert_eq!(pb.move_idx, move_idx);
+            assert_eq!(host.model().selected_move, move_idx);
+            assert!(pb.progress > 0.0, "stepped ticks must advance the action");
+
+            let body = ok_body(&call(&mut host, 4, "action_stop", json!({})));
+            assert!(body["playback"].is_null(), "{body}");
+            assert!(host.model().playback.is_none(), "action_stop must clear playback");
+            assert!(host.model().status_message.contains("stopped"));
+
+            // Unknown action must fail without disturbing the running playback.
+            let reply = call(&mut host, 5, "action_play", json!({"name": "no_such_action"}));
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+        }
+
+        #[test]
+        fn walk_set_velocity_and_gait_configure_change_locomotion_state() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = new_host();
+            connect(&mut host);
+            arm_drive(&mut host);
+            let before_uptime = host.model().latest_telemetry.uptime_ms;
+
+            let body = ok_body(&call(
+                &mut host,
+                3,
+                "walk_set_velocity",
+                json!({"vx": 0.3, "vy": -0.1, "yaw_rate": 0.15, "walk_enabled": true, "step_ticks": 20}),
+            ));
+            let w = host.model().walk_cmd;
+            assert!((w.vx - 0.3).abs() < 1e-6 && (w.vy + 0.1).abs() < 1e-6);
+            assert!((w.yaw_rate - 0.15).abs() < 1e-6 && w.walk_enabled);
+            assert_eq!(body["balance"]["walk"]["walk_enabled"], true, "{body}");
+            assert!(
+                host.model().latest_telemetry.uptime_ms > before_uptime,
+                "step_ticks must drive the simulation forward"
+            );
+
+            let body = ok_body(&call(
+                &mut host,
+                4,
+                "gait_configure",
+                json!({"step_height": 0.7, "cadence_hz": 1.8, "stance_crouch": 0.4}),
+            ));
+            let w = host.model().walk_cmd;
+            assert!((w.step_height - 0.7).abs() < 1e-6);
+            assert!((w.cadence_hz - 1.8).abs() < 1e-6);
+            assert!((w.stance_crouch - 0.4).abs() < 1e-6);
+            assert!((body["walk"]["cadence_hz"].as_f64().unwrap() - 1.8).abs() < 1e-6, "{body}");
+
+            // Walking is still guarded while Drive is disarmed.
+            host.set_drive_armed(false);
+            let reply = call(&mut host, 5, "walk_set_velocity", json!({"vx": 0.5, "walk_enabled": true}));
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+        }
+
+        #[test]
+        fn telemetry_snapshot_steps_simulation_and_publishes_state() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = new_host();
+            connect(&mut host);
+            let before = host.model().latest_telemetry.uptime_ms;
+
+            let body = ok_body(&call(&mut host, 2, "telemetry_snapshot", json!({"step_ticks": 19})));
+            assert_eq!(body["connected"], true, "{body}");
+            assert_eq!(body["active_mode"], "Teach", "{body}");
+            assert_eq!(body["joints"].as_array().unwrap().len(), host.model().rig.joints.len());
+            assert!(body["imu"]["available"].as_bool().unwrap(), "{body}");
+            assert_ne!(body["estimator"]["valid_mask"].as_u64().unwrap(), 0);
+            assert!(
+                host.model().latest_telemetry.uptime_ms > before,
+                "telemetry_snapshot(step_ticks=19) must advance the sim"
+            );
+
+            // Over-large batches are rejected instead of silently clamped.
+            let reply = call(&mut host, 3, "telemetry_snapshot", json!({"step_ticks": 9999}));
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+        }
+
+        #[test]
+        fn calibration_tools_mutate_and_round_trip_calibration() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = new_host();
+            connect(&mut host);
+
+            let body = ok_body(&call(&mut host, 2, "calibration_get", json!({})));
+            let dof = host.model().rig.joints.len();
+            assert_eq!(body["joints"].as_array().unwrap().len(), dof);
+
+            let body = ok_body(&call(
+                &mut host,
+                3,
+                "calibration_set_joint",
+                json!({"joint": 0, "min_rad": -1.4, "max_rad": 1.4,
+                       "zero_offset_rad": 0.25, "inverted": true}),
+            ));
+            let cal = host.model().calibration[0];
+            assert!((cal.min_rad + 1.4).abs() < 1e-6 && (cal.max_rad - 1.4).abs() < 1e-6);
+            assert!((cal.zero_offset_rad - 0.25).abs() < 1e-6);
+            assert!(cal.inverted);
+            assert_eq!(body["index"], 0, "{body}");
+            assert_eq!(body["calibration"]["inverted"], true, "{body}");
+            assert!((body["calibration"]["zero_offset_rad"].as_f64().unwrap() - 0.25).abs() < 1e-6, "{body}");
+
+            let body = ok_body(&call(&mut host, 4, "calibration_zero_here", json!({"joint": 1})));
+            assert_eq!(body["index"], 1, "{body}");
+            assert_eq!(host.model().target_rad[1], 0.0, "zero-here must zero the joint target");
+
+            let body = ok_body(&call(&mut host, 5, "calibration_export_json", json!({})));
+            let exported = body["calibration_json"].as_str().unwrap();
+            let mut file: Value = serde_json::from_str(exported).unwrap();
+            assert_eq!(file["robot_name"], host.model().rig.robot_name);
+            file["joints"][0]["zero_offset_rad"] = json!(-0.5_f32);
+
+            let body = ok_body(&call(
+                &mut host,
+                6,
+                "calibration_import_json",
+                json!({"json": file.to_string()}),
+            ));
+            assert!((host.model().calibration[0].zero_offset_rad + 0.5).abs() < 1e-6);
+            assert_eq!(body["joints"].as_array().unwrap().len(), dof);
+        }
+
+        #[test]
+        fn robot_presets_urdf_and_mcu_sync_change_model_state() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = new_host();
+            connect(&mut host);
+            let original_name = host.model().rig.robot_name.clone();
+            let original_dof = host.model().rig.joints.len();
+
+            let body = ok_body(&call(&mut host, 2, "robot_list_presets", json!({})));
+            let presets = body["presets"].as_array().unwrap();
+            assert!(presets.iter().any(|p| p["id"] == "rocky_mk1"));
+            assert!(presets.iter().any(|p| p["id"] == "striker_biped"));
+
+            let body = ok_body(&call(&mut host, 3, "robot_load_preset", json!({"preset": "striker_biped"})));
+            assert_ne!(body["robot"]["robot_name"], original_name, "{body}");
+            assert_ne!(host.model().rig.joints.len(), original_dof);
+
+            let bundle = AssetBundle::bundled_rocky();
+            let body = ok_body(&call(
+                &mut host,
+                4,
+                "robot_load_urdf",
+                json!({"name": "agent_robot.urdf", "urdf_xml": bundle.urdf_xml}),
+            ));
+            assert_eq!(host.model().rig.robot_name, original_name, "{body}");
+            assert_eq!(host.model().rig.joints.len(), original_dof);
+
+            // Stage a distinct blob into the simulated MCU and prove the tool
+            // reports the staged model, not a hardcoded default.
+            let blob = b"<robot name=\"staged_for_mcp\"/>".to_vec();
+            let len = blob.len();
+            assert!(host.transport_mut().stage_sim_mcu_model(
+                "staged_for_mcp",
+                rk_proto::ModelFormat::UrdfXml,
+                blob,
+                2,
+            ));
+            let body = ok_body(&call(&mut host, 5, "mcu_sync_model", json!({})));
+            let msg = body["message"].as_str().unwrap();
+            assert!(msg.contains("staged_for_mcp"), "{msg}");
+            assert!(msg.contains(&format!("{len} bytes")), "{msg}");
+            assert!(msg.contains("crc32="), "{msg}");
+
+            // Before connecting, the same tool must fail cleanly.
+            let mut fresh = new_host();
+            let reply = call(&mut fresh, 6, "mcu_sync_model", json!({}));
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+        }
+
+        #[test]
+        fn safety_estop_and_reset_change_authority_and_faults() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = new_host();
+            connect(&mut host);
+            arm_drive(&mut host);
+            let _ = call(
+                &mut host,
+                3,
+                "sim_inject_fault",
+                json!({"drop_heartbeat": true}),
+            );
+            assert!(host.transport().sim_faults().unwrap().drop_heartbeat);
+
+            let body = ok_body(&call(&mut host, 4, "safety_estop", json!({})));
+            assert_eq!(body["estop_active"], true, "{body}");
+            assert!(host.model().is_estop_active());
+            assert!(!host.policy().drive_armed, "E-Stop must disarm Agent Drive");
+
+            let body = ok_body(&call(&mut host, 5, "safety_reset_estop", json!({})));
+            assert_eq!(body["estop_active"], false, "{body}");
+            assert_eq!(body["requested_mode"], "Teach", "{body}");
+            assert!(!host.model().is_estop_active());
+            assert_eq!(host.model().requested_mode, ControlMode::Teach);
+            assert!(!host.policy().drive_armed, "reset must not re-arm Drive");
+            assert!(!host.transport().sim_faults().unwrap().drop_heartbeat);
+
+            let reply = call(&mut host, 6, "mode_set", json!({"mode": "drive"}));
+            assert_eq!(reply["result"]["isError"], true, "Drive stays guarded after reset");
+        }
+
+        #[test]
+        fn limb_solve_ik_reposes_the_selected_limb() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = new_host();
+            connect(&mut host);
+            arm_drive(&mut host);
+
+            // Plant an active action and a different selected joint first: the
+            // IK tool applies its solved pose through `apply_joint_angle`, which
+            // must abort playback and leave the last applied joint selected.
+            let play = ok_body(&call(&mut host, 2, "action_play", json!({"name": "Get Up Prone"})));
+            assert!(!play["playback"].is_null(), "{play}");
+            host.model_mut().selected_joint = 0;
+
+            let before = host.model().target_rad;
+            let foot = host.model().rig.compute_link_transforms(&before)
+                .get("l_foot").expect("l_foot link").translation.vector;
+            let goal = [foot.x + 0.08, foot.y + 0.06, foot.z + 0.10];
+
+            let body = ok_body(&call(
+                &mut host,
+                3,
+                "limb_solve_ik",
+                json!({"link_name": "l_foot", "x": goal[0], "y": goal[1], "z": goal[2]}),
+            ));
+            assert_eq!(body["link_name"], "l_foot", "{body}");
+            let target = body["target"].as_array().unwrap();
+            for (got, want) in target.iter().zip(goal) {
+                assert!((got.as_f64().unwrap() as f32 - want).abs() < 1e-6, "{body}");
+            }
+            assert!(body["telemetry"]["joints"].as_array().unwrap().len() >= 21, "{body}");
+            // Observable proof that the solved pose was applied to every joint.
+            assert!(host.model().playback.is_none(), "IK application must abort playback");
+            assert_eq!(
+                host.model().selected_joint,
+                host.model().rig.joints.len() - 1,
+                "IK must apply the solved pose to every joint"
+            );
+
+            let reply = call(&mut host, 4, "limb_solve_ik", json!({"link_name": "not_a_link", "x": 0.0, "y": 0.0, "z": 0.0}));
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+        }
+
+        #[test]
+        fn joint_targets_move_the_simulated_servos() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut host = new_host();
+            connect(&mut host);
+            let measured_before = host.model().latest_telemetry.measured_rad[0];
+
+            let body = ok_body(&call(
+                &mut host,
+                2,
+                "joint_set_target",
+                json!({"joint": 0, "angle_rad": 0.6}),
+            ));
+            assert_eq!(body["index"], 0, "{body}");
+            // In Teach mode build_next_host_packet mirrors measured angles back
+            // into targets, so the durable effect is the moved virtual-hand angle.
+            assert_eq!(host.model().selected_joint, 0);
+            assert!(
+                (host.model().latest_telemetry.measured_rad[0] - measured_before).abs() > 1e-6,
+                "step_fixed after the target must move the measured joint"
+            );
+
+            let body = ok_body(&call(
+                &mut host,
+                3,
+                "joints_set_targets",
+                json!({"units": "deg", "targets": {"l_hip_pitch": 15.0, "1": -8.0}}),
+            ));
+            assert_eq!(body["applied_count"], 2, "{body}");
+            // Give the plant's servo dynamics time to reach the new virtual-hand
+            // angles; each batch carries a fresh packet, below the deadman limit.
+            for _ in 0..6 {
+                host.step_ticks(19, 0.01);
+            }
+            let measured = host.model().latest_telemetry.measured_rad;
+            // "l_hip_pitch" is joint 11; the numeric key "1" is joint 1.
+            assert!((measured[11] - 15.0_f32.to_radians()).abs() < 0.05, "{measured:?}");
+            assert!((measured[1] - (-8.0_f32).to_radians()).abs() < 0.05, "{measured:?}");
+
+            let _ = call(&mut host, 4, "safety_estop", json!({}));
+            let reply = call(&mut host, 5, "joint_set_target", json!({"joint": 0, "angle_rad": 0.1}));
+            assert_eq!(reply["result"]["isError"], true, "joint motion is blocked by E-Stop");
+        }
+    }
+
+    /// Acceptance evidence for `sim-verification-complete` (Phase A).
+    ///
+    /// The committed scripts are loaded from disk through the *same confined-file
+    /// `run_experiment` path* the native MCP CLI exposes, and each is re-run
+    /// through the shared `CopperSimRunner` so the recorded `WalkQuality` can be
+    /// asserted. The golden `.copper` log is replayed through the shared
+    /// `ControlTask` independently.
+    mod acceptance_experiments {
+        use super::*;
+        use crate::headless::{AutomationRoots, HeadlessHost};
+        use crate::host::McpPolicy;
+        use crate::test_support::TEST_LOCK;
+        use rk_fw_core::replay::{
+            CopperReplayLog, SimEventKind, TimedSimEvent, verify_deterministic_replay,
+        };
+        use rk_model::StudioModel;
+        use rk_proto::{BalanceGains, ConfigCmd, ControlMode, FaultFlags, HostToMcu, WalkCmd};
+        use rk_sim::{
+            CopperSimRunner, ExperimentScript, SimFaultInjection, WalkQuality, fault_snapshot,
+            scripted_walk_packet,
+        };
+        use std::path::{Path, PathBuf};
+
+        const NOMINAL_TICKS: usize = 800;
+        const SHOVE_TICKS: usize = 800;
+        const FALL_TICKS: usize = 400;
+        const COMMAND_M_S: f32 = 0.5_f32 * 0.5_f32;
+
+        fn fixtures_dir() -> PathBuf {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/experiments")
+        }
+
+        fn load_script(name: &str) -> ExperimentScript {
+            let path = fixtures_dir().join(name);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+        }
+
+        /// Mirrors `McpHost::run_experiment`: the same host inputs, the same shared
+        /// runner, and therefore the same `WalkQuality` the MCP tool observed.
+        fn run_for_quality(script: &ExperimentScript) -> (WalkQuality, CopperReplayLog) {
+            let model = StudioModel::new_default();
+            let mut runner = CopperSimRunner::new(
+                model.rig.joints.len().max(1),
+                &model.calibration,
+                model.rig.default_pose(),
+            );
+            let log = runner.run_script(script);
+            (runner.last_walk_quality(), log)
+        }
+
+        fn call_run_experiment(host: &mut HeadlessHost, id: u64, name: &str) -> serde_json::Value {
+            let reply = dispatch_json_rpc(
+                host,
+                json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "run_experiment", "arguments": {"file_path": name}}
+                }),
+            )
+            .expect("run_experiment reply");
+            assert!(reply["result"]["isError"].is_null(), "{reply}");
+            let body: serde_json::Value = serde_json::from_str(
+                reply["result"]["content"][0]["text"].as_str().expect("tool text"),
+            )
+            .expect("tool JSON");
+            body
+        }
+
+        fn assert_exact(body: &serde_json::Value, ticks: usize) {
+            assert_eq!(body["exact_match"], true, "{body}");
+            assert_eq!(body["total_ticks"], ticks, "{body}");
+            assert_eq!(body["matched_ticks"], ticks, "{body}");
+        }
+
+        fn assert_walking_bounds(label: &str, quality: &WalkQuality, log: &CopperReplayLog) {
+            let faults = log.ticks.last().expect("script ticks").tx_telem.faults;
+            assert!(
+                !faults.contains(FaultFlags::TILT_FALL_CUTOFF)
+                    && !faults.contains(FaultFlags::OVER_CURRENT)
+                    && !faults.contains(FaultFlags::WATCHDOG_TIMEOUT),
+                "{label} latched faults: {faults:?}"
+            );
+            assert!(
+                (quality.mean_forward_speed_m_s - COMMAND_M_S).abs() <= 0.10 * COMMAND_M_S,
+                "{label} speed {:.3} m/s outside ±10% of {COMMAND_M_S:.3}",
+                quality.mean_forward_speed_m_s
+            );
+            assert!(
+                (quality.single_support_grf_ratio - 1.0).abs() < 0.15,
+                "{label} single-support GRF ratio {:.3} outside ±15%",
+                quality.single_support_grf_ratio
+            );
+            assert!(
+                quality.flight_ticks <= 1,
+                "{label} went airborne on {} ticks",
+                quality.flight_ticks
+            );
+            assert!(quality.max_current_ma < 1950, "{label} peak current too high");
+            assert!(
+                quality.margin_negative_fraction < 0.30,
+                "{label} capturability margin negative on {:.3} of ticks",
+                quality.margin_negative_fraction
+            );
+            assert!(quality.contact_swap_count > 0, "{label} never swapped support foot");
+            assert!(
+                (quality.com_height_min_m - 0.72).abs() <= 0.03
+                    && (quality.com_height_max_m - 0.72).abs() <= 0.03,
+                "{label} CoM height {:.3}..{:.3} outside 0.72 ± 0.03",
+                quality.com_height_min_m,
+                quality.com_height_max_m
+            );
+        }
+
+        #[test]
+        fn committed_scripts_replay_exactly_and_meet_quality_bounds() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let read_root = std::fs::canonicalize(fixtures_dir()).expect("fixtures directory");
+            let mut host = HeadlessHost::new(
+                McpPolicy::default(),
+                AutomationRoots {
+                    read_root: Some(read_root),
+                    write_root: None,
+                },
+            );
+
+            for (id, name, ticks) in [
+                (2u64, "walk_nominal.json", NOMINAL_TICKS),
+                (3, "walk_shove.json", SHOVE_TICKS),
+                (4, "fall_recover.json", FALL_TICKS),
+            ] {
+                let script = load_script(name);
+                assert_eq!(script.max_ticks, ticks, "{name} tick count changed");
+                assert_exact(&call_run_experiment(&mut host, id, name), ticks);
+
+                let (quality, log) = run_for_quality(&script);
+                assert_eq!(log.ticks.len(), ticks, "{name} recorded tick count");
+                assert!(
+                    verify_deterministic_replay(&log).exact_match,
+                    "{name} replay must be bit-exact"
+                );
+                eprintln!("{name}: {quality:?}");
+
+                match name {
+                    "walk_nominal.json" => {
+                        assert_walking_bounds(name, &quality, &log);
+                        assert!(quality.peak_tilt_rad < 0.08, "nominal peak tilt");
+                        assert!(quality.steady_tilt_rad < 0.03, "nominal steady tilt");
+                        assert!(quality.lateral_drift_m < 0.03, "nominal lateral drift");
+                        assert!(quality.max_foot_slip_m < 0.05, "nominal foot slip");
+                        assert!(
+                            quality.catch_step_fraction > 0.0 && quality.catch_step_fraction < 0.5,
+                            "nominal catch-step reporting: {}",
+                            quality.catch_step_fraction
+                        );
+                    }
+                    "walk_shove.json" => {
+                        assert_walking_bounds(name, &quality, &log);
+                        assert!(quality.peak_tilt_rad < 0.35, "shoved peak tilt");
+                        assert!(quality.steady_tilt_rad < 0.05, "shoved steady tilt");
+                        assert!(quality.lateral_drift_m < 0.08, "shoved lateral drift");
+                    }
+                    "fall_recover.json" => {
+                        let last = log.ticks.last().expect("script ticks").tx_telem;
+                        assert!(!last.faults.contains(FaultFlags::TILT_FALL_CUTOFF), "{last:?}");
+                        assert!(
+                            last.imu.pitch_rad.abs() < 0.08 && last.imu.roll_rad.abs() < 0.08,
+                            "recovery must end upright: pitch={} roll={}",
+                            last.imu.pitch_rad,
+                            last.imu.roll_rad
+                        );
+                        assert!(quality.mean_forward_speed_m_s.is_finite());
+                        assert!(quality.peak_tilt_rad > 0.5, "script must actually fall");
+                    }
+                    _ => unreachable!("fixture list is closed"),
+                }
+            }
+        }
+
+        #[test]
+        fn golden_copper_log_verifies_bit_exactly() {
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let path = fixtures_dir().join("walk_nominal.copper");
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let log: CopperReplayLog = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+            let check = verify_deterministic_replay(&log);
+            assert!(check.exact_match, "golden log must replay exactly: {check:?}");
+            assert_eq!(check.total_ticks, NOMINAL_TICKS);
+            assert_eq!(check.matched_ticks, NOMINAL_TICKS);
+            assert!(log.events.iter().any(|event| {
+                event.tick_index == 0
+                    && matches!(event.kind, SimEventKind::SetFaults(_))
+            }));
+        }
+
+        fn fault_event(tick: u64, faults: &SimFaultInjection) -> TimedSimEvent {
+            TimedSimEvent {
+                tick_index: tick,
+                kind: SimEventKind::SetFaults(fault_snapshot(faults)),
+            }
+        }
+
+        fn standing_packet(seq: u32, mode: ControlMode, config: ConfigCmd) -> HostToMcu {
+            HostToMcu {
+                seq,
+                mode,
+                torque_mask: (1u32 << 21) - 1,
+                speed_limit_pct: 100,
+                walk: WalkCmd {
+                    walk_enabled: false,
+                    balance_enabled: true,
+                    ..Default::default()
+                },
+                config,
+                ..Default::default()
+            }
+        }
+
+        fn nominal_script() -> ExperimentScript {
+            let nominal = SimFaultInjection::default();
+            ExperimentScript {
+                seed: nominal.seed,
+                events: vec![fault_event(0, &nominal)],
+                packets: (0..NOMINAL_TICKS as u32).map(scripted_walk_packet).collect(),
+                max_ticks: NOMINAL_TICKS,
+            }
+        }
+
+        fn shove_script() -> ExperimentScript {
+            let realistic = SimFaultInjection::realistic_small_humanoid();
+            let mut script = nominal_script();
+            script.seed = realistic.seed;
+            script.events = vec![
+                fault_event(0, &realistic),
+                TimedSimEvent {
+                    tick_index: 300,
+                    kind: SimEventKind::Shove {
+                        pitch_rad_s: 1.2,
+                        roll_rad_s: -0.4,
+                    },
+                },
+            ];
+            script.max_ticks = SHOVE_TICKS;
+            script.packets = (0..SHOVE_TICKS as u32).map(scripted_walk_packet).collect();
+            script
+        }
+
+        fn fall_recover_script() -> ExperimentScript {
+            let nominal = SimFaultInjection::default();
+            let mut events = vec![
+                fault_event(0, &nominal),
+                TimedSimEvent {
+                    tick_index: 30,
+                    kind: SimEventKind::Shove {
+                        pitch_rad_s: 6.0,
+                        roll_rad_s: 0.0,
+                    },
+                },
+            ];
+            for tick in (162..322).step_by(8) {
+                events.push(TimedSimEvent {
+                    tick_index: tick,
+                    kind: SimEventKind::Recovery(Some((tick - 162) as f32 / 160.0)),
+                });
+            }
+            events.push(TimedSimEvent {
+                tick_index: 322,
+                kind: SimEventKind::Recovery(Some(1.0)),
+            });
+            events.push(TimedSimEvent {
+                tick_index: 340,
+                kind: SimEventKind::Recovery(None),
+            });
+
+            let rec_gains = BalanceGains {
+                fall_cutoff_rad: 1.35,
+                ..Default::default()
+            };
+            let packets = (0..FALL_TICKS as u32)
+                .map(|seq| match seq {
+                    160 => standing_packet(seq, ControlMode::Teach, ConfigCmd::SetBalanceGains(rec_gains)),
+                    161 => standing_packet(seq, ControlMode::Teach, ConfigCmd::ClearFaults),
+                    323 => standing_packet(seq, ControlMode::Teach, ConfigCmd::SetBalanceGains(BalanceGains::default())),
+                    _ => standing_packet(seq, ControlMode::Drive, ConfigCmd::None),
+                })
+                .collect();
+            ExperimentScript {
+                seed: nominal.seed,
+                events,
+                packets,
+                max_ticks: FALL_TICKS,
+            }
+        }
+
+        /// Regeneration aid for the committed fixtures. Run once from the
+        /// workspace root with `RK_GENERATE_ACCEPTANCE_FIXTURES=1 cargo test -p
+        /// rk-mcp --lib acceptance_experiments::generate_fixtures -- --ignored
+        /// --nocapture`; the test is ignored in normal CI runs.
+        #[test]
+        #[ignore = "regenerates committed acceptance fixtures on demand"]
+        fn generate_fixtures() {
+            if std::env::var_os("RK_GENERATE_ACCEPTANCE_FIXTURES").is_none() {
+                return;
+            }
+            let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = fixtures_dir();
+            std::fs::create_dir_all(&dir).expect("create fixture directory");
+            let scripts = [
+                ("walk_nominal.json", nominal_script()),
+                ("walk_shove.json", shove_script()),
+                ("fall_recover.json", fall_recover_script()),
+            ];
+            for (name, script) in &scripts {
+                let path = dir.join(name);
+                let bytes = serde_json::to_vec(script).expect("serialize script");
+                std::fs::write(&path, &bytes).expect("write script");
+                eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+            }
+
+            let model = StudioModel::new_default();
+            let mut runner = CopperSimRunner::new(
+                model.rig.joints.len().max(1),
+                &model.calibration,
+                model.rig.default_pose(),
+            );
+            let log = runner.run_script(&scripts[0].1);
+            let path = dir.join("walk_nominal.copper");
+            let bytes = serde_json::to_vec(&log).expect("serialize golden log");
+            std::fs::write(&path, &bytes).expect("write golden log");
+            eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+
+            for (name, script) in &scripts {
+                let (quality, log) = run_for_quality(script);
+                let last = log.ticks.last().expect("ticks").tx_telem;
+                eprintln!(
+                    "{name}: quality={quality:?} mode={:?} faults={:?} pitch={} roll={}",
+                    last.active_mode, last.faults, last.imu.pitch_rad, last.imu.roll_rad
+                );
+            }
+        }
+    }
 }

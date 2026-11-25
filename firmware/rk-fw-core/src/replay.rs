@@ -23,7 +23,7 @@ pub type CopperListTick = ControlTick;
 // `rk-fw-core` cannot depend on the simulator; the simulator's conversion helpers
 // are the single source of truth for mapping between the two representations.
 const DEFAULT_SIM_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
-const DEFAULT_SIM_SERVO_LAG_FACTOR: f32 = 0.12;
+const DEFAULT_SIM_SERVO_LAG_FACTOR: f32 = 0.20;
 const DEFAULT_SIM_FOOT_FRICTION_MU: f32 = 0.7;
 
 const fn default_sim_seed() -> u64 {
@@ -50,6 +50,10 @@ pub struct SimFaultSnapshot {
     pub drop_heartbeat: bool,
     #[serde(default)]
     pub stalled_joints: [bool; MAX_JOINTS],
+    /// Per-joint servo-bus degradation: that node's register transactions fail
+    /// while every other node keeps replying.
+    #[serde(default)]
+    pub degraded_joints: [bool; MAX_JOINTS],
     #[serde(default)]
     pub voltage_sag: bool,
     #[serde(default)]
@@ -99,6 +103,7 @@ impl Default for SimFaultSnapshot {
         Self {
             drop_heartbeat: false,
             stalled_joints: [false; MAX_JOINTS],
+            degraded_joints: [false; MAX_JOINTS],
             voltage_sag: false,
             servo_bus_error: false,
             external_hand_wave: false,
@@ -367,8 +372,9 @@ mod tests {
     fn sim_fault_snapshot_defaults_match_simulator_defaults() {
         let snapshot = SimFaultSnapshot::default();
         assert_eq!(snapshot.seed, DEFAULT_SIM_SEED);
-        assert_eq!(snapshot.servo_lag_factor, 0.12);
+        assert_eq!(snapshot.servo_lag_factor, 0.20);
         assert_eq!(snapshot.foot_friction_mu, 0.7);
         assert!(snapshot.stalled_joints.iter().all(|stalled| !stalled));
+        assert!(snapshot.degraded_joints.iter().all(|degraded| !degraded));
     }
 }

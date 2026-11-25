@@ -1,10 +1,20 @@
 //! Workspace verification gate runner powered by `craft-xtask`.
 //!
-//! Usage: `cargo run -p xtask -- check`
+//! Usage:
+//!   cargo run -p xtask -- check           # full gate (identical to `sim-verify`)
+//!   cargo run -p xtask -- sim-verify      # simulation acceptance gate
+//!   cargo run -p xtask -- no-std          # no_std core crates
+//!   cargo run -p xtask -- test            # host tests
+//!   cargo run -p xtask -- wasm            # WASM cross-check
+//!   cargo run -p xtask -- firmware        # firmware-core tests + RP2350 matrix
+//!   cargo run -p xtask -- experiments     # committed MCP headless experiments
 
 use std::path::Path;
 
 use craft_xtask::runner::{self, RunOptions, Step};
+
+const RP2350_MANIFEST: &str = "firmware/rk-rp2350/Cargo.toml";
+const THUMB_TARGET: &str = "thumbv8m.main-none-eabihf";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -18,115 +28,154 @@ fn main() {
 
 fn run_gate(cmd: &str) -> Result<(), runner::Error> {
     let root = runner::root(Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    let full_gate = matches!(cmd, "check" | "sim-verify");
+
+    if !full_gate
+        && !matches!(cmd, "no-std" | "test" | "wasm" | "firmware" | "experiments")
+    {
+        return Err(runner::Error::Config(format!(
+            "unknown gate '{cmd}': expected check, sim-verify, no-std, test, wasm, firmware or experiments"
+        )));
+    }
 
     let mut steps: Vec<Step> = Vec::new();
 
-    if cmd == "check" || cmd == "no-std" {
-        steps.push(Step::new("no_std-check", |log| {
+    if full_gate || cmd == "no-std" {
+        steps.push(Step::new("no-std-check", |log| {
             let mut c = runner::cargo(&root);
             c.args([
                 "check",
                 "-p",
-                "humanoid-proto",
+                "rk-proto",
                 "-p",
-                "humanoid-control",
+                "rk-control",
                 "-p",
-                "humanoid-cu-nodes",
+                "rk-multibus",
                 "--no-default-features",
             ]);
             runner::run(
                 c,
-                log.command("cargo check -p humanoid-proto -p humanoid-control -p humanoid-cu-nodes --no-default-features"),
+                log.command("cargo check -p rk-proto -p rk-control -p rk-multibus --no-default-features"),
             )
         }));
     }
 
-    if cmd == "check" || cmd == "test" {
+    if full_gate || cmd == "test" {
         steps.push(Step::new("workspace-tests", |log| {
             let mut c = runner::cargo(&root);
-            c.args([
-                "test",
-                "-p",
-                "humanoid-proto",
-                "-p",
-                "humanoid-control",
-                "-p",
-                "humanoid-cu-nodes",
-                "-p",
-                "humanoid-sim",
-                "-p",
-                "humanoid-model",
-                "-p",
-                "humanoid-link",
-            ]);
-            runner::run(
-                c,
-                log.command("cargo test -p humanoid-proto -p humanoid-control -p humanoid-cu-nodes -p humanoid-sim -p humanoid-model -p humanoid-link"),
-            )
+            c.args(["test", "--workspace"]);
+            runner::run(c, log.command("cargo test --workspace"))
         }));
     }
 
-    if cmd == "check" || cmd == "wasm" {
+    if full_gate || cmd == "wasm" {
         steps.push(Step::new("wasm32-check", |log| {
             let mut c = runner::cargo(&root);
-            c.args([
-                "check",
-                "-p",
-                "humanoid-web",
-                "--target",
-                "wasm32-unknown-unknown",
-            ]);
+            c.args(["check", "-p", "rk-ui", "--target", "wasm32-unknown-unknown"]);
             runner::run(
                 c,
-                log.command("cargo check -p humanoid-web --target wasm32-unknown-unknown"),
+                log.command("cargo check -p rk-ui --target wasm32-unknown-unknown"),
             )
         }));
     }
 
-    if cmd == "check" || cmd == "firmware" {
+    if full_gate || cmd == "firmware" {
         steps.push(Step::new("fw-core-tests", |log| {
             let mut c = runner::cargo(&root);
             c.args([
                 "test",
                 "--manifest-path",
-                "firmware/humanoid-fw-core/Cargo.toml",
+                "firmware/Cargo.toml",
+                "-p",
+                "rk-fw-core",
             ]);
             runner::run(
                 c,
-                log.command("cargo test --manifest-path firmware/humanoid-fw-core/Cargo.toml"),
+                log.command("cargo test --manifest-path firmware/Cargo.toml -p rk-fw-core"),
             )
         }));
 
-        steps.push(Step::new("rp2350-usb-cdc-check", |log| {
+        // Default bench bring-up build (USB CDC-ACM + loopback servo plant).
+        steps.push(Step::new("rp2350-default-check", |log| {
             let mut c = runner::cargo(&root);
             c.args([
                 "check",
                 "--manifest-path",
-                "firmware/humanoid-rp2350/Cargo.toml",
+                RP2350_MANIFEST,
                 "--target",
-                "thumbv8m.main-none-eabihf",
+                THUMB_TARGET,
             ]);
             runner::run(
                 c,
-                log.command("cargo check --manifest-path firmware/humanoid-rp2350/Cargo.toml --target thumbv8m.main-none-eabihf"),
+                log.command(&format!(
+                    "cargo check --manifest-path {RP2350_MANIFEST} --target {THUMB_TARGET}"
+                )),
             )
         }));
 
+        // USB-Net + real servo bus + LSM6DSV IMU: the feature set closest to the
+        // intended v1 hardware. The crate spells the IMU feature `imu-lsm6dsv`.
+        steps.push(Step::new("rp2350-hardware-features-check", |log| {
+            let mut c = runner::cargo(&root);
+            c.args([
+                "check",
+                "--manifest-path",
+                RP2350_MANIFEST,
+                "--target",
+                THUMB_TARGET,
+                "--no-default-features",
+                "--features",
+                "usb-net,i3c-servo-bus,imu-lsm6dsv",
+            ]);
+            runner::run(
+                c,
+                log.command(&format!(
+                    "cargo check --manifest-path {RP2350_MANIFEST} --target {THUMB_TARGET} --no-default-features --features usb-net,i3c-servo-bus,imu-lsm6dsv"
+                )),
+            )
+        }));
+
+        // Keep the legacy UDP-bench cross-check used by README and CI.
         steps.push(Step::new("rp2350-usb-net-check", |log| {
             let mut c = runner::cargo(&root);
             c.args([
                 "check",
                 "--manifest-path",
-                "firmware/humanoid-rp2350/Cargo.toml",
+                RP2350_MANIFEST,
                 "--target",
-                "thumbv8m.main-none-eabihf",
+                THUMB_TARGET,
                 "--no-default-features",
                 "--features",
                 "usb-net,bench-loopback",
             ]);
             runner::run(
                 c,
-                log.command("cargo check --manifest-path firmware/humanoid-rp2350/Cargo.toml --target thumbv8m.main-none-eabihf --no-default-features --features usb-net,bench-loopback"),
+                log.command(&format!(
+                    "cargo check --manifest-path {RP2350_MANIFEST} --target {THUMB_TARGET} --no-default-features --features usb-net,bench-loopback"
+                )),
+            )
+        }));
+    }
+
+    if full_gate || cmd == "experiments" {
+        // Committed experiment scripts are loaded through the MCP headless host's
+        // confined-file `run_experiment` path. The same tests re-run each script
+        // through `CopperSimRunner` to assert the public walk-quality bounds and
+        // verify the committed golden `.copper` log bit-exactly.
+        steps.push(Step::new("mcp-headless-experiments", |log| {
+            let mut c = runner::cargo(&root);
+            c.args([
+                "test",
+                "-p",
+                "rk-mcp",
+                "--lib",
+                "acceptance_experiments",
+                "--",
+                "--nocapture",
+            ]);
+            runner::run(
+                c,
+                log.command("cargo test -p rk-mcp --lib acceptance_experiments -- --nocapture"),
             )
         }));
     }

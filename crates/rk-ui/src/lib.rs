@@ -375,6 +375,11 @@ impl RockyStudioApp {
 
     /// Connects the selected robot transport in safe `Teach` mode (Torque OFF) and queries MCU model metadata.
     pub fn connect_active_transport(&mut self) {
+        // A reconnect is a new session: never carry a latched fall, recovery
+        // sequence, saved gains or operator consent across transports. Do this
+        // before the safe-mode walk reset below, which must win over any saved
+        // `balance_enabled` value restored by the helper.
+        self.clear_fall_recovery_state();
         self.model.set_authority_mode(ControlMode::Teach);
         self.model.walk_cmd.walk_enabled = false;
         self.model.walk_cmd.vx = 0.0;
@@ -446,13 +451,7 @@ impl RockyStudioApp {
         self.pad_vx = 0.0;
         self.pad_vy = 0.0;
         self.pad_yaw = 0.0;
-        self.restore_recovery_gains();
-        self.transport.set_recovery_progress(None);
-        self.fall_event_active = false;
-        self.fall_orientation = FallOrientation::Unknown;
-        self.recovery_state = RecoveryState::Idle;
-        self.fall_dwell_sec = 0.0;
-        self.get_up_requested = false;
+        self.clear_fall_recovery_state();
         self.connected = false;
         self.active_screen = AppScreen::Dashboard;
         self.show_config_drawer = false;
@@ -488,23 +487,33 @@ impl RockyStudioApp {
         }
     }
 
-    /// Explicit operator manual reset (stands sim upright, resets E-Stop to Teach, and clears fall alarm).
-    pub fn manual_reset_upright_and_clear(&mut self) {
-        if let Some(f) = self.transport.sim_faults_mut() {
-            f.drop_heartbeat = false;
-        }
+    /// Clears every alarm / recovery / operator-consent field so a new session
+    /// (experiment reset or transport reconnect) never inherits a stale fall.
+    /// `auto_recovery_enabled` is a standing user preference, not event state,
+    /// and is deliberately preserved.
+    pub(crate) fn clear_fall_recovery_state(&mut self) {
         self.transport.set_recovery_progress(None);
         self.restore_recovery_gains();
-        self.transport.reset_upright();
-        if self.model.is_estop_active() {
-            self.model.reset_estop();
-        }
         self.fall_event_active = false;
         self.fall_orientation = FallOrientation::Unknown;
         self.recovery_state = RecoveryState::Idle;
         self.fall_dwell_sec = 0.0;
         self.operator_confirmed = false;
         self.get_up_requested = false;
+        self.saved_recovery_gains = None;
+        self.model.playback_aborted = false;
+    }
+
+    /// Explicit operator manual reset (stands sim upright, resets E-Stop to Teach, and clears fall alarm).
+    pub fn manual_reset_upright_and_clear(&mut self) {
+        if let Some(f) = self.transport.sim_faults_mut() {
+            f.drop_heartbeat = false;
+        }
+        self.transport.reset_upright();
+        if self.model.is_estop_active() {
+            self.model.reset_estop();
+        }
+        self.clear_fall_recovery_state();
     }
 
     /// Applies a newly parsed `AssetBundle` (from upload, drop, paste, preset, or MCU pull),
@@ -1505,12 +1514,14 @@ mod e2e_fixed_step_tests;
 
 #[cfg(all(test, not(any(target_arch = "wasm32", target_os = "android"))))]
 mod native_mcp_bridge_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use egui::Context;
-    use rk_mcp::mcp_bridge_channel;
-    use serde_json::json;
+    use rk_mcp::{mcp_bridge_channel, spawn_http_bridge};
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -1556,5 +1567,111 @@ mod native_mcp_bridge_tests {
             .and_then(|r| r.get("tools"))
             .and_then(serde_json::Value::as_array)
             .is_some());
+    }
+
+    /// POST one JSON-RPC tools/call to the real Streamable HTTP listener and
+    /// parse its JSON body. Bounded socket timeouts keep a stalled GUI visible
+    /// as a test failure instead of a hang.
+    fn raw_post(addr: std::net::SocketAddr, id: u64, name: &str, args: Value) -> Value {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": args}
+        })
+        .to_string();
+        let mut stream = TcpStream::connect(addr).expect("connect to loopback MCP listener");
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        write!(
+            stream,
+            "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).expect("read HTTP response");
+        let text = String::from_utf8(response).expect("HTTP response is UTF-8");
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
+        let start = text.find("\r\n\r\n").expect("HTTP headers") + 4;
+        serde_json::from_str(&text[start..]).unwrap_or_else(|e| panic!("bad JSON body ({e}): {text}"))
+    }
+
+    fn tool_body(reply: &Value) -> Value {
+        assert!(reply["result"]["isError"].is_null(), "{reply}");
+        serde_json::from_str(
+            reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no tool text: {reply}")),
+        )
+        .unwrap_or_else(|e| panic!("tool body is not JSON ({e}): {reply}"))
+    }
+
+    /// The actual desktop wiring (`mcp_bridge_channel` + `spawn_http_bridge` +
+    /// `pump_mcp_bridge` on the GUI thread) must drive the live app simulation,
+    /// not a stub: `run_experiment` returns an exact replay and
+    /// `sim_inject_fault` mutates the app's real transport fault state.
+    #[test]
+    fn live_http_bridge_drives_gui_experiment_and_fault() {
+        let _guard = super::e2e_fixed_step_tests::E2E_HARNESS_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut app = RockyStudioApp::new(Box::new(NoopSaver));
+        app.transport.reset_experiment();
+        app.model = StudioModel::new_default();
+        app.connected = true;
+
+        let (tx, rx) = mcp_bridge_channel(|| {});
+        app.attach_mcp_bridge(rx);
+        let mut handle = spawn_http_bridge("127.0.0.1:0", tx).expect("bind loopback listener");
+        let addr = handle.local_addr();
+        assert!(handle.is_running());
+
+        let script = rk_sim::ExperimentScript {
+            seed: 7,
+            events: Vec::new(),
+            packets: (0..12u32)
+                .map(|seq| rk_proto::HostToMcu {
+                    seq,
+                    ..Default::default()
+                })
+                .collect(),
+            max_ticks: 12,
+        };
+        let client = thread::spawn(move || {
+            let experiment = raw_post(addr, 1, "run_experiment", json!({"script": script}));
+            let fault = raw_post(
+                addr,
+                2,
+                "sim_inject_fault",
+                json!({"voltage_sag": true, "servo_lag_factor": 0.25}),
+            );
+            (experiment, fault)
+        });
+
+        // Behave like `DesktopWrapper::logic`: drain the bridge on the GUI
+        // thread until both HTTP calls have been answered.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !client.is_finished() && Instant::now() < deadline {
+            app.pump_mcp_bridge(&Context::default());
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(client.is_finished(), "HTTP client did not finish before the deadline");
+
+        let (experiment, fault) = client.join().expect("HTTP client thread panicked");
+        let body = tool_body(&experiment);
+        assert_eq!(body["exact_match"], true, "{body}");
+        assert_eq!(body["total_ticks"], 12, "{body}");
+        assert_eq!(body["matched_ticks"], 12, "{body}");
+
+        let body = tool_body(&fault);
+        assert_eq!(body["voltage_sag"], true, "{body}");
+        assert!((body["servo_lag_factor"].as_f64().unwrap() - 0.25_f64).abs() < 1.0e-6);
+        let faults = app.transport.sim_faults().expect("sim transport fault state");
+        assert!(faults.voltage_sag, "HTTP tool must change the live GUI sim faults");
+        assert!((faults.servo_lag_factor - 0.25_f32).abs() < 1.0e-6);
+
+        handle.stop();
+        assert!(!handle.is_running());
     }
 }

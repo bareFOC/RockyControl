@@ -233,3 +233,105 @@ fn e2e_forward_shove_to_prone_get_up_and_back_to_guard() {
     assert_eq!(app.model.requested_mode, ControlMode::Teach);
     assert!(!app.model.latest_telemetry.faults.contains(FaultFlags::TILT_FALL_CUTOFF));
 }
+
+/// Backward and lateral falls must classify correctly from the real plant's
+/// published IMU and drive the matching get-up move through the full
+/// fall -> clear -> playback -> alarm-clear sequence.
+///
+/// Impulse signs follow `rk_proto::classify_fall`: negative pitch gravity is
+/// Supine, positive roll gravity is SideRight, negative roll is SideLeft
+/// (the forward/positive-pitch Prone case is covered by the dedicated test
+/// above). No telemetry is synthesised — every frame comes from `step_fixed`.
+#[test]
+fn e2e_side_orientation_fall_get_up_through_real_plant() {
+    let _guard = super::e2e_fixed_step_tests::E2E_HARNESS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // (pitch impulse, roll impulse, expected classification, get-up move)
+    let cases = [
+        (
+            -6.0_f32,
+            0.0_f32,
+            FallOrientation::Supine,
+            "Get Up Supine",
+        ),
+        (
+            0.0_f32,
+            6.0_f32,
+            FallOrientation::SideRight,
+            "Get Up Right Side",
+        ),
+        (
+            0.0_f32,
+            -6.0_f32,
+            FallOrientation::SideLeft,
+            "Get Up Left Side",
+        ),
+    ];
+
+    for (pitch_impulse, roll_impulse, expected, move_name) in cases {
+        let mut app = RockyStudioApp::new(Box::new(NoopSaver));
+        assert_eq!(app.recovery_state, RecoveryState::Idle);
+        arm_drive_with_balance(&mut app);
+        app.transport.apply_push_impulse(pitch_impulse, roll_impulse);
+
+        // --- Fall latch + orientation classification from real telemetry ---
+        let mut fell = None;
+        for _ in 0..FALL_LATCH_TICKS {
+            let telem = step(&mut app);
+            if telem.faults.contains(FaultFlags::TILT_FALL_CUTOFF) {
+                fell = Some(telem);
+                break;
+            }
+        }
+        let fall_telem = fell.expect("shove must latch a real fall");
+        assert_eq!(
+            FallOrientation::from_wire(fall_telem.balance.fall_orientation),
+            expected,
+            "classifier must report {expected:?} for impulse ({pitch_impulse}, {roll_impulse})"
+        );
+        assert_eq!(app.fall_orientation, expected);
+        assert_eq!(app.recovery_state, RecoveryState::FallLatched);
+        assert!(app.fall_event_active);
+        assert!(viewport_alarm(&fall_telem));
+
+        // --- Operator get-up: clear fault, select the matching precomputed move ---
+        app.transport.reset_upright();
+        app.operator_confirmed = true;
+        app.auto_recovery_enabled = true;
+        let mut started = false;
+        for _ in 0..(CLEAR_FAULT_TICKS + PLAYBACK_START_TICKS) {
+            step(&mut app);
+            if app.model.playback.is_some() {
+                started = true;
+                break;
+            }
+        }
+        assert!(started, "{move_name}: get-up playback must start");
+        let pb = app.model.playback.as_ref().expect("playback must be active");
+        assert_eq!(app.model.moves[pb.move_idx].name, move_name);
+        assert_eq!(app.recovery_state, RecoveryState::PlayingGetUp);
+
+        // --- Playback + alarm clearing ---
+        let mut ticks_playing = 0_usize;
+        while app.model.playback.is_some() && ticks_playing < PLAYBACK_TICKS {
+            step(&mut app);
+            ticks_playing += 1;
+        }
+        assert!(ticks_playing > 0, "{move_name}: playback must consume ticks");
+        assert!(app.model.playback.is_none(), "{move_name}: playback must complete");
+        assert_eq!(app.recovery_state, RecoveryState::Completed);
+
+        for _ in 0..ALARM_CLEAR_TICKS {
+            step(&mut app);
+            if app.recovery_state == RecoveryState::Idle {
+                break;
+            }
+        }
+        assert_eq!(app.recovery_state, RecoveryState::Idle, "{move_name}: alarm must clear");
+        assert!(!app.fall_event_active);
+        assert_eq!(app.fall_orientation, FallOrientation::Unknown);
+        assert_eq!(app.model.requested_mode, ControlMode::Teach);
+    }
+}

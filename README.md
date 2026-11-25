@@ -14,7 +14,7 @@ Rocky Studio runs the exact same workstation UI on **Desktop** (`apps/rk-desktop
   - Always-fit-to-view framing across desktop, tablet landscape, and tablet portrait viewports.
   - Interactive 26-region Fusion 360 / Onshape style **ViewCube** (6 cardinal faces, 12 beveled edges, 8 chamfered corners), direct drag-to-orbit on the cube, 90-degree CCW/CW roll arrows, Home isometric snap, XYZ world-axis triad, and 220 ms eased quaternion slerp transitions.
   - Solid PBR robot rendering tracking live `measured_rad`, translucent cyan wireframe target ghost in `Drive` mode, thermal/current heat tinting above 70% rated current, and click/tap joint picking.
-- **Bidirectional Safety Architecture (`rk-proto`, `rk-control`, `rk-cu-nodes`)**:
+- **Bidirectional Safety Architecture (`rk-proto`, `rk-control`, `rk-multibus`)**:
   - Three explicit authority modes: `Teach` (Robot -> GUI, torque off), `Drive` (GUI -> Robot, torque on), and latched `EStop` (`Space` hotkey or top-bar button).
   - Bumpless transfer on every `Teach -> Drive` transition (`target_rad = measured_rad`).
   - Per-joint soft limits, slew-rate clamping, deadman heartbeat watchdog (200 ms), and deterministic Copper replay verification.
@@ -35,21 +35,23 @@ Rocky Studio runs the exact same workstation UI on **Desktop** (`apps/rk-desktop
 | --- | --- | --- |
 | `crates/rk-proto` | Layer 0 (`#![no_std]`) | Wire protocol (`postcard` + `cobs` + CRC32), telemetry/command frames, fault bitflags, chunked MCU model transfer |
 | `crates/rk-control` | Layer 1 (`#![no_std]`) | Safety kernel: mode state machine, bumpless transfer, soft limits, slew clamping, deadman watchdog |
-| `crates/rk-cu-nodes` | Layer 1b (`#![no_std]`) | `copper-rs` tasks (`ControlTask`, `TelemetrySink`, deterministic plant & actuator drivers) |
-| `crates/rk-sim` | Layer 2 | Software-in-the-loop (SIL) humanoid plant, fault injection, and deterministic Copper replay runner |
+| `crates/rk-multibus` | Layer 1b (`#![no_std]`) | BareFOC/I3C register-bus client, control-table wire format and bus-health tracking |
+| `crates/rk-harness` | Layer 1c | Fixed-dt deterministic Embassy harness shared by simulator and replay |
+| `crates/rk-sim` | Layer 2 | Software-in-the-loop (SIL) humanoid plant, fault injection, scripted experiments and deterministic `.copper` replay |
 | `crates/rk-model` | Layer 3 | URDF/ZIP ingestion, `k::Chain<f32>` forward kinematics, calibration, move studio, bounds calculation |
 | `crates/rk-link` | Layer 3b | `RobotTransport` abstraction: `SimTransport`, native UDP (`10.42.0.2:7777`), and USB CDC-ACM hook |
-| `crates/rk-viewport` | Layer 4 | Embedded `three-d` PBR/wireframe viewport, quaternion always-fit camera, and 26-region ViewCube |
-| `crates/rk-ui` | Layer 5 | Shared `egui` + `craft-libs` workstation UI, floating CAD HUD, charts, teach/action studio, responsive engine |
-| `apps/rk-desktop` | Layer 6 | Native desktop runner (`eframe`, `craft-atomic` saves, `craft-quit`, native file dialog, fullscreen) |
-| `apps/rk-web` | Layer 6 | Browser WASM runner (`eframe` WebGL2, `craft-platform`, native launch splash, Web Fullscreen API) |
-| `apps/rk-android` | Layer 6 | Android runner (`eframe` glow/native-activity, app-internal `PlatformSaver`, no desktop-only services) |
+| `crates/rk-mcp` | Layer 4 | MCP engine (stdio/HTTP) with headless simulator host and tool dispatch |
+| `crates/rk-viewport` | Layer 5 | Embedded `three-d` PBR/wireframe viewport, quaternion always-fit camera, and 26-region ViewCube |
+| `crates/rk-ui` | Layer 6 | Shared `egui` + `craft-libs` workstation UI, floating CAD HUD, charts, teach/action studio, responsive engine |
+| `apps/rk-desktop` | Layer 7 | Native desktop runner (`eframe`, `craft-atomic` saves, `craft-quit`, native file dialog, fullscreen) |
+| `apps/rk-web` | Layer 7 | Browser WASM runner (`eframe` WebGL2, `craft-platform`, native launch splash, Web Fullscreen API) |
+| `apps/rk-android` | Layer 7 | Android runner (`eframe` glow/native-activity, app-internal `PlatformSaver`, no desktop-only services) |
 
 ### Embedded Firmware Workspace (`/firmware/Cargo.toml`)
 
 | Crate | Target | Purpose |
 | --- | --- | --- |
-| `firmware/rk-fw-core` | `#![no_std]` | Board-agnostic Embassy + `copper-rs` runtime, UART half-duplex servo bus, frame codec |
+| `firmware/rk-fw-core` | `#![no_std]` | Board-agnostic Embassy `ControlTask`, shared control/replay types, frame codec |
 | `firmware/rk-rp2350` | `thumbv8m.main-none-eabihf` | RP2350 firmware (`embassy-rp`) with `usb-cdc` (default) and `usb-net` (CDC-NCM + `embassy-net` UDP) |
 | `firmware/rk-esp32p4` | `riscv32imafc-unknown-none-elf` | ESP32-P4 firmware (`esp-hal` + `esp-rtos`) |
 
@@ -79,17 +81,22 @@ cargo run -p rk-desktop --release
 ### Run Tests & Checks
 
 ```sh
-# Host unit & simulation tests
-cargo test -p rk-proto -p rk-control -p rk-cu-nodes -p rk-sim -p rk-model -p rk-link -p rk-viewport -p rk-ui
+# Full host + firmware + cross-target + scripted-experiment gate
+cargo run -p xtask -- sim-verify   # `check` is an alias
 
-# no_std core check
+# Individual steps
+cargo test --workspace
 sh scripts/lint.sh
-
-# Firmware core unit tests & RP2350 cross-checks (USB CDC + USB-NCM UDP)
 cargo test --manifest-path firmware/Cargo.toml -p rk-fw-core
-cargo check --manifest-path firmware/Cargo.toml -p rk-rp2350 --target thumbv8m.main-none-eabihf
-cargo check --manifest-path firmware/Cargo.toml -p rk-rp2350 --target thumbv8m.main-none-eabihf --no-default-features --features usb-net,bench-loopback
+cargo check --manifest-path firmware/rk-rp2350/Cargo.toml --target thumbv8m.main-none-eabihf
+cargo check --manifest-path firmware/rk-rp2350/Cargo.toml --target thumbv8m.main-none-eabihf --no-default-features --features usb-net,i3c-servo-bus,imu-lsm6dsv
+cargo check --manifest-path firmware/rk-rp2350/Cargo.toml --target thumbv8m.main-none-eabihf --no-default-features --features usb-net,bench-loopback
+cargo check -p rk-ui --target wasm32-unknown-unknown
 ```
+
+See [`docs/SIM_ACCEPTANCE.md`](docs/SIM_ACCEPTANCE.md) for the measured
+acceptance matrix, committed fixtures and the exact scope of replay verification.
+CI mirrors the gate in `.github/workflows/sim-verify.yml`.
 
 ## Android APK
 
