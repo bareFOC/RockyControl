@@ -4,7 +4,7 @@
 //! - [`dashboard_screen`]: Home screen (Connect to Robot -> Live Robot Stats + Control / Config Launchers)
 //! - [`control_screen`]: Full-bleed 3D robot with Walk Pad, WASD/Gamepad, MCU Upper-Body Vertical Balance, and Combat Shove tests
 //! - [`config_screen`]: Visual 3D direct joint/arm dragging (FK & `k` Limb IK), 3D protractor arc, floating visual joint config bar, and on-demand 3-tab setup drawer
-//! - [`top_bar`]: Contextual navigation, Teach/Drive authority toggle, always-pinned E-Stop, and safety banners
+//! - [`top_bar`]: Contextual navigation, Teach/Drive authority toggle, and always-pinned E-Stop (safety alerts appear as transient toasts)
 //! - [`urdf_panel`], [`calibration_tab`], [`sim_tab`]: Focused engineering tabs inside the Config & Calibration drawer
 //! - [`responsive`]: Unified touch-first ergonomics adapting automatically between Landscape and Portrait
 
@@ -42,6 +42,16 @@ use web_time::Instant;
 
 const TELEMETRY_HISTORY_LEN: usize = 180;
 const CMD_ESTOP: &str = "safety.estop";
+
+/// Transient safety notification shown as a floating toast instead of a
+/// persistent top banner (which displaces the toolbar and 3D canvas).
+#[derive(Clone, Debug)]
+struct SafetyToast {
+    text: String,
+    is_error: bool,
+    expires_at_sec: f64,
+    allow_reset: bool,
+}
 
 /// Fixed control period of the shared Embassy task (5 ms / 200 Hz).
 const CONTROL_STEP_SEC: f32 = rk_fw_core::config::CONTROL_DT_SEC;
@@ -294,6 +304,10 @@ pub struct RockyStudioApp {
     get_up_requested: bool,
     /// Operator's original `(BalanceGains, balance_enabled)` saved while get-up plays.
     saved_recovery_gains: Option<(rk_proto::BalanceGains, bool)>,
+    /// Latest transient safety notification (auto-dismissing toast).
+    safety_toast: Option<SafetyToast>,
+    /// Last (E-Stop, fault) pair used to detect state transitions for toasts.
+    last_safety_signature: (bool, FaultFlags),
 }
 
 impl RockyStudioApp {
@@ -370,6 +384,8 @@ impl RockyStudioApp {
             fall_dwell_sec: 0.0,
             get_up_requested: false,
             saved_recovery_gains: None,
+            safety_toast: None,
+            last_safety_signature: (false, FaultFlags::empty()),
         }
     }
 
@@ -502,6 +518,10 @@ impl RockyStudioApp {
         self.get_up_requested = false;
         self.saved_recovery_gains = None;
         self.model.playback_aborted = false;
+        // A clean experiment must not inherit a latched E-Stop either.
+        if self.model.is_estop_active() {
+            self.model.reset_estop();
+        }
     }
 
     /// Explicit operator manual reset (stands sim upright, resets E-Stop to Teach, and clears fall alarm).
@@ -594,6 +614,96 @@ impl RockyStudioApp {
                 }
             }
             self.model.status_message = format!("IK Limb Reach: dragging '{link_name}'");
+        }
+    }
+
+    /// Detect new E-Stop / fault transitions and raise a transient toast.
+    /// Faults that persist are not re-announced every frame.
+    fn update_safety_toast(&mut self) {
+        let estop = self.model.is_estop_active();
+        let faults = self.model.latest_telemetry.faults;
+        let signature = (estop, faults);
+        if signature == self.last_safety_signature {
+            return;
+        }
+        self.last_safety_signature = signature;
+
+        if !estop && faults.is_empty() {
+            self.safety_toast = None;
+            return;
+        }
+
+        let is_error = estop || faults.contains(FaultFlags::TILT_FALL_CUTOFF);
+        let reason = if faults.contains(FaultFlags::TILT_FALL_CUTOFF) {
+            "FALL CUTOFF LATCHED — torque OFF"
+        } else if estop {
+            "E-STOP LATCHED — torque OFF"
+        } else {
+            "Active advisory / faults"
+        };
+        self.safety_toast = Some(SafetyToast {
+            text: format!("{reason}  |  {faults:?}"),
+            is_error,
+            expires_at_sec: self.sim_time_sec + if is_error { 8.0 } else { 5.0 },
+            allow_reset: estop,
+        });
+    }
+
+    /// Floating safety toast; replaces the persistent banner that used to sit
+    /// above the 3D canvas and push the UI down.
+    fn render_safety_toast(&mut self, ctx: &egui::Context) {
+        let expired = self
+            .safety_toast
+            .as_ref()
+            .is_some_and(|toast| self.sim_time_sec >= toast.expires_at_sec);
+        if expired {
+            self.safety_toast = None;
+        }
+        let Some(toast) = self.safety_toast.clone() else {
+            return;
+        };
+
+        let (fill, stroke) = if toast.is_error {
+            (
+                Color32::from_rgb(138, 22, 30),
+                Color32::from_rgb(248, 113, 113),
+            )
+        } else {
+            (
+                Color32::from_rgb(92, 54, 14),
+                Color32::from_rgb(245, 158, 11),
+            )
+        };
+        let mut open = true;
+        egui::Area::new(egui::Id::new("rocky_safety_toast"))
+            .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16.0, 16.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(fill)
+                    .stroke(Stroke::new(1.0, stroke))
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&toast.text)
+                                    .strong()
+                                    .size(12.5)
+                                    .color(Color32::WHITE),
+                            );
+                            if toast.allow_reset && ui.button("Reset Upright → Teach").clicked() {
+                                self.manual_reset_upright_and_clear();
+                                open = false;
+                            }
+                            if ui.button("✕").clicked() {
+                                open = false;
+                            }
+                        });
+                    });
+            });
+        if !open {
+            self.safety_toast = None;
         }
     }
 
@@ -777,6 +887,7 @@ impl RockyStudioApp {
             self.sim_time_sec += dt_sec as f64;
             self.active_screen = AppScreen::Dashboard;
         }
+        self.update_safety_toast();
 
         // 3b. WASM polls the host bridge here. On native the bridge is drained
         // from DesktopWrapper::logic so hidden windows still service requests.
@@ -899,6 +1010,9 @@ impl RockyStudioApp {
 
         // Optional Paste URDF XML modal
         self.render_paste_urdf_modal(&ctx);
+
+        // Floating safety notifications (transient toasts, no layout displacement)
+        self.render_safety_toast(&ctx);
 
         // Slide-over MCP Agent Drawer
         self.render_mcp_drawer(&ctx);

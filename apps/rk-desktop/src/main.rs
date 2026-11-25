@@ -15,6 +15,8 @@ const MCP_LOOPBACK_HOST: &str = "127.0.0.1";
 struct McpListenerConfig {
     /// `None` means `--no-mcp` was passed: do not bind anything.
     addr: Option<String>,
+    /// Explicit automation opt-in: arm Agent Drive at startup (like the CLI server).
+    allow_drive: bool,
 }
 
 impl McpListenerConfig {
@@ -24,11 +26,13 @@ impl McpListenerConfig {
             .and_then(|raw| parse_port(&raw, "ROCKY_MCP_PORT"))
             .unwrap_or(DEFAULT_MCP_PORT);
         let mut enabled = true;
+        let mut allow_drive = false;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--no-mcp" => enabled = false,
+                "--allow-drive" => allow_drive = true,
                 "--mcp-port" => match args.next() {
                     Some(raw) => {
                         if let Some(parsed) = parse_port(&raw, "--mcp-port") {
@@ -49,7 +53,7 @@ impl McpListenerConfig {
 
         // `--no-mcp` is the most explicit opt-out and wins over any port setting.
         let addr = enabled.then(|| format!("{MCP_LOOPBACK_HOST}:{port}"));
-        Self { addr }
+        Self { addr, allow_drive }
     }
 }
 
@@ -191,6 +195,10 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let mut inner = RockyStudioApp::new(Box::new(DesktopAtomicSaver::new()));
+            if mcp_config.allow_drive {
+                eprintln!("[rk-desktop] --allow-drive: Agent Drive armed at startup (automation opt-in)");
+                inner.mcp.set_drive_armed(true);
+            }
             let mut mcp_listener = None;
 
             if let Some(addr) = mcp_config.addr {

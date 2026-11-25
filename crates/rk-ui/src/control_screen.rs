@@ -9,7 +9,6 @@ use crate::{PushStrength, RockyStudioApp};
 
 impl RockyStudioApp {
     pub(crate) fn render_control_screen(&mut self, ui: &mut egui::Ui) {
-        self.render_safety_banners(ui);
 
         let pointer_pos = ui
             .ctx()

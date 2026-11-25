@@ -16,7 +16,6 @@ use crate::{ConfigDrawerTab, RockyStudioApp};
 
 impl RockyStudioApp {
     pub(crate) fn render_config_screen(&mut self, ui: &mut egui::Ui) {
-        self.render_safety_banners(ui);
 
         let pointer_pos = ui
             .ctx()

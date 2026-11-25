@@ -1,6 +1,6 @@
 //! Persistent contextual top safety toolbar and safety fault banners for the 3-screen app.
 
-use egui::{Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
+use egui::{Color32, CornerRadius, RichText, Stroke, Vec2};
 use rk_proto::{ControlMode, FaultFlags};
 
 use crate::{AppScreen, RockyStudioApp};
@@ -298,49 +298,4 @@ impl RockyStudioApp {
         });
     }
 
-    /// Prominent safety banner for E-Stop or active advisory faults above the 3D canvas.
-    pub(crate) fn render_safety_banners(&mut self, ui: &mut egui::Ui) {
-        let estop = self.model.is_estop_active();
-        let faults = self.model.latest_telemetry.faults;
-
-        if estop {
-            egui::Frame::new()
-                .fill(Color32::from_rgb(138, 22, 30))
-                .inner_margin(Margin::symmetric(12, 6))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(248, 113, 113)))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let reason = if faults.contains(FaultFlags::TILT_FALL_CUTOFF) {
-                            "FALL CUTOFF LATCHED — TORQUE OFF"
-                        } else {
-                            "E-STOP LATCHED — TORQUE OFF"
-                        };
-                        ui.label(
-                            RichText::new(format!("{reason}  |  Faults: {:?}", faults))
-                                .strong()
-                                .size(12.5)
-                                .color(Color32::WHITE),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Reset Upright -> Teach").clicked() {
-                                self.manual_reset_upright_and_clear();
-                            }
-                        });
-                    });
-                });
-        } else if !faults.is_empty() {
-            egui::Frame::new()
-                .fill(Color32::from_rgb(92, 54, 14))
-                .inner_margin(Margin::symmetric(12, 5))
-                .stroke(Stroke::new(1.0, Color32::from_rgb(245, 158, 11)))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!("Active Advisory / Faults: {:?}", faults))
-                            .strong()
-                            .size(12.0)
-                            .color(Color32::from_rgb(254, 243, 199)),
-                    );
-                });
-        }
-    }
 }

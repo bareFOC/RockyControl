@@ -712,6 +712,12 @@ impl StudioModel {
         self.playback_aborted = false;
         self.recovery_playback = false;
         self.pending_config.clear();
+        // A fresh experiment always starts disarmed and in Teach. Do this AFTER
+        // clearing pending_config: reset_estop() queues ConfigCmd::ClearFaults,
+        // which is what actually releases the kernel's latched ESTOP fault.
+        if self.is_estop_active() {
+            self.reset_estop();
+        }
     }
 
     pub fn load_bundle(&mut self, bundle: AssetBundle) -> Result<(), String> {
@@ -1363,16 +1369,25 @@ mod tests {
     fn reset_experiment_state_clears_seq_playback_and_pending_config() {
         let (mut model, _) = playing_model();
         model.tx_seq = 41;
+        model.trigger_estop();
         model.playback_aborted = true;
         model.recovery_playback = true;
         model.pending_config.push(ConfigCmd::ClearFaults);
 
         model.reset_experiment_state();
 
+        assert!(!model.is_estop_active(), "E-Stop must not leak into a script");
         assert_eq!(model.tx_seq, 0, "scripted packets must start at seq 0");
         assert!(model.playback.is_none(), "active action must not leak into a script");
         assert!(!model.playback_aborted, "abort latch must not leak into a script");
         assert!(!model.recovery_playback, "recovery handoff must not leak into a script");
-        assert!(model.pending_config.is_empty(), "queued config must not leak into a script");
+        // An E-Stop reset intentionally re-queues ClearFaults so the kernel's
+        // latched fault is released on the next packet; other config must not leak.
+        assert!(
+            model.pending_config.len() == 1
+                && matches!(model.pending_config[0], ConfigCmd::ClearFaults),
+            "only the E-Stop ClearFaults command may remain: {:?}",
+            model.pending_config
+        );
     }
 }

@@ -1358,6 +1358,15 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
                 let action = args.get("action").and_then(Value::as_str).unwrap_or("");
                 match action {
                     "start" => {
+                        // Replay always starts a fresh ControlTask. Reset first so the
+                        // recording begins at kernel index zero (mode transitions such
+                        // as Teach -> Drive otherwise leave the live kernel in a state
+                        // a fresh task cannot reproduce).
+                        if self.host.transport().kind() == TransportKind::SimKernel {
+                            if let Err(err) = self.host.reset_experiment() {
+                                return self.err_result(name, "reset failed", err);
+                            }
+                        }
                         self.host.transport_mut().start_recording();
                         self.ok_json(name, "recording started", json!({"recording": true}))
                     }
@@ -1555,6 +1564,55 @@ mod tests {
         assert_eq!(body["exact_match"], true, "replay result: {body}");
         assert_eq!(body["matched_ticks"], body["total_ticks"]);
         assert_eq!(body["total_ticks"], 80);
+    }
+
+    /// Recording after a Teach -> Drive transition used to capture a kernel
+    /// mid-stream while replay always starts a fresh ControlTask, producing
+    /// 0/N exact matches. `recording_control(start)` now resets first.
+    #[test]
+    fn mcp_replay_is_exact_when_recording_starts_after_drive_transition() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
+        host.set_drive_armed(true);
+        let _ = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "robot_connect", "arguments": {"transport": "sim"}}}),
+        )
+        .expect("connect reply");
+        let drive = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "mode_set", "arguments": {"mode": "drive"}}}),
+        )
+        .expect("mode reply");
+        assert!(drive["result"]["isError"].is_null());
+
+        let start = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "recording_control", "arguments": {"action": "start"}}}),
+        )
+        .expect("recording start reply");
+        assert!(start["result"]["isError"].is_null());
+
+        let shove = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "sim_push_shove", "arguments": {"pitch_impulse_rad_s": 0.8, "roll_impulse_rad_s": -0.4, "step_ticks": 40}}}),
+        )
+        .expect("shove reply");
+        assert!(shove["result"]["isError"].is_null());
+
+        let _ = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "recording_control", "arguments": {"action": "stop"}}}),
+        )
+        .expect("stop reply");
+        let verify = dispatch_json_rpc(
+            &mut host,
+            json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "recording_control", "arguments": {"action": "verify_replay"}}}),
+        )
+        .expect("verify reply");
+        let body: Value = serde_json::from_str(verify["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["exact_match"], true, "replay result: {body}");
+        assert_eq!(body["matched_ticks"], 40);
     }
 
     /// The native Sim drawer writes the same `SimFaultInjection` fields directly;

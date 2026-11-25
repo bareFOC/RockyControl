@@ -153,12 +153,22 @@ impl SceneResources {
         camera.set_viewport(viewport);
 
         // Root translation from plant telemetry. Applied outside the tilt/body transform
-        // so the whole robot walks across the world-fixed grid; the floor plate and
-        // grid meshes are deliberately left untranslated as world-space references.
+        // so the whole robot follows its achieved world position.
         let root = iso_to_mat4(&apply_world_offset(
             &Isometry3::identity(),
             frame.world_offset,
         ));
+
+        // Keep the studio floor grid centred under the robot. Only the horizontal
+        // world offset is applied: the grid stays on the ground plane (y = 0) and
+        // simply follows the robot's x/z translation, so walking never slides the
+        // robot off its reference grid.
+        let grid_translation =
+            Mat4::from_translation(vec3(frame.world_offset[0], 0.0, frame.world_offset[2]));
+        self.floor_plate.set_transformation(grid_translation);
+        for line in &mut self.floor_grid {
+            line.set_transformation(grid_translation);
+        }
 
         // Update solid measured transforms + current heat-tinting + selection highlight
         for item in &mut self.items {
