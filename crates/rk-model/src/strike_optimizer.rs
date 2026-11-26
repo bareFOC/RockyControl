@@ -98,13 +98,13 @@ pub struct StrikeParams {
 
 impl Default for StrikeParams {
     fn default() -> Self {
-        Self::rocky_mk1()
+        Self::humanoid()
     }
 }
 
 impl StrikeParams {
-    /// Parameters for the 1.5 kg Rocky Mk1 with the bundled estimator geometry.
-    pub const fn rocky_mk1() -> Self {
+    /// Parameters for the 1.39 kg 28-DoF humanoid profile.
+    pub const fn humanoid() -> Self {
         Self {
             distal_mass_kg: 0.20,
             joint_inertia_kg_m2: 0.002,
@@ -452,9 +452,9 @@ pub fn optimize_strikes(
         .unwrap_or_else(|| rig.default_pose());
 
     let recipes: [(&str, &str, &str, StrikeParams); 3] = [
-        ("left jab", "l_forearm", "Strike", StrikeParams::rocky_mk1()),
-        ("right cross", "r_forearm", "Strike", StrikeParams::rocky_mk1()),
-        ("front kick", "r_foot", "Kick", StrikeParams::rocky_mk1().kicking()),
+        ("left jab", "Lower_Forearm_Left_1", "Strike", StrikeParams::humanoid()),
+        ("right cross", "Lower_Forearm_Right_1", "Strike", StrikeParams::humanoid()),
+        ("front kick", "Foot_Right_1", "Kick", StrikeParams::humanoid().kicking()),
     ];
 
     let mut out = Vec::new();
@@ -571,7 +571,7 @@ mod tests {
     use crate::BUNDLED_URDF_XML;
 
     fn rig() -> KinematicRig {
-        KinematicRig::from_urdf_xml(BUNDLED_URDF_XML).expect("bundled rocky_mk1.urdf must parse")
+        KinematicRig::from_urdf_xml(BUNDLED_URDF_XML).expect("bundled humanoid.urdf must parse")
     }
 
     fn assert_pose_within_limits(rig: &KinematicRig, pose: &[f32; MAX_JOINTS]) {
@@ -688,14 +688,14 @@ mod tests {
             .unwrap();
         let guard = authored.iter().find(|m| m.name == "Guard").unwrap().keyframes[0].angles_rad;
         let make = |margin: f32| {
-            let mut params = StrikeParams::rocky_mk1();
+            let mut params = StrikeParams::humanoid();
             params.support_margin_m = margin;
             optimize_strike(
                 &rig,
                 &StrikeTarget {
                     name: "probe".to_string(),
                     category: "Strike".to_string(),
-                    end_effector_link: "l_forearm".to_string(),
+                    end_effector_link: "Lower_Forearm_Left_1".to_string(),
                     windup_pose: base.keyframes[0].angles_rad,
                     authored_impact_pose: base.keyframes[1].angles_rad,
                     guard_pose: guard,
@@ -726,7 +726,7 @@ mod tests {
             authored_impact_pose: base.keyframes[1].angles_rad,
             guard_pose: guard,
             impact_duration_ms: 360,
-            params: StrikeParams::rocky_mk1(),
+            params: StrikeParams::humanoid(),
         };
         assert_eq!(
             optimize_strike(&rig, &target).err(),

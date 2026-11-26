@@ -262,7 +262,7 @@ impl RockyStudioApp {
                                 )
                                 .clicked()
                             {
-                                self.apply_loaded_bundle(AssetBundle::bundled_rocky());
+                                self.apply_loaded_bundle(AssetBundle::bundled_humanoid());
                             }
                             if ui
                                 .add(

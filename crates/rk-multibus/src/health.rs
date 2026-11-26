@@ -18,7 +18,7 @@ pub const MAX_CONSECUTIVE_TIMEOUTS: u8 = 3;
 pub struct MultibusBusTracker {
     joint_count: usize,
     consecutive_timeouts: [u8; MAX_JOINTS],
-    degraded_mask: u32,
+    degraded_mask: u64,
     total_timeout_count: u16,
     tx_seq: u8,
     feedback: RawServoFeedback,
@@ -70,7 +70,7 @@ impl MultibusBusTracker {
             return;
         }
         self.consecutive_timeouts[joint] = 0;
-        self.degraded_mask &= !(1u32 << joint);
+        self.degraded_mask &= !(1u64 << joint);
         self.feedback.raw_angle_rad[joint] = reply.position_rad;
         self.feedback.velocity_rad_s[joint] = reply.velocity_rad_s;
         self.feedback.current_ma[joint] = amps_to_milliamps(reply.current_amps);
@@ -87,7 +87,7 @@ impl MultibusBusTracker {
         self.total_timeout_count = self.total_timeout_count.saturating_add(1);
         self.consecutive_timeouts[joint] = self.consecutive_timeouts[joint].saturating_add(1);
         if self.consecutive_timeouts[joint] >= MAX_CONSECUTIVE_TIMEOUTS {
-            self.degraded_mask |= 1u32 << joint;
+            self.degraded_mask |= 1u64 << joint;
         }
         self.feedback.i3c_timeout_count = self.total_timeout_count;
         self.feedback.bus_error = self.degraded_mask != 0;
@@ -100,7 +100,7 @@ impl MultibusBusTracker {
         }
     }
 
-    pub const fn degraded_mask(&self) -> u32 {
+    pub const fn degraded_mask(&self) -> u64 {
         self.degraded_mask
     }
 
@@ -117,7 +117,7 @@ impl MultibusBusTracker {
     }
 
     pub fn is_degraded(&self, joint: usize) -> bool {
-        joint < MAX_JOINTS && (self.degraded_mask & (1u32 << joint)) != 0
+        joint < MAX_JOINTS && (self.degraded_mask & (1u64 << joint)) != 0
     }
 
     pub const fn snapshot(&self) -> RawServoFeedback {
@@ -164,7 +164,7 @@ mod tests {
         assert!(!tracker.snapshot().bus_error);
 
         tracker.record_timeout(7);
-        assert_eq!(tracker.degraded_mask(), 1u32 << 7);
+        assert_eq!(tracker.degraded_mask(), 1u64 << 7);
         assert!(tracker.is_degraded(7));
         assert!(!tracker.is_degraded(0));
         assert!(tracker.snapshot().bus_error);

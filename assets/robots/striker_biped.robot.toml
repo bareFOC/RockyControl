@@ -1,0 +1,98 @@
+name = "striker_biped"
+urdf = "striker_biped.urdf"
+z_up = true
+pelvis_link = "base_link"
+left_foot_link = "l_foot_link"
+right_foot_link = "r_foot_link"
+imu_link = "base_link"
+imu_mounting_rpy = [0.0, 0.0, 0.0]
+foot_half_length_m = 0.09
+foot_margin_m = 0.06
+h_com_m = 0.42
+
+[leg_geometry]
+thigh_len = 0.25
+shin_len = 0.25
+hip_ankle_offset = 0.07
+half_hip_spacing = 0.10
+nominal_height = 0.48
+min_height = 0.36
+max_reach = 0.495
+max_dx = 0.12
+max_dy = 0.10
+max_swing_dx = 0.16
+max_swing_dy = 0.14
+max_foot_lift = 0.07
+max_sway = 0.05
+
+[[actuators]]
+urdf_joint = "head_yaw"
+role = "head_yaw"
+bus_id = 0
+node_addr = 0x20
+nm_per_amp = 0.9
+max_torque_nm = 12.0
+max_velocity_rad_s = 6.0
+
+[[actuators]]
+urdf_joint = "l_hip_pitch"
+role = "l_hip_pitch"
+bus_id = 0
+node_addr = 0x21
+nm_per_amp = 0.9
+max_torque_nm = 25.0
+max_velocity_rad_s = 6.0
+
+[[actuators]]
+urdf_joint = "l_knee_pitch"
+role = "l_knee_pitch"
+bus_id = 0
+node_addr = 0x22
+nm_per_amp = 0.9
+max_torque_nm = 25.0
+max_velocity_rad_s = 6.0
+
+[[actuators]]
+urdf_joint = "l_ankle_pitch"
+role = "l_ankle_pitch"
+bus_id = 0
+node_addr = 0x23
+nm_per_amp = 0.9
+max_torque_nm = 18.0
+max_velocity_rad_s = 6.0
+
+[[actuators]]
+urdf_joint = "r_hip_pitch"
+role = "r_hip_pitch"
+bus_id = 0
+node_addr = 0x24
+nm_per_amp = 0.9
+max_torque_nm = 25.0
+max_velocity_rad_s = 6.0
+
+[[actuators]]
+urdf_joint = "r_knee_pitch"
+role = "r_knee_pitch"
+bus_id = 0
+node_addr = 0x25
+nm_per_amp = 0.9
+max_torque_nm = 25.0
+max_velocity_rad_s = 6.0
+
+[[actuators]]
+urdf_joint = "r_ankle_pitch"
+role = "r_ankle_pitch"
+bus_id = 0
+node_addr = 0x26
+nm_per_amp = 0.9
+max_torque_nm = 18.0
+max_velocity_rad_s = 6.0
+
+[[actuators]]
+urdf_joint = "l_shoulder_pitch"
+role = "l_shoulder_pitch"
+bus_id = 0
+node_addr = 0x27
+nm_per_amp = 0.9
+max_torque_nm = 15.0
+max_velocity_rad_s = 6.0

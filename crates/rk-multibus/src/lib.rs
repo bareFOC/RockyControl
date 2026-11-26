@@ -42,10 +42,11 @@ pub use health::{
 };
 pub use joint_map::{
     bind_joint, decode_feedback_burst, decode_joint_command, encode_feedback_burst, joint_node_addr,
-    read_joint_feedback, write_joint_command, JointCommand, JointFeedback, TorqueConstants,
-    FEEDBACK_BURST_LEN, FEEDBACK_BURST_REG, JOINT_NODE_BASE, MAX_SERVO_JOINTS,
+    read_joint_feedback, write_joint_command, JointCommand, JointFeedback,
+    FEEDBACK_BURST_LEN, FEEDBACK_BURST_REG, MAX_SERVO_JOINTS,
     REG_PRESENT_TEMP_MCU, REG_PRESENT_TEMP_MOTOR, REG_PRESENT_TEMPERATURE,
 };
+pub use rk_robot_profile::{JOINT_NODE_BASE, TorqueConstants};
 pub use transport::{
     PioError, PioI3c, PioI3cBus,
 };

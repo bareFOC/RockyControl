@@ -60,3 +60,10 @@ MCP tool behavior, the live GUI HTTP listener, running/CBF/impact-through-app, s
 #### Scenario: Staged model pull
 - **WHEN** a model is staged on the simulated MCU and pulled through the chunked protocol with an injected CRC failure
 - **THEN** retry succeeds and the pulled model matches the source
+
+### Requirement: 28-DoF golden fixtures and sim-verify pass
+The committed golden replay fixtures (`walk_nominal.copper`) and scripted experiments (`walk_nominal.json`, `walk_shove.json`, `fall_recover.json`) SHALL reflect the REP-103-normalized, tuned 28-DoF humanoid and SHALL pass `cargo run -p xtask -- sim-verify` with `exact_match` replay verification.
+
+#### Scenario: Golden sim-verify gate passes on 28-DoF humanoid
+- **WHEN** `cargo run -p xtask -- sim-verify` runs after 28-DoF bringup
+- **THEN** all host, firmware-core, RP2350, WASM, scripted experiment, and `.copper` replay checks pass with zero violations

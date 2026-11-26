@@ -1,0 +1,1295 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="humanoid">
+  <material name="silver_default">
+    <color rgba="0.700 0.700 0.700 1.000" />
+  </material>
+  <material name="plastic_matte_white">
+    <color rgba="0.9647058823529412 0.9647058823529412 0.9529411764705882 1.0" />
+  </material>
+  <material name="rambros_orange">
+    <color rgba="1.0 0.5058823529411764 0.043137254901960784 1.0" />
+  </material>
+  <transmission name="Revolute 1_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="waist_yaw">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 1_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 2_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="waist_roll">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 2_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 3_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="waist_pitch">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 3_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 5_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="head_roll">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 5_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 6_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="head_pitch">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 6_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 7_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="head_yaw">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 7_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 8_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_hip_pitch">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 8_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 9_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_hip_roll">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 9_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 10_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_hip_yaw">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 10_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 11_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_knee_upper">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 11_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 12_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_knee_lower">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 12_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 13_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_ankle_roll">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 13_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 14_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_ankle_pitch">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 14_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 15_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_toe_pitch">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 15_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 16_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_shoulder_pitch">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 16_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 17_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_shoulder_roll">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 17_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 18_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_shoulder_yaw">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 18_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 19_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_elbow_upper">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 19_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 20_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="r_elbow_lower">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 20_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 22_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_hip_pitch">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 22_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 23_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_hip_roll">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 23_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 24_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_hip_yaw">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 24_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 25_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_knee_upper">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 25_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 26_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_knee_lower">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 26_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 27_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_ankle_roll">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 27_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 28_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_ankle_pitch">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 28_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 29_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_toe_pitch">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 29_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 30_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_shoulder_pitch">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 30_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 31_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_shoulder_roll">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 31_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 32_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_shoulder_yaw">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 32_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 33_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_elbow_upper">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 33_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <transmission name="Revolute 34_tran">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="l_elbow_lower">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="Revolute 34_actr">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+  <link name="base_link">
+    <inertial>
+      <origin xyz="-0.000146858980726 2.01298973261e-17 0.275569554527" rpy="0 0 0" />
+      <mass value="0.0870304228599534" />
+      <inertia ixx="2.45650869165e-05" iyy="1.87080004008e-05" izz="2.06078701487e-05" ixy="-3.52952502017e-20" iyz="9.97798117846e-22" ixz="-2.31096355196e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/base_link.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/base_link.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Waist_1">
+    <inertial>
+      <origin xyz="-0.00291598068929 -6.44976156124e-09 -0.061422487337" rpy="0 0 0" />
+      <mass value="0.112298897182183" />
+      <inertia ixx="4.76816793886e-05" iyy="4.18581740131e-05" izz="4.33240560842e-05" ixy="1.19471939531e-11" iyz="-2.59186818886e-11" ixz="-4.65636294937e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 -0.3" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Waist_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.3" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Waist_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Backbone_1">
+    <inertial>
+      <origin xyz="-1.8761522174e-17 1.97770771155e-11 -8.90064577597e-10" rpy="0 0 0" />
+      <mass value="0.00328282172111711" />
+      <inertia ixx="1.46860014849e-07" iyy="1.40922240428e-07" izz="2.55182100169e-07" ixy="4.79039029447e-22" iyz="-1.73565897854e-15" ixz="-1.71084819897e-23" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 -0.3" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Backbone_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.3" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Backbone_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Chest_1">
+    <inertial>
+      <origin xyz="0.00113850203577 5.70522160479e-09 0.0281374635994" rpy="0 0 0" />
+      <mass value="0.18940792717964" />
+      <inertia ixx="9.45792517569e-05" iyy="7.24162903413e-05" izz="8.49941213004e-05" ixy="1.84176774675e-12" iyz="-2.05288509867e-11" ixz="3.65435747498e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 -0.3" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Chest_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.3" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Chest_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Lower_Neck_1">
+    <inertial>
+      <origin xyz="-0.00241099447017 -1.31378399109e-09 0.0132612329448" rpy="0 0 0" />
+      <mass value="0.0307701989781159" />
+      <inertia ixx="3.74024797958e-06" iyy="4.0791321934e-06" izz="4.44219571938e-06" ixy="1.70659123938e-12" iyz="1.53788043816e-12" ixz="-3.62381012065e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Lower_Neck_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Lower_Neck_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Neck_1">
+    <inertial>
+      <origin xyz="-0.00365558480036 1.675462389e-18 0" rpy="0 0 0" />
+      <mass value="0.00102112329836749" />
+      <inertia ixx="2.92040462183e-08" iyy="1.08090369648e-08" izz="3.42549862211e-08" ixy="-2.33627075212e-23" iyz="4.27713420237e-24" ixz="0" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 -0.38" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Neck_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.38" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Neck_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Upper_Neck_1">
+    <inertial>
+      <origin xyz="0.00114501778274 -1.48401375851e-08 0.00741505727576" rpy="0 0 0" />
+      <mass value="0.00843022728991839" />
+      <inertia ixx="5.16300322144e-07" iyy="4.98044680926e-07" izz="6.50288097399e-07" ixy="1.54601416736e-12" iyz="-2.97139216921e-13" ixz="6.26721234846e-08" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 -0.38" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Upper_Neck_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.38" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Upper_Neck_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Head_1">
+    <inertial>
+      <origin xyz="0.00464375164986 -2.25348399475e-17 0.0276742309564" rpy="0 0 0" />
+      <mass value="0.0874602812818963" />
+      <inertia ixx="2.26779627881e-05" iyy="2.51237834029e-05" izz="2.03179106035e-05" ixy="-1.79119569498e-20" iyz="-1.62201145507e-20" ixz="3.38371600546e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 -0.38" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Head_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.38" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Head_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Hip_Joint_Right_1">
+    <inertial>
+      <origin xyz="-1.95647750778e-18 -0.0208957386108 -0.000369931883411" rpy="0 0 0" />
+      <mass value="0.00699564875813173" />
+      <inertia ixx="4.3887498148e-07" iyy="2.16962459249e-07" izz="4.70448144038e-07" ixy="-6.98611550898e-23" iyz="1.57367930598e-08" ixz="5.06319459547e-24" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 -0.22" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Hip_Joint_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.22" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Hip_Joint_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Hip_Right_1">
+    <inertial>
+      <origin xyz="-6.75999745256e-09 -0.00106327786679 -0.00890551197265" rpy="0 0 0" />
+      <mass value="0.0629392739256309" />
+      <inertia ixx="1.36868286912e-05" iyy="1.77355434941e-05" izz="1.29293455848e-05" ixy="-1.92845127054e-12" iyz="9.6358824547e-07" ixz="1.12564687494e-11" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0.026 -0.22" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Hip_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0.026 -0.22" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Hip_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Thigh_Right_1">
+    <inertial>
+      <origin xyz="0.00176960816708 3.87838250057e-09 -0.0562139313008" rpy="0 0 0" />
+      <mass value="0.0875175540888593" />
+      <inertia ixx="3.53336900894e-05" iyy="3.65457750539e-05" izz="1.40804595228e-05" ixy="1.16190466197e-12" iyz="1.57896832545e-11" ixz="1.17071548832e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0.026 -0.22" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Thigh_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0.026 -0.22" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Thigh_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Knee_Right_1">
+    <inertial>
+      <origin xyz="0.00335655237361 3.80484636853e-11 -0.0100000001908" rpy="0 0 0" />
+      <mass value="0.0135531453857907" />
+      <inertia ixx="1.22197445547e-06" iyy="1.57416095686e-06" izz="8.01491124036e-07" ixy="-1.57079013815e-14" iyz="-5.52355605915e-15" ixz="2.83822775056e-14" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0.026 -0.132" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Knee_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="0 0.026 -0.132" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Knee_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Shin_Right_1">
+    <inertial>
+      <origin xyz="-0.000409136914528 -1.51016114867e-05 -0.0372901570733" rpy="0 0 0" />
+      <mass value="0.0668023480033833" />
+      <inertia ixx="4.28676573408e-05" iyy="4.13446313833e-05" izz="6.31173835909e-06" ixy="-8.16569885103e-11" iyz="-5.12193732991e-08" ixz="2.21824332071e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0.026 -0.112" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Shin_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0.026 -0.112" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Shin_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Ankle_1">
+    <inertial>
+      <origin xyz="0.000544349886616 -6.93889390391e-18 4.67179134267e-09" rpy="0 0 0" />
+      <mass value="0.000990642607116602" />
+      <inertia ixx="2.83197029101e-08" iyy="1.02066148944e-08" izz="3.30994600707e-08" ixy="1.32348898008e-23" iyz="0" ixz="7.68691842727e-15" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.003 0.026 -0.022" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Ankle_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="-0.003 0.026 -0.022" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Ankle_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Foot_Right_1">
+    <inertial>
+      <origin xyz="0.00610155904647 -0.000831394038953 -0.0128834124519" rpy="0 0 0" />
+      <mass value="0.0319426526407283" />
+      <inertia ixx="2.52616001437e-06" iyy="7.45292819905e-06" izz="7.99109104717e-06" ixy="2.88325631832e-07" iyz="-8.06706421422e-08" ixz="2.62813149654e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0.026 -0.022" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Foot_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0.026 -0.022" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Foot_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Toe_1">
+    <inertial>
+      <origin xyz="0.00781888167646 -0.0105252095004 -0.00107778338387" rpy="0 0 0" />
+      <mass value="0.00479473282553439" />
+      <inertia ixx="2.18759297649e-07" iyy="2.05395828529e-07" izz="3.44349657363e-07" ixy="3.28652765501e-08" iyz="-5.03468715898e-09" ixz="1.8531200826e-08" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.029 0.013 -0.006" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Toe_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="-0.029 0.013 -0.006" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Toe_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Shoulder_Joint_Right_1">
+    <inertial>
+      <origin xyz="0.00107980142136 -0.0389785523318 -5.42613942157e-05" rpy="0 0 0" />
+      <mass value="0.01304468675718" />
+      <inertia ixx="1.25197937234e-06" iyy="6.81225032107e-07" izz="1.15240390339e-06" ixy="1.11018760477e-07" iyz="1.0854287671e-09" ixz="-5.13192299367e-09" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Shoulder_Joint_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Shoulder_Joint_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Shoulder_Right_1">
+    <inertial>
+      <origin xyz="-4.16761735362e-06 -0.00189742414893 -0.00916985949042" rpy="0 0 0" />
+      <mass value="0.0239926089021528" />
+      <inertia ixx="3.17965498678e-06" iyy="4.10553457585e-06" izz="3.3755168435e-06" ixy="-1.0003195447e-07" iyz="3.04608947239e-07" ixz="-4.36935756023e-08" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0.046 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Shoulder_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0.046 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Shoulder_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Upper_Arm_1">
+    <inertial>
+      <origin xyz="-0.000934868658483 3.9951458246e-05 -0.0424801000633" rpy="0 0 0" />
+      <mass value="0.0510899591044482" />
+      <inertia ixx="1.35453821822e-05" iyy="1.38093690568e-05" izz="6.10693994426e-06" ixy="4.53843715025e-09" iyz="3.05094400089e-08" ixz="-7.36856198285e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0.046 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Upper_Arm_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0.046 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Upper_Arm_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Elbow_Right_1">
+    <inertial>
+      <origin xyz="-0.00484437392106 -4.51091247688e-12 -0.00865541519329" rpy="0 0 0" />
+      <mass value="0.0088519869938443" />
+      <inertia ixx="5.68476392812e-07" iyy="7.86891981973e-07" izz="4.46154224817e-07" ixy="3.43733169776e-16" iyz="-3.56370477832e-15" ixz="-8.17159599354e-08" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0.046 -0.28" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Elbow_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="0 0.046 -0.28" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Elbow_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Lower_Forearm_Right_1">
+    <inertial>
+      <origin xyz="-0.00225088275851 -2.60001574501e-05 -0.0205089147387" rpy="0 0 0" />
+      <mass value="0.0449094145604967" />
+      <inertia ixx="1.42508624047e-05" iyy="1.38974214877e-05" izz="4.33735318701e-06" ixy="2.6292403639e-09" iyz="-3.44487973321e-08" ixz="5.1501879541e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0.046 -0.26" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Lower_Forearm_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 0.046 -0.26" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Lower_Forearm_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Hand_Right_1">
+    <inertial>
+      <origin xyz="0.00120340589016 0.0001734225172 -0.017189704567" rpy="0 0 0" />
+      <mass value="0.0192678887989449" />
+      <inertia ixx="3.9679272208e-06" iyy="5.31274231602e-06" izz="2.62549176288e-06" ixy="-5.26689117118e-08" iyz="3.08892776503e-08" ixz="-1.2795155276e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0.046 -0.21" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Hand_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="0 0.046 -0.21" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Hand_Right_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Hip_Joint_Left_1">
+    <inertial>
+      <origin xyz="0 0.0208957459128 -0.000369907688945" rpy="0 0 0" />
+      <mass value="0.006995624371089" />
+      <inertia ixx="4.38873939041e-07" iyy="2.16960897648e-07" izz="4.70447367845e-07" ixy="-1.36868294476e-22" iyz="-1.57367069896e-08" ixz="-2.05302441714e-22" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 -0.22" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Hip_Joint_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.22" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Hip_Joint_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Hip_Left_1">
+    <inertial>
+      <origin xyz="-6.75999745256e-09 0.00106327786679 -0.00890551197265" rpy="0 0 0" />
+      <mass value="0.0629392739256309" />
+      <inertia ixx="1.36868286912e-05" iyy="1.77355434941e-05" izz="1.29293455848e-05" ixy="1.92845126616e-12" iyz="-9.6358824547e-07" ixz="1.12564687494e-11" />
+    </inertial>
+    <visual>
+      <origin xyz="0 -0.026 -0.22" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Hip_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 -0.026 -0.22" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Hip_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Thigh_Left_1">
+    <inertial>
+      <origin xyz="0.00176960816708 -3.87838250751e-09 -0.0562139313008" rpy="0 0 0" />
+      <mass value="0.0875175540888593" />
+      <inertia ixx="3.53336900894e-05" iyy="3.65457750539e-05" izz="1.40804595228e-05" ixy="-1.16190464927e-12" iyz="-1.57896833629e-11" ixz="1.17071548832e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 -0.026 -0.22" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Thigh_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 -0.026 -0.22" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Thigh_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Knee_Left_1">
+    <inertial>
+      <origin xyz="0.00335655290268 -9.81665512767e-11 -0.0100000001908" rpy="0 0 0" />
+      <mass value="0.013553145051522" />
+      <inertia ixx="1.22197431891e-06" iyy="1.57416057178e-06" izz="8.01490844541e-07" ixy="-1.9977555817e-15" iyz="5.5232307985e-15" ixz="2.83818743179e-14" />
+    </inertial>
+    <visual>
+      <origin xyz="0 -0.026 -0.132" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Knee_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="0 -0.026 -0.132" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Knee_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Shin_Left_1">
+    <inertial>
+      <origin xyz="-0.000409136914528 1.51016114867e-05 -0.0372901570733" rpy="0 0 0" />
+      <mass value="0.0668023480033834" />
+      <inertia ixx="4.28676573408e-05" iyy="4.13446313833e-05" izz="6.31173835909e-06" ixy="8.16569885168e-11" iyz="5.12193732992e-08" ixz="2.21824332071e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 -0.026 -0.112" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Shin_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 -0.026 -0.112" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Shin_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Ankle_Left_1">
+    <inertial>
+      <origin xyz="0.000544349886616 3.46944695195e-18 -4.67179128369e-09" rpy="0 0 0" />
+      <mass value="0.000990642607116603" />
+      <inertia ixx="2.83197029101e-08" iyy="1.02066148944e-08" izz="3.30994600707e-08" ixy="0" iyz="0" ixz="-7.68691841404e-15" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.003 -0.026 -0.022" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Ankle_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="-0.003 -0.026 -0.022" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Ankle_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Foot_Left_1">
+    <inertial>
+      <origin xyz="0.00610155904647 0.000831394038953 -0.0128834124519" rpy="0 0 0" />
+      <mass value="0.0319426526407283" />
+      <inertia ixx="2.52616001437e-06" iyy="7.45292819905e-06" izz="7.99109104717e-06" ixy="-2.88325631832e-07" iyz="8.06706421422e-08" ixz="2.62813149654e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 -0.026 -0.022" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Foot_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 -0.026 -0.022" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Foot_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Toe_Left_1">
+    <inertial>
+      <origin xyz="0.00781888186815 0.0105252045178 -0.00107778455523" rpy="0 0 0" />
+      <mass value="0.00479472760392661" />
+      <inertia ixx="2.18758502842e-07" iyy="2.05395758013e-07" izz="3.44348928773e-07" ixy="-3.28652957887e-08" iyz="5.03471309512e-09" ixz="1.85311991343e-08" />
+    </inertial>
+    <visual>
+      <origin xyz="-0.029 -0.013 -0.006" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Toe_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="-0.029 -0.013 -0.006" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Toe_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Shoulder_Joint_Left_1">
+    <inertial>
+      <origin xyz="0.00107980142136 0.0389785523318 -5.42613942157e-05" rpy="0 0 0" />
+      <mass value="0.01304468675718" />
+      <inertia ixx="1.25197937234e-06" iyy="6.81225032107e-07" izz="1.15240390339e-06" ixy="-1.11018760477e-07" iyz="-1.0854287671e-09" ixz="-5.13192299367e-09" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Shoulder_Joint_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Shoulder_Joint_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Shoulder_Left_1">
+    <inertial>
+      <origin xyz="-4.16761735362e-06 0.00189742414893 -0.00916985949042" rpy="0 0 0" />
+      <mass value="0.0239926089021528" />
+      <inertia ixx="3.17965498678e-06" iyy="4.10553457585e-06" izz="3.3755168435e-06" ixy="1.0003195447e-07" iyz="-3.04608947239e-07" ixz="-4.36935756023e-08" />
+    </inertial>
+    <visual>
+      <origin xyz="0 -0.046 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Shoulder_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 -0.046 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Shoulder_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Upper_Arm_Left_1">
+    <inertial>
+      <origin xyz="-0.000934868658483 -3.9951458246e-05 -0.0424801000633" rpy="0 0 0" />
+      <mass value="0.0510899591044482" />
+      <inertia ixx="1.35453821822e-05" iyy="1.38093690568e-05" izz="6.10693994426e-06" ixy="-4.53843715025e-09" iyz="-3.05094400089e-08" ixz="-7.36856198285e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 -0.046 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Upper_Arm_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 -0.046 -0.344" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Upper_Arm_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Elbow_Left_1">
+    <inertial>
+      <origin xyz="-0.00484437396447 -4.51094717135e-12 -0.00865541518679" rpy="0 0 0" />
+      <mass value="0.0088519869510671" />
+      <inertia ixx="5.68476329097e-07" iyy="7.86891904321e-07" izz="4.46154208234e-07" ixy="3.4373867549e-16" iyz="3.45634165819e-15" ixz="-8.17159604523e-08" />
+    </inertial>
+    <visual>
+      <origin xyz="0 -0.046 -0.28" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Elbow_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="0 -0.046 -0.28" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Elbow_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Lower_Forearm_Left_1">
+    <inertial>
+      <origin xyz="-0.00225088275851 2.60001574501e-05 -0.0205089147387" rpy="0 0 0" />
+      <mass value="0.0449094145604967" />
+      <inertia ixx="1.42508624047e-05" iyy="1.38974214877e-05" izz="4.33735318701e-06" ixy="-2.6292403639e-09" iyz="3.44487973321e-08" ixz="5.1501879541e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 -0.046 -0.26" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Lower_Forearm_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="plastic_matte_white" />
+    </visual>
+    <collision>
+      <origin xyz="0 -0.046 -0.26" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Lower_Forearm_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="Hand_Left_1">
+    <inertial>
+      <origin xyz="0.00120340589016 -0.0001734225172 -0.017189704567" rpy="0 0 0" />
+      <mass value="0.0192678887989449" />
+      <inertia ixx="3.9679272208e-06" iyy="5.31274231602e-06" izz="2.62549176288e-06" ixy="5.26689117118e-08" iyz="-3.08892776503e-08" ixz="-1.2795155276e-07" />
+    </inertial>
+    <visual>
+      <origin xyz="0 -0.046 -0.21" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Hand_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+      <material name="rambros_orange" />
+    </visual>
+    <collision>
+      <origin xyz="0 -0.046 -0.21" rpy="0 0 1.5707963268" />
+      <geometry>
+        <mesh filename="package://humanoid_description/meshes/Hand_Left_1.stl" scale="0.001 0.001 0.001" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="waist_yaw" type="revolute">
+    <origin xyz="0 0 0.3" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="Waist_1" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit upper="1.570796" lower="-1.570796" effort="100" velocity="100" />
+  </joint>
+  <joint name="waist_roll" type="revolute">
+    <origin xyz="0 0 0.3" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="Backbone_1" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit upper="0.392699" lower="-0.392699" effort="100" velocity="100" />
+  </joint>
+  <joint name="waist_pitch" type="revolute">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="Backbone_1" />
+    <child link="Chest_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="0.523599" lower="-0.523599" effort="100" velocity="100" />
+  </joint>
+  <joint name="chest_to_lower_neck" type="fixed">
+    <origin xyz="0 0 0.044" rpy="0 0 0" />
+    <parent link="Chest_1" />
+    <child link="Lower_Neck_1" />
+  </joint>
+  <joint name="head_roll" type="revolute">
+    <origin xyz="0 0 0.036" rpy="0 0 0" />
+    <parent link="Lower_Neck_1" />
+    <child link="Neck_1" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit upper="0.523599" lower="-0.523599" effort="100" velocity="100" />
+  </joint>
+  <joint name="head_pitch" type="revolute">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="Neck_1" />
+    <child link="Upper_Neck_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="0.523599" lower="-1.047198" effort="100" velocity="100" />
+  </joint>
+  <joint name="head_yaw" type="revolute">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="Upper_Neck_1" />
+    <child link="Head_1" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit upper="1.570796" lower="-1.570796" effort="100" velocity="100" />
+  </joint>
+  <joint name="r_hip_pitch" type="revolute">
+    <origin xyz="0 0 -0.08" rpy="0 0 0" />
+    <parent link="Waist_1" />
+    <child link="Hip_Joint_Right_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="1.570796" lower="-1.919862" effort="100" velocity="100" />
+  </joint>
+  <joint name="r_hip_roll" type="revolute">
+    <origin xyz="0 -0.026 0" rpy="0 0 0" />
+    <parent link="Hip_Joint_Right_1" />
+    <child link="Hip_Right_1" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit upper="0.174533" lower="-1.570796" effort="100" velocity="100" />
+  </joint>
+  <joint name="r_hip_yaw" type="revolute">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="Hip_Right_1" />
+    <child link="Thigh_Right_1" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit upper="1.570796" lower="-1.570796" effort="100" velocity="100" />
+  </joint>
+  <joint name="r_knee_upper" type="revolute">
+    <origin xyz="0 0 -0.088" rpy="0 0 0" />
+    <parent link="Thigh_Right_1" />
+    <child link="Knee_Right_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="1.48353" lower="0.0" effort="100" velocity="100" />
+  </joint>
+  <joint name="r_knee_lower" type="revolute">
+    <origin xyz="0 0 -0.02" rpy="0 0 0" />
+    <parent link="Knee_Right_1" />
+    <child link="Shin_Right_1" />
+    <axis xyz="0.0 -1.0 0.0" />
+    <limit upper="0.0" lower="-1.48353" effort="100" velocity="100" />
+    <mimic joint="r_knee_upper" multiplier="-1.0" offset="0.0" />
+  </joint>
+  <joint name="r_ankle_roll" type="revolute">
+    <origin xyz="0.003 0 -0.09" rpy="0 0 0" />
+    <parent link="Shin_Right_1" />
+    <child link="Ankle_1" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit upper="0.785398" lower="-0.261799" effort="100" velocity="100" />
+  </joint>
+  <joint name="r_ankle_pitch" type="revolute">
+    <origin xyz="-0.003 0 0" rpy="0 0 0" />
+    <parent link="Ankle_1" />
+    <child link="Foot_Right_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="0.785398" lower="-0.785398" effort="100" velocity="100" />
+  </joint>
+  <joint name="r_toe_pitch" type="revolute">
+    <origin xyz="0.029 0.013 -0.016" rpy="0 0 0" />
+    <parent link="Foot_Right_1" />
+    <child link="Toe_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="1.308997" lower="-1.308997" effort="100" velocity="100" />
+  </joint>
+  <joint name="r_shoulder_pitch" type="revolute">
+    <origin xyz="0 0 0.044" rpy="0 0 0" />
+    <parent link="Chest_1" />
+    <child link="Shoulder_Joint_Right_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="2.094395" lower="-3.490659" effort="100" velocity="100" />
+  </joint>
+  <joint name="r_shoulder_roll" type="revolute">
+    <origin xyz="0 -0.046 0" rpy="0 0 0" />
+    <parent link="Shoulder_Joint_Right_1" />
+    <child link="Shoulder_Right_1" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit upper="0.349066" lower="-1.570796" effort="100" velocity="100" />
+  </joint>
+  <joint name="r_shoulder_yaw" type="revolute">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="Shoulder_Right_1" />
+    <child link="Upper_Arm_1" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit upper="1.570796" lower="-1.570796" effort="100" velocity="100" />
+  </joint>
+  <joint name="r_elbow_upper" type="revolute">
+    <origin xyz="0 0 -0.064" rpy="0 0 0" />
+    <parent link="Upper_Arm_1" />
+    <child link="Elbow_Right_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="0.0" lower="-1.48353" effort="100" velocity="100" />
+  </joint>
+  <joint name="r_elbow_lower" type="revolute">
+    <origin xyz="0 0 -0.02" rpy="0 0 0" />
+    <parent link="Elbow_Right_1" />
+    <child link="Lower_Forearm_Right_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="0.0" lower="-1.48353" effort="100" velocity="100" />
+    <mimic joint="r_elbow_upper" multiplier="1.0" offset="0.0" />
+  </joint>
+  <joint name="r_forearm_to_hand" type="fixed">
+    <origin xyz="0 0 -0.05" rpy="0 0 0" />
+    <parent link="Lower_Forearm_Right_1" />
+    <child link="Hand_Right_1" />
+  </joint>
+  <joint name="l_hip_pitch" type="revolute">
+    <origin xyz="0 0 -0.08" rpy="0 0 0" />
+    <parent link="Waist_1" />
+    <child link="Hip_Joint_Left_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="1.570796" lower="-1.919862" effort="100" velocity="100" />
+  </joint>
+  <joint name="l_hip_roll" type="revolute">
+    <origin xyz="0 0.026 0" rpy="0 0 0" />
+    <parent link="Hip_Joint_Left_1" />
+    <child link="Hip_Left_1" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit upper="1.570796" lower="-0.174533" effort="100" velocity="100" />
+  </joint>
+  <joint name="l_hip_yaw" type="revolute">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="Hip_Left_1" />
+    <child link="Thigh_Left_1" />
+    <axis xyz="0.0 0.0 -1.0" />
+    <limit upper="1.570796" lower="-1.570796" effort="100" velocity="100" />
+  </joint>
+  <joint name="l_knee_upper" type="revolute">
+    <origin xyz="0 0 -0.088" rpy="0 0 0" />
+    <parent link="Thigh_Left_1" />
+    <child link="Knee_Left_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="1.48353" lower="0.0" effort="100" velocity="100" />
+  </joint>
+  <joint name="l_knee_lower" type="revolute">
+    <origin xyz="0 0 -0.02" rpy="0 0 0" />
+    <parent link="Knee_Left_1" />
+    <child link="Shin_Left_1" />
+    <axis xyz="0.0 -1.0 0.0" />
+    <limit upper="0.0" lower="-1.48353" effort="100" velocity="100" />
+    <mimic joint="l_knee_upper" multiplier="-1.0" offset="0.0" />
+  </joint>
+  <joint name="l_ankle_roll" type="revolute">
+    <origin xyz="0.003 0 -0.09" rpy="0 0 0" />
+    <parent link="Shin_Left_1" />
+    <child link="Ankle_Left_1" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit upper="0.261799" lower="-0.785398" effort="100" velocity="100" />
+  </joint>
+  <joint name="l_ankle_pitch" type="revolute">
+    <origin xyz="-0.003 0 0" rpy="0 0 0" />
+    <parent link="Ankle_Left_1" />
+    <child link="Foot_Left_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="0.785398" lower="-0.785398" effort="100" velocity="100" />
+  </joint>
+  <joint name="l_toe_pitch" type="revolute">
+    <origin xyz="0.029 -0.013 -0.016" rpy="0 0 0" />
+    <parent link="Foot_Left_1" />
+    <child link="Toe_Left_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="1.308997" lower="-1.308997" effort="100" velocity="100" />
+  </joint>
+  <joint name="l_shoulder_pitch" type="revolute">
+    <origin xyz="0 0 0.044" rpy="0 0 0" />
+    <parent link="Chest_1" />
+    <child link="Shoulder_Joint_Left_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="2.094395" lower="-3.490659" effort="100" velocity="100" />
+  </joint>
+  <joint name="l_shoulder_roll" type="revolute">
+    <origin xyz="0 0.046 0" rpy="0 0 0" />
+    <parent link="Shoulder_Joint_Left_1" />
+    <child link="Shoulder_Left_1" />
+    <axis xyz="1.0 0.0 0.0" />
+    <limit upper="1.570796" lower="-0.349066" effort="100" velocity="100" />
+  </joint>
+  <joint name="l_shoulder_yaw" type="revolute">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="Shoulder_Left_1" />
+    <child link="Upper_Arm_Left_1" />
+    <axis xyz="0.0 0.0 -1.0" />
+    <limit upper="1.570796" lower="-1.570796" effort="100" velocity="100" />
+  </joint>
+  <joint name="l_elbow_upper" type="revolute">
+    <origin xyz="0 0 -0.064" rpy="0 0 0" />
+    <parent link="Upper_Arm_Left_1" />
+    <child link="Elbow_Left_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="0.0" lower="-1.48353" effort="100" velocity="100" />
+  </joint>
+  <joint name="l_elbow_lower" type="revolute">
+    <origin xyz="0 0 -0.02" rpy="0 0 0" />
+    <parent link="Elbow_Left_1" />
+    <child link="Lower_Forearm_Left_1" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit upper="0.0" lower="-1.48353" effort="100" velocity="100" />
+    <mimic joint="l_elbow_upper" multiplier="-1.0" offset="0.0" />
+  </joint>
+  <joint name="l_forearm_to_hand" type="fixed">
+    <origin xyz="0 0 -0.05" rpy="0 0 0" />
+    <parent link="Lower_Forearm_Left_1" />
+    <child link="Hand_Left_1" />
+  </joint>
+</robot>

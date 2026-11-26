@@ -10,7 +10,9 @@ use rk_proto::{ModelFormat, ModelInfo, crc32};
 
 use crate::kinematics::{KinematicRig, VisualShape};
 
-pub const BUNDLED_URDF_XML: &str = include_str!("../../../assets/sample_humanoid/rocky_mk1.urdf");
+pub const BUNDLED_URDF_XML: &str = include_str!("../../../assets/robots/humanoid.urdf");
+pub const BUNDLED_HUMANOID_ZIP: &[u8] =
+    include_bytes!("../../../assets/robots/humanoid_bundle.zip");
 
 /// Provenance of the currently loaded robot URDF bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,7 +27,7 @@ pub enum ModelSource {
 impl ModelSource {
     pub fn label(&self) -> String {
         match self {
-            Self::Bundled => "Bundled (rocky_mk1)".to_string(),
+            Self::Bundled => "Bundled (humanoid)".to_string(),
             Self::SamplePreset(name) => format!("Sample ({name})"),
             Self::UploadedFile(name) => format!("Uploaded ({name})"),
             Self::PastedXml => "Pasted URDF XML".to_string(),
@@ -59,18 +61,16 @@ pub struct AssetBundle {
 
 impl Default for AssetBundle {
     fn default() -> Self {
-        Self::bundled_rocky()
+        Self::bundled_humanoid()
     }
 }
 
 impl AssetBundle {
-    pub fn bundled_rocky() -> Self {
-        Self {
-            robot_name: "rocky_mk1".to_string(),
-            urdf_xml: BUNDLED_URDF_XML.to_string(),
-            files: HashMap::new(),
-            source: ModelSource::Bundled,
-        }
+    pub fn bundled_humanoid() -> Self {
+        let mut bundle = Self::from_bytes("humanoid_bundle.zip", BUNDLED_HUMANOID_ZIP)
+            .expect("bundled humanoid_bundle.zip must be valid");
+        bundle.source = ModelSource::Bundled;
+        bundle
     }
 
     pub fn from_sample(name: &str, urdf_xml: &str) -> Result<Self, String> {

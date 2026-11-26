@@ -1,0 +1,163 @@
+<?xml version="1.0"?>
+<robot name="striker_biped_zup">
+  <material name="chassis_carbon"><color rgba="0.18 0.21 0.27 1.0"/></material>
+  <material name="armor_cobalt"><color rgba="0.14 0.48 0.72 1.0"/></material>
+  <material name="servo_amber"><color rgba="0.88 0.56 0.14 1.0"/></material>
+  <material name="visor_cyan"><color rgba="0.22 0.78 0.90 1.0"/></material>
+
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.16 0.22 0.14"/></geometry>
+      <material name="chassis_carbon"/>
+    </visual>
+    <visual>
+      <origin xyz="0.06 0 0.08" rpy="0 0 0"/>
+      <geometry><box size="0.08 0.16 0.06"/></geometry>
+      <material name="visor_cyan"/>
+    </visual>
+  </link>
+
+  <link name="turret_head">
+    <visual>
+      <origin xyz="0 0 0.06" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.065" length="0.10"/></geometry>
+      <material name="armor_cobalt"/>
+    </visual>
+  </link>
+  <joint name="head_yaw" type="revolute">
+    <parent link="base_link"/>
+    <child link="turret_head"/>
+    <origin xyz="0 0 0.08" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.57" upper="1.57" effort="12.0" velocity="6.0"/>
+  </joint>
+
+  <!-- Left Leg (Z-down) -->
+  <link name="l_hip_link">
+    <visual>
+      <origin xyz="0 0 -0.02" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.042" length="0.07"/></geometry>
+      <material name="servo_amber"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 -0.14" rpy="0 0 0"/>
+      <geometry><box size="0.07 0.08 0.22"/></geometry>
+      <material name="armor_cobalt"/>
+    </visual>
+  </link>
+  <joint name="l_hip_pitch" type="revolute">
+    <parent link="base_link"/>
+    <child link="l_hip_link"/>
+    <origin xyz="0 0.10 -0.07" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.35" upper="1.10" effort="25.0" velocity="6.0"/>
+  </joint>
+
+  <link name="l_shin_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><sphere radius="0.044"/></geometry>
+      <material name="servo_amber"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.036" length="0.24"/></geometry>
+      <material name="chassis_carbon"/>
+    </visual>
+  </link>
+  <joint name="l_knee_pitch" type="revolute">
+    <parent link="l_hip_link"/>
+    <child link="l_shin_link"/>
+    <origin xyz="0 0 -0.25" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0.0" upper="2.0" effort="25.0" velocity="6.0"/>
+  </joint>
+
+  <link name="l_foot_link">
+    <visual>
+      <origin xyz="0.03 0 -0.025" rpy="0 0 0"/>
+      <geometry><box size="0.18 0.09 0.04"/></geometry>
+      <material name="armor_cobalt"/>
+    </visual>
+  </link>
+  <joint name="l_ankle_pitch" type="revolute">
+    <parent link="l_shin_link"/>
+    <child link="l_foot_link"/>
+    <origin xyz="0 0 -0.25" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.8" upper="0.8" effort="18.0" velocity="6.0"/>
+  </joint>
+
+  <!-- Right Leg (Z-down) -->
+  <link name="r_hip_link">
+    <visual>
+      <origin xyz="0 0 -0.02" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.042" length="0.07"/></geometry>
+      <material name="servo_amber"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 -0.14" rpy="0 0 0"/>
+      <geometry><box size="0.07 0.08 0.22"/></geometry>
+      <material name="armor_cobalt"/>
+    </visual>
+  </link>
+  <joint name="r_hip_pitch" type="revolute">
+    <parent link="base_link"/>
+    <child link="r_hip_link"/>
+    <origin xyz="0 -0.10 -0.07" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.35" upper="1.10" effort="25.0" velocity="6.0"/>
+  </joint>
+
+  <link name="r_shin_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><sphere radius="0.044"/></geometry>
+      <material name="servo_amber"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 -0.13" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.036" length="0.24"/></geometry>
+      <material name="chassis_carbon"/>
+    </visual>
+  </link>
+  <joint name="r_knee_pitch" type="revolute">
+    <parent link="r_hip_link"/>
+    <child link="r_shin_link"/>
+    <origin xyz="0 0 -0.25" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="0.0" upper="2.0" effort="25.0" velocity="6.0"/>
+  </joint>
+
+  <link name="r_foot_link">
+    <visual>
+      <origin xyz="0.03 0 -0.025" rpy="0 0 0"/>
+      <geometry><box size="0.18 0.09 0.04"/></geometry>
+      <material name="armor_cobalt"/>
+    </visual>
+  </link>
+  <joint name="r_ankle_pitch" type="revolute">
+    <parent link="r_shin_link"/>
+    <child link="r_foot_link"/>
+    <origin xyz="0 0 -0.25" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.8" upper="0.8" effort="18.0" velocity="6.0"/>
+  </joint>
+
+  <!-- Weapon Shoulder Arms -->
+  <link name="l_arm_pod">
+    <visual>
+      <origin xyz="0.10 0 0" rpy="0 1.5708 0"/>
+      <geometry><cylinder radius="0.035" length="0.20"/></geometry>
+      <material name="servo_amber"/>
+    </visual>
+  </link>
+  <joint name="l_shoulder_pitch" type="revolute">
+    <parent link="base_link"/>
+    <child link="l_arm_pod"/>
+    <origin xyz="0 0.14 0.02" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.4" upper="1.4" effort="15.0" velocity="6.0"/>
+  </joint>
+</robot>

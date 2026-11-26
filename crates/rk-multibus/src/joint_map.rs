@@ -20,11 +20,10 @@ use barefoc_master::{
 };
 use rk_control::{RawServoCommand, RawServoFeedback};
 use rk_proto::{JointCommandMode, MAX_JOINTS};
+use rk_robot_profile::{JOINT_NODE_BASE, TorqueConstants};
 
-/// First BareFOC node address used by Rocky joints.
-pub const JOINT_NODE_BASE: u8 = 0x20;
-/// Rocky Mk1 has 21 actuated joints, therefore nodes `0x20..=0x34`.
-pub const MAX_SERVO_JOINTS: usize = 21;
+/// Maximum number of actuated servo joints supported on the bus.
+pub const MAX_SERVO_JOINTS: usize = 36;
 
 /// Legacy whole-degree MOSFET temperature (`u16`, °C). Mirrors BareFOC
 /// `REG_PRESENT_TEMPERATURE`; not re-exported by `barefoc-master`.
@@ -46,69 +45,6 @@ const _: () = {
     assert!(REG_PRESENT_VELOCITY + 4 == REG_PRESENT_CURRENT);
     assert!(REG_PRESENT_CURRENT + 4 == FEEDBACK_BURST_REG + FEEDBACK_BURST_LEN as u16);
 };
-
-/// Default effective torque constant (0.9 N·m per ampere).
-///
-/// Derived from `rk_control::impact::DEFAULT_MA_PER_NM = 1111 mA/N·m`:
-/// `1000 / 1111 ≈ 0.9 N·m/A`. This includes the gearbox and is documented as
-/// an integrator-supplied constant — the BareFOC control table has no KV or
-/// torque-constant register.
-pub const DEFAULT_NM_PER_AMP: f32 = 0.9;
-
-/// Per-joint torque constants used to convert between Rocky's N·m commands
-/// and the BareFOC control table's `f32` ampere registers.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TorqueConstants {
-    /// Effective N·m per ampere of motor current, indexed by joint.
-    pub nm_per_amp: [f32; MAX_JOINTS],
-}
-
-impl Default for TorqueConstants {
-    fn default() -> Self {
-        Self {
-            nm_per_amp: [DEFAULT_NM_PER_AMP; MAX_JOINTS],
-        }
-    }
-}
-
-impl TorqueConstants {
-    /// Uniform torque constant for every joint.
-    pub const fn uniform(nm_per_amp: f32) -> Self {
-        Self {
-            nm_per_amp: [nm_per_amp; MAX_JOINTS],
-        }
-    }
-
-    fn constant(&self, joint: usize) -> f32 {
-        let k = self.nm_per_amp[joint.min(MAX_JOINTS - 1)];
-        if k.is_finite() && k > 0.0 {
-            k
-        } else {
-            0.0
-        }
-    }
-
-    /// Convert a commanded torque in N·m to BareFOC goal current in amperes.
-    pub fn nm_to_amps(&self, joint: usize, torque_nm: f32) -> f32 {
-        let k = self.constant(joint);
-        if k == 0.0 { 0.0 } else { torque_nm / k }
-    }
-
-    /// Convert a BareFOC current reading in amperes to N·m.
-    pub fn amps_to_nm(&self, joint: usize, current_amps: f32) -> f32 {
-        self.constant(joint) * current_amps
-    }
-
-    /// Convert N·m to Rocky's `u16` milliampere feedback unit.
-    pub fn nm_to_milliamps(&self, joint: usize, torque_nm: f32) -> u16 {
-        amps_to_milliamps(self.nm_to_amps(joint, torque_nm))
-    }
-
-    /// Convert Rocky's milliampere feedback unit back to N·m.
-    pub fn milliamps_to_nm(&self, joint: usize, current_ma: u16) -> f32 {
-        self.amps_to_nm(joint, (current_ma as f32) * 0.001_f32)
-    }
-}
 
 /// BareFOC node address for a joint, or `None` when the joint has no servo node.
 pub const fn joint_node_addr(joint: usize) -> Option<u8> {
@@ -288,7 +224,7 @@ mod tests {
         assert_eq!(joint_node_addr(0), Some(0x20));
         assert_eq!(joint_node_addr(4), Some(0x24));
         assert_eq!(joint_node_addr(20), Some(0x34));
-        assert_eq!(joint_node_addr(21), None);
+        assert_eq!(joint_node_addr(MAX_SERVO_JOINTS), None);
         assert_eq!(joint_node_addr(MAX_JOINTS), None);
     }
 
@@ -402,6 +338,6 @@ mod tests {
     fn bind_joint_rejects_unservoed_joints() {
         let transport = ();
         assert!(bind_joint(0, transport).is_some());
-        assert!(bind_joint(21, transport).is_none());
+        assert!(bind_joint(MAX_SERVO_JOINTS, transport).is_none());
     }
 }

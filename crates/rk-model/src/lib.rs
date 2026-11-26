@@ -37,11 +37,11 @@ mod tests {
     #[test]
     fn bundled_urdf_parses_and_evaluates_fk() {
         let rig = KinematicRig::from_urdf_xml(BUNDLED_URDF_XML).expect("parse bundled urdf");
-        assert_eq!(rig.joints.len(), 21);
+        assert_eq!(rig.joints.len(), 28);
         let transforms = rig.compute_link_transforms(&rig.default_pose());
-        assert!(transforms.contains_key("pelvis"));
-        assert!(transforms.contains_key("l_forearm"));
-        assert!(transforms.contains_key("r_foot"));
+        assert!(transforms.contains_key("base_link"));
+        assert!(transforms.contains_key("Lower_Forearm_Left_1"));
+        assert!(transforms.contains_key("Foot_Right_1"));
     }
 
     #[test]
@@ -117,16 +117,16 @@ mod tests {
 
     #[test]
     fn mcu_blob_xml_and_deflate_round_trip_with_crc32() {
-        let bundle = AssetBundle::bundled_rocky();
+        let bundle = AssetBundle::bundled_humanoid();
         let raw = bundle.urdf_xml.as_bytes();
-        let info_raw = ModelInfo::from_static("rocky_mk1", ModelFormat::UrdfXml, raw, 21);
+        let info_raw = ModelInfo::from_static("humanoid", ModelFormat::UrdfXml, raw, 28);
         let parsed_raw = AssetBundle::from_mcu_blob(&info_raw, raw).expect("load raw mcu urdf");
-        assert_eq!(parsed_raw.robot_name, "rocky_mk1");
+        assert_eq!(parsed_raw.robot_name, "humanoid");
 
         let deflated = bundle.to_deflated_urdf_bytes().expect("deflate urdf");
         assert!(deflated.len() < raw.len() / 3, "deflate should shrink URDF >3x");
         let info_def =
-            ModelInfo::from_static("rocky_mk1", ModelFormat::UrdfDeflate, &deflated, 21);
+            ModelInfo::from_static("humanoid", ModelFormat::UrdfDeflate, &deflated, 28);
         let parsed_def =
             AssetBundle::from_mcu_blob(&info_def, &deflated).expect("load deflated mcu urdf");
         assert_eq!(parsed_def.urdf_xml, bundle.urdf_xml);
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn resolve_mesh_bytes_handles_package_uri_and_basename() {
-        let mut bundle = AssetBundle::bundled_rocky();
+        let mut bundle = AssetBundle::bundled_humanoid();
         bundle
             .files
             .insert("my_robot/meshes/visual/forearm.STL".to_string(), vec![1, 2, 3]);

@@ -16,6 +16,7 @@ use rk_proto::{
     BalanceGains, EstimatorTelemetry, ImuState, WalkCmd, classify_fall, estimator_valid,
     fall_orientation, uvc_phase,
 };
+use rk_robot_profile::LegGeometry;
 
 use crate::estimator::DcmSwingHint;
 
@@ -56,78 +57,7 @@ fn adapt_step_duration(
     }
 }
 
-/// Parameterized 6-DoF bipedal leg geometry in meters.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LegGeometry {
-    /// Upper leg (hip pitch -> knee pitch) length in meters.
-    pub thigh_len: f32,
-    /// Lower leg (knee pitch -> ankle pitch) length in meters.
-    pub shin_len: f32,
-    /// Combined vertical offset of hip-roll->hip-pitch + ankle-pitch->ankle-roll in meters.
-    pub hip_ankle_offset: f32,
-    /// Lateral distance from pelvis centerline to one hip axis in meters.
-    pub half_hip_spacing: f32,
-    /// Nominal standing hip-to-ankle height in meters (slight combat knee bend).
-    pub nominal_height: f32,
-    /// Minimum safe crouch height in meters.
-    pub min_height: f32,
-    /// Maximum reachable hip-pitch-to-ankle-pitch chord (`< thigh_len + shin_len`).
-    pub max_reach: f32,
-    /// Maximum sagittal support foot offset `dxi` in meters.
-    pub max_dx: f32,
-    /// Maximum lateral support foot offset `dyi` in meters.
-    pub max_dy: f32,
-    /// Maximum sagittal swing foot offset `dxis` in meters.
-    pub max_swing_dx: f32,
-    /// Maximum lateral swing foot offset `dyis` in meters.
-    pub max_swing_dy: f32,
-    /// Peak sinusoidal swing foot clearance in meters (`fhMax`).
-    pub max_foot_lift: f32,
-    /// Maximum lateral pelvis recovery sway in meters (`swMax`).
-    pub max_sway: f32,
-}
-
-impl LegGeometry {
-    /// Matches bundled `assets/sample_humanoid/rocky_mk1.urdf` (21-DoF, 6-DoF legs).
-    pub const fn rocky_mk1() -> Self {
-        Self {
-            thigh_len: 0.32,
-            shin_len: 0.32,
-            hip_ankle_offset: 0.06,
-            half_hip_spacing: 0.095,
-            nominal_height: 0.62,
-            min_height: 0.46,
-            max_reach: 0.635,
-            max_dx: 0.16,
-            max_dy: 0.15,
-            max_swing_dx: 0.22,
-            max_swing_dy: 0.22,
-            max_foot_lift: 0.095,
-            max_sway: 0.075,
-        }
-    }
-
-    /// Exact Kondo KHR-3HV / ai2001 reference dimensions from `main.c` (in meters).
-    pub const fn khr_3hv() -> Self {
-        Self {
-            thigh_len: 0.065,
-            shin_len: 0.065,
-            hip_ankle_offset: 0.0645,
-            half_hip_spacing: 0.0215,
-            nominal_height: 0.185,
-            min_height: 0.140,
-            max_reach: 0.129,
-            max_dx: 0.045,
-            max_dy: 0.045,
-            max_swing_dx: 0.070,
-            max_swing_dy: 0.070,
-            max_foot_lift: 0.035,
-            max_sway: 0.025,
-        }
-    }
-}
-
-/// Solved single-leg 6-DoF joint angles in Rocky Mk1 URDF sign conventions (radians).
+/// Solved single-leg 6/7-DoF joint angles in URDF sign conventions (radians).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LegIkAngles {
     pub hip_yaw: f32,
@@ -136,6 +66,7 @@ pub struct LegIkAngles {
     pub knee_pitch: f32,
     pub ankle_pitch: f32,
     pub ankle_roll: f32,
+    pub toe_pitch: f32,
     /// Clamped height if the requested `(x, y, h)` exceeded `max_reach`.
     pub clamped_h: f32,
 }
@@ -208,6 +139,7 @@ pub fn solve_leg_ik(
         knee_pitch,
         ankle_pitch,
         ankle_roll,
+        toe_pitch: 0.0,
         clamped_h,
     }
 }
@@ -249,6 +181,8 @@ pub struct UvcStepOutput {
     pub left_leg: LegIkAngles,
     pub right_leg: LegIkAngles,
     pub waist_yaw: f32,
+    pub waist_pitch: f32,
+    pub waist_roll: f32,
     pub l_shoulder_pitch_delta: f32,
     pub l_shoulder_roll_delta: f32,
     pub r_shoulder_pitch_delta: f32,
@@ -281,6 +215,7 @@ pub struct UvcStepOutput {
 #[derive(Clone, Debug)]
 pub struct UvcController {
     geom: LegGeometry,
+    z_up: bool,
     phase: UvcPhase,
     phase_elapsed_sec: f32,
     /// `0 = Right` support foot, `1 = Left` support foot.
@@ -329,8 +264,13 @@ pub struct UvcController {
 
 impl UvcController {
     pub const fn new(geom: LegGeometry) -> Self {
+        Self::new_for_profile(geom, false)
+    }
+
+    pub const fn new_for_profile(geom: LegGeometry, z_up: bool) -> Self {
         Self {
             geom,
+            z_up,
             phase: UvcPhase::Idle,
             phase_elapsed_sec: 0.0,
             support_foot: 0,
@@ -502,6 +442,8 @@ impl UvcController {
                 left_leg: tuck_leg,
                 right_leg: tuck_leg_r,
                 waist_yaw: 0.0,
+                waist_pitch: 0.0,
+                waist_roll: 0.0,
                 l_shoulder_pitch_delta: -0.45,
                 l_shoulder_roll_delta: -0.15,
                 r_shoulder_pitch_delta: -0.45,
@@ -558,17 +500,17 @@ impl UvcController {
         let h_com = if gains.h_com_m.is_finite() {
             gains.h_com_m.clamp(0.12_f32, 0.80_f32)
         } else {
-            0.72_f32
+            0.25_f32
         };
         let omega = sqrtf(GRAVITY_M_S2 / h_com);
         let capture_valid = estimator.valid_mask & estimator_valid::DCM != 0;
         let (capture_sag, capture_lat, capture_error) = if capture_valid {
             let k_v = gains.dcm_step_gain.clamp(0.0_f32, 1.5_f32);
-            // `dcm_xy_m = [xi_lat (right +), xi_sag (forward +)]`; `com_vel_m_s = [lat, up, sag]`.
             let xi_sag = estimator.dcm_xy_m[1];
             let xi_lat = estimator.dcm_xy_m[0];
-            let p_sag = xi_sag + k_v * (vx * 0.5_f32 - estimator.com_vel_m_s[2]) / omega;
-            let p_lat = xi_lat + k_v * (vy * 0.5_f32 - estimator.com_vel_m_s[0]) / omega;
+            let (sag_vel_idx, lat_vel_idx) = if self.z_up { (0, 1) } else { (2, 0) };
+            let p_sag = xi_sag + k_v * (vx * 0.5_f32 - estimator.com_vel_m_s[sag_vel_idx]) / omega;
+            let p_lat = xi_lat + k_v * (vy * 0.5_f32 - estimator.com_vel_m_s[lat_vel_idx]) / omega;
             let err_sag = xi_sag - p_sag;
             let err_lat = xi_lat - p_lat;
             (p_sag, p_lat, sqrtf(err_sag * err_sag + err_lat * err_lat))
@@ -781,7 +723,7 @@ impl UvcController {
                 // Swing-foot landing ONLY. With a valid DCM channel the capture target
                 // (ξ + K_v·(v_des − v_com)/ω) is authoritative; the legacy hint is a fallback.
                 // `dxi`/`dyi` (stance hip) are never written here — UVC remains I-only.
-                let swing_lat_sign = if self.support_foot == 0 {
+                let swing_lat_sign = if (self.support_foot == 0) ^ self.z_up {
                     -1.0_f32
                 } else {
                     1.0_f32
@@ -988,6 +930,24 @@ impl UvcController {
             roll_corr = damp_r;
         }
 
+        // Toe push-off on stance foot & dorsiflexion on swing foot during active stepping.
+        let toe_push = if wants_walk || walk.walk_enabled {
+            0.18_f32 * sinf(self.gait_phase_rad).max(0.0_f32)
+        } else {
+            0.0_f32
+        };
+        if self.support_foot == 1 {
+            left_leg.toe_pitch += toe_push;
+            right_leg.toe_pitch -= 0.5_f32 * toe_push;
+        } else {
+            right_leg.toe_pitch += toe_push;
+            left_leg.toe_pitch -= 0.5_f32 * toe_push;
+        }
+
+        // Waist pitch/roll balance assist (applied when profile has waist_pitch/waist_roll).
+        let waist_pitch = 0.35_f32 * pitch_corr;
+        let waist_roll = 0.35_f32 * roll_corr;
+
         // 7. Arm counter-spread (`armCont` proportional to lateral step offset + sagittal lean)
         let arm_gain = gains.arm_assist.clamp(0.0_f32, 1.5_f32);
         let lat_ratio = (self.dyis / self.geom.max_swing_dy.max(0.01_f32)).clamp(0.0_f32, 1.0_f32);
@@ -998,6 +958,8 @@ impl UvcController {
             left_leg,
             right_leg,
             waist_yaw: self.waist_yaw,
+            waist_pitch,
+            waist_roll,
             l_shoulder_pitch_delta: -sag_swing,
             l_shoulder_roll_delta: spread,
             r_shoulder_pitch_delta: -sag_swing,
@@ -1122,9 +1084,27 @@ mod tests {
         (PI / (0.5_f32 / cadence).clamp(STEP_DUR_MIN_SEC, STEP_DUR_MAX_SEC)) * dt
     }
 
+    fn test_biped_geom() -> LegGeometry {
+        LegGeometry {
+            thigh_len: 0.32,
+            shin_len: 0.32,
+            hip_ankle_offset: 0.06,
+            half_hip_spacing: 0.095,
+            nominal_height: 0.62,
+            min_height: 0.46,
+            max_reach: 0.635,
+            max_dx: 0.16,
+            max_dy: 0.15,
+            max_swing_dx: 0.22,
+            max_swing_dy: 0.22,
+            max_foot_lift: 0.095,
+            max_sway: 0.075,
+        }
+    }
+
     #[test]
     fn analytic_6dof_leg_ik_keeps_sole_strictly_parallel_on_khr_and_rocky() {
-        for geom in [LegGeometry::khr_3hv(), LegGeometry::rocky_mk1()] {
+        for geom in [LegGeometry::khr_3hv(), LegGeometry::humanoid(), test_biped_geom()] {
             let xs = [
                 -geom.max_dx,
                 -geom.max_dx * 0.4,
@@ -1163,7 +1143,7 @@ mod tests {
 
     #[test]
     fn bias_compensated_attitude_subtracts_calibrated_bias() {
-        let ctrl = UvcController::new(LegGeometry::rocky_mk1());
+        let ctrl = UvcController::new(test_biped_geom());
         assert_eq!(ctrl.pitch_bias(), 0.0);
         assert_eq!(ctrl.roll_bias(), 0.0);
         let imu = ImuState {
@@ -1187,7 +1167,7 @@ mod tests {
 
     #[test]
     fn uvc_projects_foot_forward_under_forward_lean_and_triggers_fall_tuck() {
-        let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+        let mut ctrl = UvcController::new(test_biped_geom());
         let gains = BalanceGains::default();
         let walk = WalkCmd::default();
 
@@ -1248,7 +1228,7 @@ mod tests {
     /// no capture telemetry the Khadiv law falls back to nominal cadence.
     #[test]
     fn walking_gait_phase_advances_continuously() {
-        let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+        let mut ctrl = UvcController::new(test_biped_geom());
         let dt = 0.005_f32;
         let cadence = 1.55_f32;
         let walk = WalkCmd {
@@ -1293,7 +1273,7 @@ mod tests {
     /// a π offset, and support alternates as the clock crosses each boundary.
     #[test]
     fn support_foot_is_pi_offset_from_walking_phase() {
-        let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+        let mut ctrl = UvcController::new(test_biped_geom());
         let dt = 0.005_f32;
         let walk = WalkCmd {
             walk_enabled: true,
@@ -1370,7 +1350,7 @@ mod tests {
         };
 
         let first_left_support = |telem: EstimatorTelemetry, hint: DcmSwingHint| -> usize {
-            let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+            let mut ctrl = UvcController::new(test_biped_geom());
             for tick in 1..=400 {
                 let out = ctrl.step_with_dcm(dt, imu, walk, gains, hint, telem);
                 if out.phase == UvcPhase::ActiveCatchStep && out.support_foot == 1 {
@@ -1410,7 +1390,7 @@ mod tests {
     /// very next tick continues advancing from that locked value.
     #[test]
     fn catch_step_entry_phase_locks_without_discontinuity() {
-        let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+        let mut ctrl = UvcController::new(test_biped_geom());
         let dt = 0.005_f32;
         let cadence = 1.55_f32;
         let walk = WalkCmd {
@@ -1504,7 +1484,7 @@ mod tests {
     /// landing target equals the capture point ξ = v_des/ω.
     #[test]
     fn capture_law_tracks_commanded_speed_via_swing_foot_only() {
-        let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+        let mut ctrl = UvcController::new(test_biped_geom());
         let (imu, walk, gains) = enter_catch(&mut ctrl);
 
         let omega = sqrtf(GRAVITY_M_S2 / gains.h_com_m);
@@ -1530,7 +1510,7 @@ mod tests {
         let v_des = 0.25_f32;
         let shove_v = 1.0_f32;
 
-        let mut steady = UvcController::new(LegGeometry::rocky_mk1());
+        let mut steady = UvcController::new(test_biped_geom());
         let (imu, walk, gains) = enter_catch(&mut steady);
         steady.step_with_dcm(
             0.005,
@@ -1542,7 +1522,7 @@ mod tests {
         );
         let (steady_dxis, _) = steady.swing_targets();
 
-        let mut pushed = UvcController::new(LegGeometry::rocky_mk1());
+        let mut pushed = UvcController::new(test_biped_geom());
         let (imu, walk, gains) = enter_catch(&mut pushed);
         pushed.step_with_dcm(
             0.005,
@@ -1570,7 +1550,7 @@ mod tests {
     #[test]
     fn khadiv_timing_shortens_step_when_capture_error_exceeds_margin() {
         let advance_phase = |telem: EstimatorTelemetry| -> f32 {
-            let mut ctrl = UvcController::new(LegGeometry::rocky_mk1());
+            let mut ctrl = UvcController::new(test_biped_geom());
             let (imu, walk, gains) = enter_catch(&mut ctrl);
             let mut phase = UvcPhase::Idle;
             for _ in 0..12 {
@@ -1598,8 +1578,8 @@ mod tests {
     /// and the capture law is gated off when `estimator_valid::DCM` is absent.
     #[test]
     fn capture_law_leaves_stance_hip_untouched_and_respects_dcm_validity_gate() {
-        let mut valid = UvcController::new(LegGeometry::rocky_mk1());
-        let mut invalid = UvcController::new(LegGeometry::rocky_mk1());
+        let mut valid = UvcController::new(test_biped_geom());
+        let mut invalid = UvcController::new(test_biped_geom());
         let (imu, walk, gains) = enter_catch(&mut valid);
         let _ = enter_catch(&mut invalid);
 

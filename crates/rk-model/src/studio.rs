@@ -33,6 +33,7 @@ impl KinematicRig {
 pub struct Keyframe {
     pub label: String,
     pub duration_ms: u32,
+    #[serde(with = "rk_proto::serde_array")]
     pub angles_rad: [f32; MAX_JOINTS],
 }
 
@@ -626,7 +627,7 @@ pub struct StudioModel {
     pub rig: KinematicRig,
     pub requested_mode: ControlMode,
     pub speed_limit_pct: u8,
-    pub torque_mask: u32,
+    pub torque_mask: u64,
     pub target_rad: [f32; MAX_JOINTS],
     pub joint_command_mode: [u8; MAX_JOINTS],
     pub target_velocity_rad_s: [f32; MAX_JOINTS],
@@ -652,9 +653,9 @@ pub struct StudioModel {
 
 impl StudioModel {
     pub fn new_default() -> Self {
-        let bundle = AssetBundle::bundled_rocky();
+        let bundle = AssetBundle::bundled_humanoid();
         let rig = KinematicRig::from_urdf_xml(&bundle.urdf_xml)
-            .expect("bundled rocky_mk1.urdf must be valid");
+            .expect("bundled humanoid.urdf must be valid");
         let calibration = rig.default_calibration();
         let default_pose = rig.default_pose();
         let mut moves = default_combat_library(&rig);
@@ -662,10 +663,10 @@ impl StudioModel {
         // the authored library; never solved at runtime on the MCU).
         moves.extend(crate::strike_optimizer::optimized_strikes(&rig, &moves));
         moves.extend(default_recovery_library(&rig));
-        let all_mask = if rig.joints.len() >= 32 {
-            u32::MAX
+        let all_mask = if rig.joints.len() >= 64 {
+            u64::MAX
         } else {
-            (1u32 << rig.joints.len()) - 1
+            (1u64 << rig.joints.len()) - 1
         };
 
         let mut latest_telemetry = McuToHost::default();
@@ -741,10 +742,10 @@ impl StudioModel {
         self.selected_move = 0;
         self.torque_mask = if rig.joints.is_empty() {
             0
-        } else if rig.joints.len() >= 32 {
-            u32::MAX
+        } else if rig.joints.len() >= 64 {
+            u64::MAX
         } else {
-            (1u32 << rig.joints.len()) - 1
+            (1u64 << rig.joints.len()) - 1
         };
         let diag = bundle.diagnostics(&rig);
         let mesh_note = if !diag.missing_meshes.is_empty() {
@@ -836,7 +837,7 @@ impl StudioModel {
         if joint >= self.rig.joints.len() {
             return;
         }
-        let bit = 1u32 << joint;
+        let bit = 1u64 << joint;
         let was_enabled = (self.torque_mask & bit) != 0;
         if enabled {
             if !was_enabled {
@@ -1112,7 +1113,7 @@ mod tests {
     use crate::bundle::BUNDLED_URDF_XML;
 
     fn rig() -> KinematicRig {
-        KinematicRig::from_urdf_xml(BUNDLED_URDF_XML).expect("bundled rocky_mk1.urdf must parse")
+        KinematicRig::from_urdf_xml(BUNDLED_URDF_XML).expect("bundled humanoid.urdf must parse")
     }
 
     #[test]
@@ -1121,10 +1122,10 @@ mod tests {
         let knee = rig
             .joints
             .iter()
-            .find(|j| j.name == "l_knee_pitch")
-            .expect("l_knee_pitch exists");
+            .find(|j| j.name == "l_knee_upper")
+            .expect("l_knee_upper exists");
         let beyond = knee.default_max_rad + 5.0;
-        let pose = rig.pose_from_overrides(&[("l_knee_pitch", beyond), ("waist_yaw", 0.25)]);
+        let pose = rig.pose_from_overrides(&[("l_knee_upper", beyond), ("waist_yaw", 0.25)]);
 
         assert!((pose[knee.index] - knee.default_max_rad).abs() < 1e-6);
         let waist = rig.joints.iter().find(|j| j.name == "waist_yaw").unwrap();
@@ -1189,7 +1190,7 @@ mod tests {
         assert_eq!(expected.len(), 4);
 
         model
-            .load_bundle(AssetBundle::bundled_rocky())
+            .load_bundle(AssetBundle::bundled_humanoid())
             .expect("reload bundled URDF");
         for name in expected {
             assert!(
@@ -1389,5 +1390,42 @@ mod tests {
             "only the E-Stop ClearFaults command may remain: {:?}",
             model.pending_config
         );
+    }
+
+    #[test]
+    fn recovery_and_combat_libraries_respect_28dof_joint_limits() {
+        let model = StudioModel::new_default();
+        let prof = &rk_robot_profile::generated::humanoid::PROFILE;
+        let check_lib = |lib: Vec<ActionMove>, label: &str| {
+            assert!(!lib.is_empty(), "{label} must not be empty");
+            for action in &lib {
+                for (kf_idx, kf) in action.keyframes.iter().enumerate() {
+                    for (j_idx, j_meta) in model.rig.joints.iter().enumerate() {
+                        let q = kf.angles_rad[j_idx];
+                        let ratio = prof.motor_to_joint_ratio[j_idx];
+                        let q_urdf = q * ratio;
+                        assert!(
+                            q >= j_meta.default_min_rad - 1e-4 && q <= j_meta.default_max_rad + 1e-4,
+                            "{label} '{}' kf {kf_idx} joint '{}' ({j_idx}) ctrl {q:.4} outside [{:.4}, {:.4}]",
+                            action.name,
+                            j_meta.name,
+                            j_meta.default_min_rad,
+                            j_meta.default_max_rad
+                        );
+                        if (ratio - 1.0).abs() > 1e-3 {
+                            assert!(
+                                q_urdf >= j_meta.default_min_rad * ratio - 1e-4
+                                    && q_urdf <= j_meta.default_max_rad * ratio + 1e-4,
+                                "{label} '{}' kf {kf_idx} joint '{}' urdf {q_urdf:.4} out of range",
+                                action.name,
+                                j_meta.name
+                            );
+                        }
+                    }
+                }
+            }
+        };
+        check_lib(default_recovery_library(&model.rig), "recovery");
+        check_lib(default_combat_library(&model.rig), "combat");
     }
 }

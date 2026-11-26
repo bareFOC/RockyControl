@@ -134,6 +134,8 @@ pub struct KinematicRig {
     pub links: Vec<LinkSummary>,
     pub visuals: Vec<LinkVisual>,
     pub up_axis: UpAxis,
+    /// Maps each `chain` DOF index to `(actuator_index, mimic_scale)`.
+    pub chain_joint_map: Vec<(usize, f32)>,
     /// Root height above floor so any uploaded robot stands cleanly grounded on `y = 0`.
     pub root_y_offset: f32,
     pub bounds_min: [f32; 3],
@@ -193,6 +195,7 @@ impl KinematicRig {
 
         let mut joint_metas: Vec<JointMeta> = Vec::new();
         let mut link_to_joint_idx: HashMap<String, usize> = HashMap::new();
+        let mut raw_chain_entries: Vec<(Option<usize>, Option<(String, f32)>)> = Vec::new();
 
         fn attach_children(
             parent_link: &str,
@@ -200,6 +203,7 @@ impl KinematicRig {
             parent_to_children: &HashMap<String, Vec<&urdf_rs::Joint>>,
             joint_metas: &mut Vec<JointMeta>,
             link_to_joint_idx: &mut HashMap<String, usize>,
+            raw_chain_entries: &mut Vec<(Option<usize>, Option<(String, f32)>)>,
         ) {
             let Some(children) = parent_to_children.get(parent_link) else {
                 return;
@@ -232,7 +236,6 @@ impl KinematicRig {
                     .rotation(rot);
 
                 if let Some(kind) = kind_opt.filter(|_| joint_metas.len() < MAX_JOINTS) {
-                    let idx = joint_metas.len();
                     let (lo, hi) = match kind {
                         JointKind::Continuous => {
                             let min_r = (j.limit.lower as f32).clamp(-3.1416, 3.1416);
@@ -272,26 +275,33 @@ impl KinematicRig {
                             .limits(Some(k::joint::Range::new(lo, hi))),
                     };
 
-                    let default_rad = if kind == JointKind::Prismatic {
-                        0.0_f32.clamp(lo, hi)
+                    if let Some(mimic) = &j.mimic {
+                        let mult = mimic.multiplier.unwrap_or(1.0) as f32;
+                        raw_chain_entries.push((None, Some((mimic.joint.clone(), mult))));
                     } else {
-                        default_stance_angle(&j.name).clamp(lo, hi)
-                    };
-                    joint_metas.push(JointMeta {
-                        index: idx,
-                        name: j.name.clone(),
-                        label: prettify_joint_name(&j.name),
-                        kind,
-                        group: classify_limb_group(&j.name),
-                        parent_link: j.parent.link.clone(),
-                        child_link: j.child.link.clone(),
-                        axis: [unit_axis.x, unit_axis.y, unit_axis.z],
-                        origin_xyz: [xyz[0] as f32, xyz[1] as f32, xyz[2] as f32],
-                        default_min_rad: lo,
-                        default_max_rad: hi,
-                        default_rad,
-                    });
-                    link_to_joint_idx.insert(j.child.link.clone(), idx);
+                        let idx = joint_metas.len();
+                        let default_rad = if kind == JointKind::Prismatic {
+                            0.0_f32.clamp(lo, hi)
+                        } else {
+                            default_stance_angle(&j.name).clamp(lo, hi)
+                        };
+                        joint_metas.push(JointMeta {
+                            index: idx,
+                            name: j.name.clone(),
+                            label: prettify_joint_name(&j.name),
+                            kind,
+                            group: classify_limb_group(&j.name),
+                            parent_link: j.parent.link.clone(),
+                            child_link: j.child.link.clone(),
+                            axis: [unit_axis.x, unit_axis.y, unit_axis.z],
+                            origin_xyz: [xyz[0] as f32, xyz[1] as f32, xyz[2] as f32],
+                            default_min_rad: lo,
+                            default_max_rad: hi,
+                            default_rad,
+                        });
+                        link_to_joint_idx.insert(j.child.link.clone(), idx);
+                        raw_chain_entries.push((Some(idx), None));
+                    }
                 } else {
                     builder = builder.joint_type(k::JointType::Fixed);
                 }
@@ -305,6 +315,7 @@ impl KinematicRig {
                     parent_to_children,
                     joint_metas,
                     link_to_joint_idx,
+                    raw_chain_entries,
                 );
             }
         }
@@ -315,7 +326,42 @@ impl KinematicRig {
             &parent_to_children,
             &mut joint_metas,
             &mut link_to_joint_idx,
+            &mut raw_chain_entries,
         );
+
+        let mut has_follower = vec![false; joint_metas.len()];
+        for (_, mimic_opt) in &raw_chain_entries {
+            if let Some((target_name, _)) = mimic_opt {
+                if let Some(m) = joint_metas.iter().find(|jm| jm.name == *target_name) {
+                    has_follower[m.index] = true;
+                }
+            }
+        }
+        for (idx, has) in has_follower.iter().enumerate() {
+            if *has {
+                joint_metas[idx].default_min_rad *= 2.0;
+                joint_metas[idx].default_max_rad *= 2.0;
+                joint_metas[idx].default_rad *= 2.0;
+            }
+        }
+        let chain_joint_map: Vec<(usize, f32)> = raw_chain_entries
+            .into_iter()
+            .map(|(act_opt, mimic_opt)| {
+                if let Some(act) = act_opt {
+                    let scale = if has_follower[act] { 0.5_f32 } else { 1.0_f32 };
+                    (act, scale)
+                } else if let Some((target_name, mult)) = mimic_opt {
+                    let act = joint_metas
+                        .iter()
+                        .find(|jm| jm.name == target_name)
+                        .map(|jm| jm.index)
+                        .unwrap_or(0);
+                    (act, 0.5_f32 * mult)
+                } else {
+                    (0, 0.0_f32)
+                }
+            })
+            .collect();
 
         let chain = k::Chain::from_root(root_node);
 
@@ -419,6 +465,7 @@ impl KinematicRig {
             links,
             visuals,
             up_axis: detected_up,
+            chain_joint_map,
             root_y_offset: 0.0,
             bounds_min: [-0.3, 0.0, -0.3],
             bounds_max: [0.3, 1.2, 0.3],
@@ -535,7 +582,13 @@ impl KinematicRig {
     ) -> (HashMap<String, Isometry3<f32>>, Isometry3<f32>) {
         let dof = self.chain.dof();
         let positions: Vec<f32> = (0..dof)
-            .map(|i| angles_rad.get(i).copied().unwrap_or(0.0_f32))
+            .map(|d| {
+                if let Some(&(act_idx, scale)) = self.chain_joint_map.get(d) {
+                    angles_rad.get(act_idx).copied().unwrap_or(0.0_f32) * scale
+                } else {
+                    angles_rad.get(d).copied().unwrap_or(0.0_f32)
+                }
+            })
             .collect();
         let _ = self.chain.set_joint_positions_clamped(&positions);
         self.chain.update_transforms();
@@ -713,10 +766,6 @@ impl KinematicRig {
 
 /// Automatically detects whether a URDF was authored in standard ROS Z-Up or Y-Up.
 fn detect_up_axis(robot: &urdf_rs::Robot, chain: &k::Chain<f32>) -> UpAxis {
-    if robot.name == "rocky_mk1" {
-        return UpAxis::YUp;
-    }
-
     chain.update_transforms();
     let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
     let (mut min_z, mut max_z) = (f32::INFINITY, f32::NEG_INFINITY);

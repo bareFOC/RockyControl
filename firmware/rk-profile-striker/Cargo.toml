@@ -1,0 +1,9 @@
+[package]
+name = "rk-profile-striker"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "URDF-free compile-time striker biped RobotProfile wrapper for embedded firmware"
+
+[dependencies]
+rk-robot-profile = { path = "../../crates/rk-robot-profile", default-features = false }

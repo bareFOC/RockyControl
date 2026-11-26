@@ -9,6 +9,8 @@
 //!   cargo run -p xtask -- firmware        # firmware-core tests + RP2350 matrix
 //!   cargo run -p xtask -- experiments     # committed MCP headless experiments
 
+mod codegen;
+
 use std::path::Path;
 
 use craft_xtask::runner::{self, RunOptions, Step};
@@ -28,6 +30,9 @@ fn main() {
 
 fn run_gate(cmd: &str) -> Result<(), runner::Error> {
     let root = runner::root(Path::new(env!("CARGO_MANIFEST_DIR")))?;
+    if cmd == "codegen-robots" {
+        return codegen::run_codegen(&root);
+    }
     let full_gate = matches!(cmd, "check" | "sim-verify");
 
     if !full_gate
@@ -125,12 +130,12 @@ fn run_gate(cmd: &str) -> Result<(), runner::Error> {
                 THUMB_TARGET,
                 "--no-default-features",
                 "--features",
-                "usb-net,i3c-servo-bus,imu-lsm6dsv",
+                "usb-net,i3c-servo-bus,imu-lsm6dsv,robot-humanoid",
             ]);
             runner::run(
                 c,
                 log.command(&format!(
-                    "cargo check --manifest-path {RP2350_MANIFEST} --target {THUMB_TARGET} --no-default-features --features usb-net,i3c-servo-bus,imu-lsm6dsv"
+                    "cargo check --manifest-path {RP2350_MANIFEST} --target {THUMB_TARGET} --no-default-features --features usb-net,i3c-servo-bus,imu-lsm6dsv,robot-humanoid"
                 )),
             )
         }));
@@ -146,12 +151,12 @@ fn run_gate(cmd: &str) -> Result<(), runner::Error> {
                 THUMB_TARGET,
                 "--no-default-features",
                 "--features",
-                "usb-net,bench-loopback",
+                "usb-net,bench-loopback,robot-humanoid",
             ]);
             runner::run(
                 c,
                 log.command(&format!(
-                    "cargo check --manifest-path {RP2350_MANIFEST} --target {THUMB_TARGET} --no-default-features --features usb-net,bench-loopback"
+                    "cargo check --manifest-path {RP2350_MANIFEST} --target {THUMB_TARGET} --no-default-features --features usb-net,bench-loopback,robot-humanoid"
                 )),
             )
         }));

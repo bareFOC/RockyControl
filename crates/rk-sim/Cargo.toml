@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 rk-proto.workspace = true
+rk-robot-profile = { workspace = true, features = ["std"] }
 rk-control.workspace = true
 rk-multibus.workspace = true
 rk-fw-core.workspace = true

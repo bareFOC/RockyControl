@@ -132,10 +132,10 @@ impl RockyStudioApp {
                                             self.model.status_message = err;
                                         }
                                     }
-                                    if self.model.rig.robot_name != "rocky_mk1"
-                                        && ui.button("Reset Rocky Mk1").clicked()
+                                    if self.model.rig.robot_name != "humanoid"
+                                        && ui.button("Reset Humanoid").clicked()
                                     {
-                                        self.apply_loaded_bundle(AssetBundle::bundled_rocky());
+                                        self.apply_loaded_bundle(AssetBundle::bundled_humanoid());
                                     }
                                 });
                             });
@@ -170,7 +170,7 @@ impl RockyStudioApp {
                             .color(Color32::from_rgb(120, 138, 162)),
                     );
                     if ui.small_button("Rocky Mk1 (21-DoF)").clicked() {
-                        self.apply_loaded_bundle(AssetBundle::bundled_rocky());
+                        self.apply_loaded_bundle(AssetBundle::bundled_humanoid());
                     }
                     if ui.small_button("Striker Biped (8-DoF)").clicked() {
                         if let Ok(b) = AssetBundle::from_sample(

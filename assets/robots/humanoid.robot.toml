@@ -1,0 +1,302 @@
+name = "humanoid"
+urdf = "humanoid.urdf"
+z_up = true
+pelvis_link = "base_link"
+left_foot_link = "Foot_Left_1"
+right_foot_link = "Foot_Right_1"
+left_toe_link = "Toe_Left_1"
+right_toe_link = "Toe_1"
+imu_link = "Chest_1"
+imu_mounting_rpy = [0.0, 0.0, 0.0]
+foot_half_length_m = 0.035
+foot_margin_m = 0.025
+h_com_m = 0.25
+
+[leg_geometry]
+thigh_len = 0.108
+shin_len = 0.090
+hip_ankle_offset = 0.0
+half_hip_spacing = 0.026
+nominal_height = 0.195
+min_height = 0.145
+max_reach = 0.196
+max_dx = 0.050
+max_dy = 0.045
+max_swing_dx = 0.070
+max_swing_dy = 0.060
+max_foot_lift = 0.035
+max_sway = 0.025
+
+# 28 actuators across 4 I3C buses:
+#   bus 0: torso + neck/head (0..6)
+#   bus 1: right leg (6..13)
+#   bus 2: left leg (13..20)
+#   bus 3: right + left arms (20..28)
+
+[[actuators]]
+urdf_joint = "waist_yaw"
+role = "waist_yaw"
+bus_id = 0
+node_addr = 0x20
+nm_per_amp = 0.9
+max_torque_nm = 2.4
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "r_hip_pitch"
+role = "r_hip_pitch"
+bus_id = 1
+node_addr = 0x20
+nm_per_amp = 0.9
+max_torque_nm = 2.4
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "r_hip_roll"
+role = "r_hip_roll"
+bus_id = 1
+node_addr = 0x21
+nm_per_amp = 0.9
+max_torque_nm = 2.4
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "r_hip_yaw"
+role = "r_hip_yaw"
+bus_id = 1
+node_addr = 0x22
+nm_per_amp = 0.9
+max_torque_nm = 2.0
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "r_knee_upper"
+role = "r_knee_pitch"
+coupled_joint = "r_knee_lower"
+motor_to_joint_ratio = 0.5
+primary_mimic_scale = 0.5
+coupled_mimic_scale = -0.5
+bus_id = 1
+node_addr = 0x23
+nm_per_amp = 0.9
+max_torque_nm = 2.4
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "r_ankle_roll"
+role = "r_ankle_roll"
+bus_id = 1
+node_addr = 0x24
+nm_per_amp = 0.9
+max_torque_nm = 1.8
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "r_ankle_pitch"
+role = "r_ankle_pitch"
+bus_id = 1
+node_addr = 0x25
+nm_per_amp = 0.9
+max_torque_nm = 1.8
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "r_toe_pitch"
+role = "r_toe_pitch"
+bus_id = 1
+node_addr = 0x26
+nm_per_amp = 0.55
+max_torque_nm = 0.8
+max_velocity_rad_s = 10.0
+
+[[actuators]]
+urdf_joint = "l_hip_pitch"
+role = "l_hip_pitch"
+bus_id = 2
+node_addr = 0x20
+nm_per_amp = 0.9
+max_torque_nm = 2.4
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "l_hip_roll"
+role = "l_hip_roll"
+bus_id = 2
+node_addr = 0x21
+nm_per_amp = 0.9
+max_torque_nm = 2.4
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "l_hip_yaw"
+role = "l_hip_yaw"
+bus_id = 2
+node_addr = 0x22
+nm_per_amp = 0.9
+max_torque_nm = 2.0
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "l_knee_upper"
+role = "l_knee_pitch"
+coupled_joint = "l_knee_lower"
+motor_to_joint_ratio = 0.5
+primary_mimic_scale = 0.5
+coupled_mimic_scale = -0.5
+bus_id = 2
+node_addr = 0x23
+nm_per_amp = 0.9
+max_torque_nm = 2.4
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "l_ankle_roll"
+role = "l_ankle_roll"
+bus_id = 2
+node_addr = 0x24
+nm_per_amp = 0.9
+max_torque_nm = 1.8
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "l_ankle_pitch"
+role = "l_ankle_pitch"
+bus_id = 2
+node_addr = 0x25
+nm_per_amp = 0.9
+max_torque_nm = 1.8
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "l_toe_pitch"
+role = "l_toe_pitch"
+bus_id = 2
+node_addr = 0x26
+nm_per_amp = 0.55
+max_torque_nm = 0.8
+max_velocity_rad_s = 10.0
+
+[[actuators]]
+urdf_joint = "waist_roll"
+role = "waist_roll"
+bus_id = 0
+node_addr = 0x21
+nm_per_amp = 0.9
+max_torque_nm = 2.4
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "waist_pitch"
+role = "waist_pitch"
+bus_id = 0
+node_addr = 0x22
+nm_per_amp = 0.9
+max_torque_nm = 2.4
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "head_roll"
+role = "head_roll"
+bus_id = 0
+node_addr = 0x23
+nm_per_amp = 0.55
+max_torque_nm = 0.8
+max_velocity_rad_s = 10.0
+
+[[actuators]]
+urdf_joint = "head_pitch"
+role = "head_pitch"
+bus_id = 0
+node_addr = 0x24
+nm_per_amp = 0.55
+max_torque_nm = 0.8
+max_velocity_rad_s = 10.0
+
+[[actuators]]
+urdf_joint = "head_yaw"
+role = "head_yaw"
+bus_id = 0
+node_addr = 0x25
+nm_per_amp = 0.55
+max_torque_nm = 0.8
+max_velocity_rad_s = 10.0
+
+[[actuators]]
+urdf_joint = "r_shoulder_pitch"
+role = "r_shoulder_pitch"
+bus_id = 3
+node_addr = 0x20
+nm_per_amp = 0.75
+max_torque_nm = 1.8
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "r_shoulder_roll"
+role = "r_shoulder_roll"
+bus_id = 3
+node_addr = 0x21
+nm_per_amp = 0.75
+max_torque_nm = 1.8
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "r_shoulder_yaw"
+role = "r_shoulder_yaw"
+bus_id = 3
+node_addr = 0x22
+nm_per_amp = 0.75
+max_torque_nm = 1.4
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "r_elbow_upper"
+role = "r_elbow_pitch"
+coupled_joint = "r_elbow_lower"
+motor_to_joint_ratio = 0.5
+primary_mimic_scale = 0.5
+coupled_mimic_scale = 0.5
+bus_id = 3
+node_addr = 0x23
+nm_per_amp = 0.65
+max_torque_nm = 1.2
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "l_shoulder_pitch"
+role = "l_shoulder_pitch"
+bus_id = 3
+node_addr = 0x24
+nm_per_amp = 0.75
+max_torque_nm = 1.8
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "l_shoulder_roll"
+role = "l_shoulder_roll"
+bus_id = 3
+node_addr = 0x25
+nm_per_amp = 0.75
+max_torque_nm = 1.8
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "l_shoulder_yaw"
+role = "l_shoulder_yaw"
+bus_id = 3
+node_addr = 0x26
+nm_per_amp = 0.75
+max_torque_nm = 1.4
+max_velocity_rad_s = 8.0
+
+[[actuators]]
+urdf_joint = "l_elbow_upper"
+role = "l_elbow_pitch"
+coupled_joint = "l_elbow_lower"
+motor_to_joint_ratio = 0.5
+primary_mimic_scale = 0.5
+coupled_mimic_scale = 0.5
+bus_id = 3
+node_addr = 0x27
+nm_per_amp = 0.65
+max_torque_nm = 1.2
+max_velocity_rad_s = 8.0

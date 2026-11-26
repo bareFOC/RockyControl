@@ -1,49 +1,30 @@
-//! Zero-allocation `#![no_std]` MCU flash-resident URDF / kinematics model store.
+//! Zero-allocation `#![no_std]` model-store request handler.
 //!
-//! Embeds the robot's URDF directly into MCU `.rodata` XIP flash (`0` bytes of SRAM overhead),
-//! computes its IEEE CRC32 at compile time, and serves fixed-size `postcard` + COBS chunks so
-//! any Rocky Studio desktop or browser workstation can connect to the MCU and automatically
-//! pull the exact kinematics model without shipping local URDF files.
+//! The MCU does **not** bundle a URDF: model data is owned by the Rocky Studio
+//! application (bundled preset, upload, or staged flash blob) and is never
+//! parsed by the real-time control path. Consequently the MCU exposes no model
+//! pull service (the former UDP `:7778` service is gone) and the app's
+//! `mcu_sync_model` path reports "not available" rather than downloading a
+//! firmware-embedded model.
 //!
-//! # Flash Budget (RP2350 & ESP32-P4)
-//! - `rocky_mk1.urdf` raw UTF-8 XML: ~9.0 KB (~0.22% of 4 MB RP2350 Pico 2 flash).
-//! - Optional zlib/deflate URDF: ~1.6 KB (~0.04% of 4 MB flash).
-//! - Dedicated flash partition (e.g., last 64 KB erase sector) can later accept runtime URDF
-//!   updates without recompiling firmware while keeping the exact same `ModelRequest` wire API.
+//! [`FlashModelStore`] remains a caller-provided, read-only blob server over the
+//! shared `ModelRequest`/`ModelResponse` wire API. It is used by the simulator
+//! and host tests to validate the exact code path a runtime flash-loaded model
+//! would use; it costs no SRAM and links no model bytes unless a caller supplies
+//! them.
 
-use crate::config::DEFAULT_JOINT_COUNT;
 use rk_proto::{
-    MAX_MODEL_COBS_FRAME_BYTES, MODEL_CHUNK_BYTES, ModelChunk, ModelFormat, ModelInfo,
-    ModelRequest, ModelResponse, decode_model_req_cobs, encode_model_resp_cobs,
+    MAX_MODEL_COBS_FRAME_BYTES, MODEL_CHUNK_BYTES, ModelChunk, ModelInfo, ModelRequest,
+    ModelResponse, decode_model_req_cobs, encode_model_resp_cobs,
 };
 
-/// Robot URDF embedded directly in MCU `.rodata` XIP flash (zero SRAM cost).
-pub const EMBEDDED_URDF_BYTES: &[u8] =
-    include_bytes!("../../../assets/sample_humanoid/rocky_mk1.urdf");
-
-/// Compile-time metadata + CRC32 for the flash-resident URDF blob.
-pub const EMBEDDED_MODEL_INFO: ModelInfo = ModelInfo::from_static(
-    "rocky_mk1",
-    ModelFormat::UrdfXml,
-    EMBEDDED_URDF_BYTES,
-    DEFAULT_JOINT_COUNT as u8,
-);
-
-/// Read-only flash-backed model provider served off the real-time servo control path.
+/// Read-only model provider served off the real-time servo control path.
+///
+/// The caller owns the blob; no model bytes are compiled into this crate.
 #[derive(Clone, Copy, Debug)]
 pub struct FlashModelStore<'a> {
     info: ModelInfo,
     blob: &'a [u8],
-}
-
-impl FlashModelStore<'static> {
-    /// Returns the default compile-time flash store containing `rocky_mk1.urdf`.
-    pub const fn bundled_rocky() -> Self {
-        Self {
-            info: EMBEDDED_MODEL_INFO,
-            blob: EMBEDDED_URDF_BYTES,
-        }
-    }
 }
 
 impl<'a> FlashModelStore<'a> {
@@ -115,15 +96,19 @@ impl<'a> FlashModelStore<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rk_proto::{crc32, decode_model_resp_cobs, encode_model_req_cobs};
+    use rk_proto::{ModelFormat, crc32, decode_model_resp_cobs, encode_model_req_cobs};
+
+    // Caller-owned test blob: no URDF is bundled in the firmware crate.
+    const TEST_BLOB: &[u8] = b"<robot name=\"test\"><joint name=\"a\"/></robot>";
+    const TEST_INFO: ModelInfo = ModelInfo::from_static("test", ModelFormat::UrdfXml, TEST_BLOB, 1);
 
     #[test]
-    fn flash_model_store_streams_full_urdf_with_exact_crc32() {
-        let store = FlashModelStore::bundled_rocky();
+    fn flash_model_store_streams_caller_owned_blob_with_exact_crc32() {
+        let store = FlashModelStore::new(TEST_INFO, TEST_BLOB);
         let mut req_wire = [0u8; MAX_MODEL_COBS_FRAME_BYTES];
         let mut resp_wire = [0u8; MAX_MODEL_COBS_FRAME_BYTES];
 
-        // 1. Query ModelInfo over COBS
+        // 1. Query ModelInfo over COBS.
         let req_len = encode_model_req_cobs(&ModelRequest::GetInfo, &mut req_wire)
             .unwrap()
             .len();
@@ -135,11 +120,11 @@ mod tests {
             ModelResponse::Info(info) => info,
             other => panic!("expected ModelResponse::Info, got {other:?}"),
         };
-        assert_eq!(info.name_str(), "rocky_mk1");
-        assert_eq!(info.joint_count, DEFAULT_JOINT_COUNT as u8);
-        assert_eq!(info.total_bytes as usize, EMBEDDED_URDF_BYTES.len());
+        assert_eq!(info.name_str(), "test");
+        assert_eq!(info.joint_count, 1);
+        assert_eq!(info.total_bytes as usize, TEST_BLOB.len());
 
-        // 2. Pull all chunks and reassemble
+        // 2. Pull all chunks and reassemble.
         let mut reassembled = std::vec::Vec::with_capacity(info.total_bytes as usize);
         while (reassembled.len() as u32) < info.total_bytes {
             let req = ModelRequest::ReadChunk {
@@ -161,8 +146,14 @@ mod tests {
             }
         }
 
-        assert_eq!(reassembled.len(), EMBEDDED_URDF_BYTES.len());
+        assert_eq!(reassembled.len(), TEST_BLOB.len());
         assert_eq!(crc32(&reassembled), info.crc32);
-        assert_eq!(reassembled.as_slice(), EMBEDDED_URDF_BYTES);
+        assert_eq!(reassembled.as_slice(), TEST_BLOB);
+    }
+
+    #[test]
+    fn flash_model_store_without_blob_reports_not_available() {
+        let store = FlashModelStore::new(ModelInfo::default(), &[]);
+        assert_eq!(store.handle_request(ModelRequest::GetInfo), ModelResponse::NotAvailable);
     }
 }

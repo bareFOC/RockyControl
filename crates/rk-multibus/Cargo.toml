@@ -8,6 +8,7 @@ license.workspace = true
 barefoc-master.workspace = true
 embedded-hal.workspace = true
 rk-proto.workspace = true
+rk-robot-profile.workspace = true
 rk-control.workspace = true
 
 [dev-dependencies]

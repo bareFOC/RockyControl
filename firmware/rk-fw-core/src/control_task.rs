@@ -39,6 +39,11 @@ pub trait RobotIo {
         CONTROL_DT_SEC
     }
 
+    /// Robot profile used to construct the shared kernel.
+    fn profile(&self) -> &'static rk_robot_profile::RobotProfile {
+        &rk_robot_profile::generated::humanoid::PROFILE
+    }
+
     /// Number of joints used to construct the shared kernel.
     fn joint_count(&self) -> usize {
         DEFAULT_JOINT_COUNT
@@ -87,6 +92,10 @@ impl<T: RobotIo + ?Sized> RobotIo for &mut T {
 
     fn dt_sec(&self) -> f32 {
         (**self).dt_sec()
+    }
+
+    fn profile(&self) -> &'static rk_robot_profile::RobotProfile {
+        (**self).profile()
     }
 
     fn joint_count(&self) -> usize {
@@ -152,7 +161,7 @@ pub fn step_control_tick<I: RobotIo>(io: &mut I, control: &mut ControlTask) {
 /// Wrapped by each backend in a thin `#[embassy_executor::task]`; all control logic
 /// (kernel construction, fixed dt, tick fan-out) lives here.
 pub async fn control_task<I: RobotIo>(mut io: I) {
-    let mut control = ControlTask::new(io.joint_count(), &io.calibration());
+    let mut control = ControlTask::new_with_profile(io.profile(), &io.calibration());
     loop {
         io.wait_tick().await;
         step_control_tick(&mut io, &mut control);

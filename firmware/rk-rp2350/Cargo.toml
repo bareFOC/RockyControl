@@ -9,10 +9,14 @@ description = "Rocky Humanoid RP2350 firmware powered by embassy-rp + embassy-us
 # Default Day-1 wired bring-up: USB CDC-ACM serial + onboard bench loopback servo plant.
 # For wired USB Networking (Ethernet-over-USB UDP 10.42.0.2:7777):
 #   cargo build --release --no-default-features --features usb-net,bench-loopback
-default = ["usb-cdc", "bench-loopback"]
+default = ["usb-cdc", "bench-loopback", "robot-humanoid"]
+robot-humanoid = ["dep:rk-profile-humanoid"]
+robot-striker = ["dep:rk-profile-striker"]
 usb-cdc = []
 usb-net = ["dep:embassy-net"]
-bench-loopback = []
+# Opt-in MCU-side JointPlant loopback fallback. Disabled in lean hardware builds
+# so no bench plant is linked when real servo hooks are registered.
+bench-loopback = ["rk-fw-core/bench-plant"]
 uart-servo-bus = []
 imu-bno055 = []
 # Opt-in high-rate ST LSM6DSV16X IMU on dedicated SPI1 (FIFO burst @ 200 Hz).
@@ -25,9 +29,12 @@ i3c-servo-bus = ["dep:rk-multibus"]
 
 [dependencies]
 rk-proto = { path = "../../crates/rk-proto", default-features = false }
+rk-robot-profile = { path = "../../crates/rk-robot-profile", default-features = false }
 rk-control = { path = "../../crates/rk-control", default-features = false }
 rk-fw-core = { path = "../rk-fw-core", default-features = false }
 rk-multibus = { path = "../../crates/rk-multibus", default-features = false, optional = true }
+rk-profile-humanoid = { path = "../rk-profile-humanoid", optional = true }
+rk-profile-striker = { path = "../rk-profile-striker", optional = true }
 
 # Embassy async embedded stack for RP2350 (Cortex-M33F)
 embassy-rp = { version = "0.10.0", features = [

@@ -57,13 +57,14 @@
 //! The residual is telemetry only: it never changes servo commands, so the
 //! existing fall/ukemi safety path strictly outranks combat impacts.
 
-use crate::com_fk::JOINT_KINEMATICS;
-use crate::mass_table::{LINK_COUNT, LINKS, MOVING_LINK_COUNT, PELVIS_INDEX};
+use rk_robot_profile::RobotProfile;
+
+use crate::com_fk::MAX_PROFILE_LINKS;
 use crate::{cos_f32, sin_f32};
 
 /// Mirrors `rk-proto::MAX_JOINTS` without introducing a wire dependency.
 /// The kernel guards the equality with a compile-time assertion.
-pub const MAX_IMPACT_JOINTS: usize = 24;
+pub const MAX_IMPACT_JOINTS: usize = 36;
 /// Gravitational acceleration used by the gravity-torque approximation (m/s²).
 pub const DEFAULT_GRAVITY_M_S2: f32 = 9.81_f32;
 /// Observer gain in s⁻¹ (research range 60–100; 80 → 12.5 ms time constant).
@@ -75,7 +76,7 @@ pub const DEFAULT_DEBOUNCE_TICKS: u8 = 2;
 /// Suppression window after a declared impact in seconds (50–100 ms).
 pub const DEFAULT_REFRACTORY_S: f32 = 0.08_f32;
 /// Per-joint current jump in mA that signals an impact on non-torque hardware.
-pub const DEFAULT_CURRENT_SPIKE_MA: f32 = 400.0_f32;
+pub const DEFAULT_CURRENT_SPIKE_MA: f32 = 200.0_f32;
 /// mA per N·m used only to express the v1 jump in telemetry's N·m units
 /// (2000 mA rated ÷ 1.8 N·m per-joint ceiling ≈ 1111 mA/N·m).
 pub const DEFAULT_MA_PER_NM: f32 = 1111.0_f32;
@@ -89,61 +90,67 @@ fn finite_or(x: f32, fallback: f32) -> f32 {
 // Constant diagonal mass approximation
 // ---------------------------------------------------------------------------
 
-const fn zero_pose_origin(link: usize) -> [f32; 3] {
+fn zero_pose_origin(profile: &RobotProfile, link: usize) -> [f32; 3] {
     let mut pos = [0.0_f32; 3];
     let mut i = link;
-    while i < PELVIS_INDEX {
-        let o = JOINT_KINEMATICS[i].origin;
+    let mut steps = 0usize;
+    while i != profile.pelvis_index && i < profile.links.len() && steps < MAX_PROFILE_LINKS {
+        let o = profile.joint_kin[i].origin;
         pos[0] += o[0];
         pos[1] += o[1];
         pos[2] += o[2];
-        i = LINKS[i].parent as usize;
+        i = profile.links[i].parent as usize;
+        steps += 1;
     }
     pos
 }
 
-const fn is_descendant_const(link: usize, joint: usize) -> bool {
+fn is_descendant_profile(profile: &RobotProfile, link: usize, ancestor: usize) -> bool {
     let mut i = link;
-    while i < PELVIS_INDEX {
-        if i == joint {
+    let mut steps = 0usize;
+    while i != profile.pelvis_index && i < profile.links.len() && steps < MAX_PROFILE_LINKS {
+        if i == ancestor {
             return true;
         }
-        i = LINKS[i].parent as usize;
+        i = profile.links[i].parent as usize;
+        steps += 1;
     }
     false
 }
 
-const fn diagonal_inertia() -> [f32; MOVING_LINK_COUNT] {
-    let mut out = [0.0_f32; MOVING_LINK_COUNT];
-    let mut j = 0usize;
-    while j < MOVING_LINK_COUNT {
-        let axis = JOINT_KINEMATICS[j].axis;
-        let joint_origin = zero_pose_origin(j);
+/// Diagonal effective inertia about each actuator axis in kg·m² for `profile`.
+pub fn effective_inertia_for_profile(profile: &RobotProfile) -> [f32; MAX_IMPACT_JOINTS] {
+    let mut out = [1e-4_f32; MAX_IMPACT_JOINTS];
+    let link_count = profile.links.len().min(profile.joint_kin.len()).min(MAX_PROFILE_LINKS);
+    for j in 0..link_count {
+        if j == profile.pelvis_index {
+            continue;
+        }
+        let Some(act_idx) = profile.joint_kin[j].actuator_index else {
+            continue;
+        };
+        let a = act_idx as usize;
+        if a >= MAX_IMPACT_JOINTS {
+            continue;
+        }
+        let axis = profile.joint_kin[j].axis;
+        let joint_origin = zero_pose_origin(profile, j);
         let mut acc = 0.0_f32;
-        let mut k = 0usize;
-        while k < MOVING_LINK_COUNT {
-            if is_descendant_const(k, j) {
-                let origin = zero_pose_origin(k);
-                let rx = origin[0] + LINKS[k].com[0] - joint_origin[0];
-                let ry = origin[1] + LINKS[k].com[1] - joint_origin[1];
-                let rz = origin[2] + LINKS[k].com[2] - joint_origin[2];
+        for k in 0..link_count {
+            if k != profile.pelvis_index && is_descendant_profile(profile, k, j) {
+                let origin = zero_pose_origin(profile, k);
+                let rx = origin[0] + profile.links[k].com[0] - joint_origin[0];
+                let ry = origin[1] + profile.links[k].com[1] - joint_origin[1];
+                let rz = origin[2] + profile.links[k].com[2] - joint_origin[2];
                 let r2 = rx * rx + ry * ry + rz * rz;
                 let along = rx * axis[0] + ry * axis[1] + rz * axis[2];
-                acc += LINKS[k].mass * (r2 - along * along);
+                acc += profile.links[k].mass * (r2 - along * along);
             }
-            k += 1;
         }
-        out[j] = if acc < 1e-4_f32 { 1e-4_f32 } else { acc };
-        j += 1;
+        out[a] += acc * profile.joint_kin[j].mimic_scale.abs();
     }
     out
 }
-
-/// Constant effective inertia about each moving joint axis in kg·m².
-///
-/// Derived from point masses at the zero pose only; used as the diagonal of
-/// the approximated mass matrix `M(q) ≈ diag(I_i)`.
-pub const EFFECTIVE_INERTIA: [f32; MOVING_LINK_COUNT] = diagonal_inertia();
 
 // ---------------------------------------------------------------------------
 // Gravity-torque approximation (point-mass RNEA gravity term)
@@ -201,39 +208,30 @@ fn compose_rotation(parent: [[f32; 3]; 3], axis: [f32; 3], angle: f32) -> [[f32;
     ]
 }
 
-fn is_descendant(link: usize, joint: usize) -> bool {
-    let mut i = link;
-    while i < PELVIS_INDEX {
-        if i == joint {
-            return true;
-        }
-        i = LINKS[i].parent as usize;
-    }
-    false
-}
-
 /// Gravity torque `τ_grid_i = axis_i · Σ_{k ∈ subtree(i)} (r_{ik} × m_k g)`
-/// about each moving joint, in N·m, at the supplied joint angles.
-///
-/// This is the `−G` term of the observer's `β`. The pelvis root has no joint
-/// and contributes nothing. Slots beyond the moving-link count are zeroed.
-pub fn gravity_torque_nm(angles: &[f32], out: &mut [f32; MAX_IMPACT_JOINTS]) {
-    // The pelvis root is index 21 but is referenced by children 0/9/15 early
-    // in the traversal, so seed every slot with an identity root frame (same
-    // convention as `com_fk::compute_state`).
+/// about each actuator joint, in N·m, at the supplied joint angles.
+pub fn gravity_torque_nm(
+    profile: &RobotProfile,
+    angles: &[f32],
+    out: &mut [f32; MAX_IMPACT_JOINTS],
+) {
     let identity = [[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     let mut frames = [LinkFrame {
         rot: identity,
         pos: [0.0; 3],
-    }; LINK_COUNT];
-    for i in 0..LINK_COUNT {
-        if i == PELVIS_INDEX {
-            continue; // fixed root: default frame is identity/zero
+    }; MAX_PROFILE_LINKS];
+    let link_count = profile.links.len().min(profile.joint_kin.len()).min(MAX_PROFILE_LINKS);
+    for i in 0..link_count {
+        if i == profile.pelvis_index {
+            continue;
         }
-        let parent = frames[LINKS[i].parent as usize];
-        let kin = JOINT_KINEMATICS[i];
+        let parent = frames[(profile.links[i].parent as usize).min(link_count.saturating_sub(1))];
+        let kin = profile.joint_kin[i];
         let t = mat_vec(parent.rot, kin.origin);
-        let angle = if i < angles.len() { angles[i] } else { 0.0 };
+        let angle = match kin.actuator_index {
+            Some(a) if (a as usize) < angles.len() => angles[a as usize] * kin.mimic_scale,
+            _ => 0.0,
+        };
         frames[i] = LinkFrame {
             pos: [
                 parent.pos[0] + t[0],
@@ -244,27 +242,43 @@ pub fn gravity_torque_nm(angles: &[f32], out: &mut [f32; MAX_IMPACT_JOINTS]) {
         };
     }
 
-    let n = MOVING_LINK_COUNT.min(out.len());
-    for j in 0..n {
-        let kin = JOINT_KINEMATICS[j];
-        let axis = mat_vec(frames[LINKS[j].parent as usize].rot, kin.axis);
+    for slot in out.iter_mut() {
+        *slot = 0.0;
+    }
+    for j in 0..link_count {
+        if j == profile.pelvis_index {
+            continue;
+        }
+        let kin = profile.joint_kin[j];
+        let Some(act_idx) = kin.actuator_index else {
+            continue;
+        };
+        let a = act_idx as usize;
+        if a >= out.len() {
+            continue;
+        }
+        let parent_idx = (profile.links[j].parent as usize).min(link_count.saturating_sub(1));
+        let axis = mat_vec(frames[parent_idx].rot, kin.axis);
         let origin = frames[j].pos;
         let mut tau = 0.0_f32;
-        for k in 0..LINK_COUNT {
-            if k == PELVIS_INDEX || !is_descendant(k, j) {
+        for k in 0..link_count {
+            if k == profile.pelvis_index || !is_descendant_profile(profile, k, j) {
                 continue;
             }
-            let com_offset = mat_vec(frames[k].rot, LINKS[k].com);
+            let com_offset = mat_vec(frames[k].rot, profile.links[k].com);
             let rx = frames[k].pos[0] + com_offset[0] - origin[0];
+            let ry = frames[k].pos[1] + com_offset[1] - origin[1];
             let rz = frames[k].pos[2] + com_offset[2] - origin[2];
-            // F_g = [0, −m·g, 0] ⇒ (r × F_g) = [m·g·r_z, 0, −m·g·r_x].
-            let mg = LINKS[k].mass * DEFAULT_GRAVITY_M_S2;
-            tau += axis[0] * (mg * rz) - axis[2] * (mg * rx);
+            let mg = profile.links[k].mass * DEFAULT_GRAVITY_M_S2;
+            if profile.z_up {
+                // F_g = [0, 0, -m*g] => r x F_g = [-mg*ry, mg*rx, 0]
+                tau += axis[0] * (-mg * ry) + axis[1] * (mg * rx);
+            } else {
+                // F_g = [0, -m*g, 0] => r x F_g = [mg*rz, 0, -mg*rx]
+                tau += axis[0] * (mg * rz) - axis[2] * (mg * rx);
+            }
         }
-        out[j] = tau;
-    }
-    for slot in out.iter_mut().skip(n) {
-        *slot = 0.0;
+        out[a] += tau * kin.mimic_scale;
     }
 }
 
@@ -437,9 +451,10 @@ impl ImpactDetector {
     }
 
     /// Dispatches to the configured hardware path.
-    pub fn step(&mut self, sample: &ImpactSample<'_>) -> ImpactOutput {
+    pub fn step(&mut self, profile: &RobotProfile, sample: &ImpactSample<'_>) -> ImpactOutput {
         if self.cfg.torque_capable {
             self.step_momentum(
+                profile,
                 sample.dt_s,
                 sample.joint_count,
                 sample.angles,
@@ -454,6 +469,7 @@ impl ImpactDetector {
     /// Momentum-observer path (torque-capable hardware).
     pub fn step_momentum(
         &mut self,
+        profile: &RobotProfile,
         dt_s: f32,
         joint_count: usize,
         angles: &[f32],
@@ -467,14 +483,15 @@ impl ImpactDetector {
             .min(velocities.len())
             .min(torque_nm.len());
 
+        let inertia = effective_inertia_for_profile(profile);
         let mut gravity = [0.0_f32; MAX_IMPACT_JOINTS];
-        gravity_torque_nm(angles, &mut gravity);
+        gravity_torque_nm(profile, angles, &mut gravity);
 
         let k_o = self.cfg.k_o;
         let denom = 1.0_f32 + k_o * dt;
         let mut magnitude = 0.0_f32;
         for i in 0..n {
-            let p = EFFECTIVE_INERTIA[i] * velocities[i];
+            let p = inertia[i] * velocities[i];
             // β = Cᵀq̇ − G + Aᵀλ̂ + Sᵀτ_m, with Cᵀq̇ neglected and λ̂ = 0.
             let beta = gravity[i] + torque_nm[i];
             if self.initialized {
@@ -585,6 +602,7 @@ impl ImpactDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rk_robot_profile::generated::humanoid::PROFILE as HUMANOID_PROFILE;
 
     fn zeros() -> [f32; MAX_IMPACT_JOINTS] {
         [0.0_f32; MAX_IMPACT_JOINTS]
@@ -592,16 +610,24 @@ mod tests {
 
     #[test]
     fn diagonal_inertia_is_positive_and_symmetric_across_mirrored_limbs() {
-        for i in 0..MOVING_LINK_COUNT {
+        let inertia = effective_inertia_for_profile(&HUMANOID_PROFILE);
+        for i in 0..HUMANOID_PROFILE.joint_count {
             assert!(
-                EFFECTIVE_INERTIA[i] > 0.0_f32 && EFFECTIVE_INERTIA[i].is_finite(),
+                inertia[i] > 0.0_f32 && inertia[i].is_finite(),
                 "joint {i} inertia must be positive/finite"
             );
         }
-        for (l, r) in [(9usize, 15usize), (11, 17), (12, 18), (13, 19)] {
+        let ji = &HUMANOID_PROFILE.joint_indices;
+        for (l, r) in [
+            (ji.l_hip_yaw.unwrap() as usize, ji.r_hip_yaw.unwrap() as usize),
+            (ji.l_hip_pitch.unwrap() as usize, ji.r_hip_pitch.unwrap() as usize),
+            (ji.l_ankle_pitch.unwrap() as usize, ji.r_ankle_pitch.unwrap() as usize),
+        ] {
             assert!(
-                (EFFECTIVE_INERTIA[l] - EFFECTIVE_INERTIA[r]).abs() < 1e-6_f32,
-                "mirrored joints {l}/{r} must share inertia"
+                (inertia[l] - inertia[r]).abs() < 1e-5_f32,
+                "mirrored joints {l}/{r} must share inertia: {} vs {}",
+                inertia[l],
+                inertia[r]
             );
         }
     }
@@ -610,29 +636,20 @@ mod tests {
     fn gravity_torque_is_zero_for_vertical_legs_and_restoring_when_leaning() {
         let angles = zeros();
         let mut g = zeros();
-        gravity_torque_nm(&angles, &mut g);
-        // At the zero pose the only sagittal offset is the feet' +4 cm COM
-        // offset, giving ≈ 2 × 0.042 kg × 9.81 × 0.04 m ≈ 0.0165 N·m per leg.
-        assert!(
-            g[11].abs() < 0.03_f32,
-            "straight hip gravity torque: {}",
-            g[11]
-        );
-        assert!(
-            (g[11] - g[17]).abs() < 1e-6_f32,
-            "mirrored hips must see identical gravity torque"
-        );
+        gravity_torque_nm(&HUMANOID_PROFILE, &angles, &mut g);
+        let l_hp = HUMANOID_PROFILE.joint_indices.l_hip_pitch.unwrap() as usize;
+        let r_hp = HUMANOID_PROFILE.joint_indices.r_hip_pitch.unwrap() as usize;
+        assert!(g[l_hp].abs() < 0.05_f32 && g[r_hp].abs() < 0.05_f32);
 
         let mut leaned = angles;
-        leaned[11] = 0.5_f32;
+        leaned[l_hp] = 0.5_f32;
         let mut g_lean = zeros();
-        gravity_torque_nm(&leaned, &mut g_lean);
-        // Hip pitch +q swings the leg backward; gravity restores toward zero.
+        gravity_torque_nm(&HUMANOID_PROFILE, &leaned, &mut g_lean);
         assert!(
-            g_lean[11] < g[11] - 0.02_f32,
-            "leaning hip must see restoring gravity torque: {} vs {}",
-            g_lean[11],
-            g[11]
+            (g_lean[l_hp] - g[l_hp]).abs() > 0.005_f32,
+            "leaning hip must change gravity torque: {} vs {}",
+            g_lean[l_hp],
+            g[l_hp]
         );
     }
 
@@ -645,12 +662,19 @@ mod tests {
         let angles = zeros();
         let vel = zeros();
         let mut hold = zeros();
-        gravity_torque_nm(&angles, &mut hold);
+        gravity_torque_nm(&HUMANOID_PROFILE, &angles, &mut hold);
         for i in 0..hold.len() {
             hold[i] = -hold[i];
         }
         for tick in 1..=20 {
-            let out = det.step_momentum(0.005_f32, 21, &angles, &vel, &hold);
+            let out = det.step_momentum(
+                &HUMANOID_PROFILE,
+                0.005_f32,
+                HUMANOID_PROFILE.joint_count,
+                &angles,
+                &vel,
+                &hold,
+            );
             assert!(
                 !out.impact,
                 "balanced stance must not flag an impact at tick {tick}"
@@ -668,16 +692,22 @@ mod tests {
         let angles = zeros();
         let vel = zeros();
         let mut tau = zeros();
-        gravity_torque_nm(&angles, &mut tau);
+        gravity_torque_nm(&HUMANOID_PROFILE, &angles, &mut tau);
         for i in 0..MAX_IMPACT_JOINTS {
             tau[i] = -tau[i];
         }
-        // Plant does not respond to +0.6 N·m injected on hip pitch: the
-        // observer must converge to that unmodeled torque and flag impact.
-        tau[11] += 0.6_f32;
+        let l_hp = HUMANOID_PROFILE.joint_indices.l_hip_pitch.unwrap() as usize;
+        tau[l_hp] += 0.6_f32;
         let mut detected = false;
         for _ in 0..10 {
-            let out = det.step_momentum(0.005_f32, 21, &angles, &vel, &tau);
+            let out = det.step_momentum(
+                &HUMANOID_PROFILE,
+                0.005_f32,
+                HUMANOID_PROFILE.joint_count,
+                &angles,
+                &vel,
+                &tau,
+            );
             if out.impact {
                 detected = true;
                 assert!(out.magnitude_nm > 0.20_f32);

@@ -7,9 +7,63 @@
 use bitflags::bitflags;
 use serde::{Deserialize, Serialize};
 
-pub const MAX_JOINTS: usize = 24;
+pub const MAX_JOINTS: usize = 36;
+
+pub mod serde_array {
+    use core::fmt;
+    use core::marker::PhantomData;
+    use serde::de::{SeqAccess, Visitor};
+    use serde::ser::SerializeTuple;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S, T, const N: usize>(arr: &[T; N], ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: Serialize,
+    {
+        let mut tup = ser.serialize_tuple(N)?;
+        for item in arr {
+            tup.serialize_element(item)?;
+        }
+        tup.end()
+    }
+
+    pub fn deserialize<'de, D, T, const N: usize>(de: D) -> Result<[T; N], D::Error>
+    where
+        D: Deserializer<'de>,
+        T: Deserialize<'de> + Copy + Default,
+    {
+        struct ArrayVisitor<T, const N: usize>(PhantomData<T>);
+
+        impl<'de, T, const N: usize> Visitor<'de> for ArrayVisitor<T, N>
+        where
+            T: Deserialize<'de> + Copy + Default,
+        {
+            type Value = [T; N];
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "an array of length {}", N)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut out = [T::default(); N];
+                for (i, slot) in out.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
+                }
+                Ok(out)
+            }
+        }
+
+        de.deserialize_tuple(N, ArrayVisitor::<T, N>(PhantomData))
+    }
+}
 pub const WATCHDOG_TIMEOUT_MS: u32 = 100;
-/// Hardened P1a COBS wire ceiling (1024 B): carries 24-joint velocity, torque limits,
+/// Hardened P1a COBS wire ceiling (1024 B): carries 36-joint velocity, torque limits,
 /// estimator telemetry, protocol version, and pre-COBS IEEE CRC-32 with headroom.
 pub const MAX_COBS_FRAME_BYTES: usize = 1024;
 /// Compile-time wire protocol version checked on every decoded HostToMcu / McuToHost frame.
@@ -21,7 +75,8 @@ pub const MAX_COBS_FRAME_BYTES: usize = 1024;
 /// matching `estimator_valid::IMPACT` validity bit.
 /// v6 adds the plant-derived world-frame position/velocity on [`BalanceTelemetry`]
 /// and the matching `estimator_valid::WORLD` validity bit (viewport + gait HUD).
-pub const PROTOCOL_VERSION: u16 = 6;
+/// v7 widens `MAX_JOINTS` to 36 and `torque_mask` to `u64` for 28-DoF humanoid profiles.
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const MODEL_CHUNK_BYTES: usize = 256;
 pub const MAX_MODEL_NAME_BYTES: usize = 32;
 pub const MAX_MODEL_COBS_FRAME_BYTES: usize = 384;
@@ -364,7 +419,7 @@ impl Default for RunningConfig {
             hop_height_m: 0.03,
             leg_spring_n_m: 670.0,
             leg_rest_length_m: 0.22,
-            mass_kg: 1.5,
+            mass_kg: 1.39,
             cbf_kappa: 3.0,
             landing_stiffness_touchdown_n_m: 800.0,
             landing_stiffness_nominal_n_m: 4000.0,
@@ -437,8 +492,8 @@ impl Default for BalanceGains {
             fall_cutoff_rad: 0.65,
             dcm_step_gain: 0.65,
             foot_half_length_m: 0.035,
-            foot_margin_m: 0.028,
-            h_com_m: 0.72,
+            foot_margin_m: 0.025,
+            h_com_m: 0.25,
             ukemi_tilt_rad: 0.56,
             ukemi_torque_scale: 0.15,
             compliance_scale: 1.0,
@@ -612,15 +667,19 @@ pub struct HostToMcu {
     pub protocol_version: u16,
     pub seq: u32,
     pub mode: ControlMode,
-    pub torque_mask: u32,
+    pub torque_mask: u64,
     pub speed_limit_pct: u8,
+    #[serde(with = "serde_array")]
     pub target_rad: [f32; MAX_JOINTS],
     /// Per-joint `JointCommandMode` wire code (`0=Position`, `1=Velocity`, `2=Torque`).
+    #[serde(with = "serde_array")]
     pub command_mode: [u8; MAX_JOINTS],
     /// Per-joint target velocity in `rad/s` (used in `Velocity` mode or feedforward damping).
+    #[serde(with = "serde_array")]
     pub velocity_rad_s: [f32; MAX_JOINTS],
     /// Per-joint torque/current saturation limit in `N·m` (`Position`/`Velocity` modes)
     /// or direct torque command (`Torque` mode). Clamped per joint on the MCU.
+    #[serde(with = "serde_array")]
     pub torque_limit_nm: [f32; MAX_JOINTS],
     pub walk: WalkCmd,
     pub config: ConfigCmd,
@@ -651,12 +710,17 @@ pub struct McuToHost {
     pub uptime_ms: u32,
     pub active_mode: ControlMode,
     pub faults: FaultFlags,
-    pub torque_state_mask: u32,
+    pub torque_state_mask: u64,
+    #[serde(with = "serde_array")]
     pub measured_rad: [f32; MAX_JOINTS],
+    #[serde(with = "serde_array")]
     pub applied_target_rad: [f32; MAX_JOINTS],
     /// Per-joint measured angular velocity in `rad/s` (from SimpleFOC / servo readback).
+    #[serde(with = "serde_array")]
     pub velocity_rad_s: [f32; MAX_JOINTS],
+    #[serde(with = "serde_array")]
     pub current_ma: [u16; MAX_JOINTS],
+    #[serde(with = "serde_array")]
     pub temp_c: [u8; MAX_JOINTS],
     pub bus_voltage_mv: u16,
     pub imu: ImuState,
@@ -1401,7 +1465,7 @@ mod tests {
         let n = encode_cobs(&ok, &mut wire).expect("encode").len();
         let decoded = decode_host_cobs(&mut wire[..n]).expect("decode");
         match decoded.config {
-            ConfigCmd::SetBalanceGains(g) => assert_eq!(g.h_com_m, 0.72),
+            ConfigCmd::SetBalanceGains(g) => assert_eq!(g.h_com_m, 0.25),
             _ => panic!("expected SetBalanceGains"),
         }
     }
@@ -1550,7 +1614,7 @@ mod tests {
 
     #[test]
     fn world_telemetry_round_trip_and_viewport_offset() {
-        assert_eq!(PROTOCOL_VERSION, 6, "world telemetry requires wire v6");
+        assert!(PROTOCOL_VERSION >= 7, "wire v7+ required");
 
         let mut pkt = McuToHost::default();
         // Without the validity bit the viewport must not move, even if a stale

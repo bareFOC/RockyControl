@@ -198,7 +198,7 @@ impl RockyStudioApp {
                 let measured_rad = self.model.latest_telemetry.measured_rad[j_idx];
                 let current_ma = self.model.latest_telemetry.current_ma[j_idx];
                 let cal = self.model.calibration[j_idx];
-                let torque_on = (self.model.torque_mask & (1u32 << j_idx)) != 0;
+                let torque_on = (self.model.torque_mask & (1u64 << j_idx)) != 0;
 
                 // Row 1: Joint identity, live angle & current, Torque / Zero / Invert / Reset
                 ui.horizontal(|ui| {

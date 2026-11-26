@@ -83,6 +83,22 @@ compile_error!(
 #[cfg(not(any(feature = "usb-cdc", feature = "usb-net")))]
 compile_error!("Enable one wired transport feature: `usb-cdc` or `usb-net`.");
 
+#[cfg(all(feature = "robot-humanoid", feature = "robot-striker"))]
+compile_error!("Enable either `robot-humanoid` or `robot-striker`, not both.");
+
+#[cfg(not(any(feature = "robot-humanoid", feature = "robot-striker")))]
+compile_error!("Enable one robot profile feature: `robot-humanoid` or `robot-striker`.");
+
+#[cfg(feature = "robot-humanoid")]
+pub(crate) const fn active_profile() -> &'static rk_robot_profile::RobotProfile {
+    rk_profile_humanoid::PROFILE
+}
+
+#[cfg(feature = "robot-striker")]
+pub(crate) const fn active_profile() -> &'static rk_robot_profile::RobotProfile {
+    rk_profile_striker::PROFILE
+}
+
 /// Board I/O adapter for the shared, runtime-agnostic control task.
 ///
 /// All timing comes from Embassy (`Ticker` + `Instant`); all data comes from the
@@ -97,6 +113,10 @@ struct HardwareRobotIo {
 }
 
 impl RobotIo for HardwareRobotIo {
+    fn profile(&self) -> &'static rk_robot_profile::RobotProfile {
+        active_profile()
+    }
+
     async fn wait_tick(&mut self) {
         self.ticker.next().await;
     }

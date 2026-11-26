@@ -2,6 +2,8 @@
 resolver = "3"
 members = [
     "rk-fw-core",
+    "rk-profile-humanoid",
+    "rk-profile-striker",
     "rk-rp2350",
 ]
 # ESP32-P4 requires the RISC-V esp-hal toolchain (`riscv32imafc-unknown-none-elf`),
@@ -17,6 +19,6 @@ debug = 2
 [profile.release]
 opt-level = "s"
 debug = 2
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"

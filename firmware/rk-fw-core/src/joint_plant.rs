@@ -22,8 +22,9 @@
 //! impact detector. A non-positive `torque_limit_nm` means torque OFF: the
 //! joint holds its angle, reports quiescent current and cools toward ambient.
 
-use rk_control::EFFECTIVE_INERTIA;
+use rk_control::impact::effective_inertia_for_profile;
 use rk_proto::{JointCommandMode, RATED_CURRENT_MA};
+use rk_robot_profile::RobotProfile;
 
 /// Electrical conversion used by the plant: 1 N·m per ampere.
 ///
@@ -76,6 +77,7 @@ pub struct JointPlant<const N: usize> {
     current_ma: [u16; N],
     temp_c: [f32; N],
     gravity_nm: [f32; N],
+    inertia_kg_m2: [f32; N],
     /// Position stiffness as `bandwidth² · inertia` (s⁻², scaled by inertia).
     position_bandwidth_rad_s: f32,
     position_damping: f32,
@@ -95,11 +97,19 @@ impl<const N: usize> JointPlant<N> {
             current_ma: [0u16; N],
             temp_c: [AMBIENT_TEMP_C; N],
             gravity_nm: [0.0_f32; N],
+            inertia_kg_m2: [FALLBACK_INERTIA_KG_M2; N],
             position_bandwidth_rad_s: DEFAULT_POSITION_BANDWIDTH_RAD_S,
             position_damping: DEFAULT_POSITION_DAMPING,
             velocity_bandwidth_rad_s: DEFAULT_VELOCITY_BANDWIDTH_RAD_S,
             friction_nm_s_per_rad: 0.0_f32,
         }
+    }
+
+    /// Populates per-joint diagonal inertia from `profile`.
+    pub fn set_profile(&mut self, profile: &RobotProfile) {
+        let inertia = effective_inertia_for_profile(profile);
+        let n = N.min(inertia.len());
+        self.inertia_kg_m2[..n].copy_from_slice(&inertia[..n]);
     }
 
     /// Number of active joints.
@@ -126,10 +136,7 @@ impl<const N: usize> JointPlant<N> {
             return (0.0_f32, 0.0_f32, 0u16, 0.0_f32);
         }
         let dt = dt_sec.clamp(0.001_f32, 0.05_f32);
-        let inertia = EFFECTIVE_INERTIA
-            .get(joint)
-            .copied()
-            .unwrap_or(FALLBACK_INERTIA_KG_M2);
+        let inertia = self.inertia_kg_m2[joint];
         let limit = torque_limit_nm.max(0.0_f32);
         let angle = self.angle_rad[joint];
         let velocity = self.velocity_rad_s[joint];

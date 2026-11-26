@@ -77,3 +77,21 @@ The simulator SHALL support scripted walk-disturbance scenarios (low friction, s
 #### Scenario: Disturbance recovery
 - **WHEN** low friction or sensor latency is scripted mid-walk
 - **THEN** the controller recovers within two seconds or latches a clean fall with recovery intact
+
+### Requirement: Profile-driven plant and two-point foot contact
+The simulator SHALL construct its world dynamics, joint plant, torque masks (`u64`), and actuator constants from the active `RobotProfile`, and SHALL model 2-point foot contact (heel + toe) using `com_fk` foot and toe link frames.
+
+#### Scenario: Toe push-off shifts foot contact forward
+- **WHEN** the 28-DoF humanoid pitches its toes down during stance push-off
+- **THEN** the simulator detects toe contact via toe-link FK and supports ground reaction force at the toe contact point
+
+### Requirement: Tuned two-point heel and toe contact fidelity
+The simulator's 2-point heel+toe contact parameters SHALL be tuned for the 28-DoF humanoid's foot geometry and mass distribution so `toe_pitch` push-off, heel-strike, and realistic-sensor `walk_nominal` / `walk_shove` runs maintain bounded slip, zero flight ticks, and accurate single-support GRF.
+
+#### Scenario: Two-point push-off without excessive slip
+- **WHEN** the 28-DoF humanoid executes `walk_nominal` with `toe_pitch` push-off active
+- **THEN** heel and toe contacts share support transitions smoothly with accumulated slip within acceptance bounds and no spurious flight ticks
+
+#### Scenario: Shove recovery under two-point contact
+- **WHEN** `walk_shove` injects a lateral or sagittal CoM impulse on the 28-DoF humanoid
+- **THEN** two-point foot contact and UVC/SLIP stepping recover balance within the acceptance window without latching a fall

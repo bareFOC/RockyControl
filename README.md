@@ -18,8 +18,8 @@ Rocky Studio runs the exact same workstation UI on **Desktop** (`apps/rk-desktop
   - Three explicit authority modes: `Teach` (Robot -> GUI, torque off), `Drive` (GUI -> Robot, torque on), and latched `EStop` (`Space` hotkey or top-bar button).
   - Bumpless transfer on every `Teach -> Drive` transition (`target_rad = measured_rad`).
   - Per-joint soft limits, slew-rate clamping, deadman heartbeat watchdog (200 ms), and deterministic Copper replay verification.
-- **URDF & MCU Model Pipeline (`rk-model`, `rk-link`)**:
-  - Loads `.urdf`, `.xml`, or `.zip` robot bundles (with embedded STL/OBJ meshes) via upload picker, drag-and-drop, XML paste, or chunked CRC32-verified MCU flash pull (`Pull MCU`).
+- **URDF & Model Pipeline (`rk-model`, `rk-link`)**:
+  - Loads `.urdf`, `.xml`, or `.zip` robot bundles (with embedded STL/OBJ meshes) via upload picker, drag-and-drop, or XML paste. Models are **app-owned**: the MCU embeds no URDF and serves no model download, so `Pull MCU` reports that the model is unavailable on real hardware.
   - Built-in 12-DoF fighting humanoid sample (`assets/sample_humanoid/rocky_mk1.urdf`).
 - **Fall Recovery (`rk-ui`, `rk-model`)**:
   - A pulsing red highlight and a top-right **Recovery HUD** panel make falls unmistakable, showing `FALL DETECTED / STABLE`, the classified orientation, and the ordered recovery state.
@@ -33,7 +33,7 @@ Rocky Studio runs the exact same workstation UI on **Desktop** (`apps/rk-desktop
 
 | Crate | Layer | Purpose |
 | --- | --- | --- |
-| `crates/rk-proto` | Layer 0 (`#![no_std]`) | Wire protocol (`postcard` + `cobs` + CRC32), telemetry/command frames, fault bitflags, chunked MCU model transfer |
+| `crates/rk-proto` | Layer 0 (`#![no_std]`) | Wire protocol (`postcard` + `cobs` + CRC32), telemetry/command frames, fault bitflags, chunked model-store codec (sim/host only; MCU model pull unavailable) |
 | `crates/rk-control` | Layer 1 (`#![no_std]`) | Safety kernel: mode state machine, bumpless transfer, soft limits, slew clamping, deadman watchdog |
 | `crates/rk-multibus` | Layer 1b (`#![no_std]`) | BareFOC/I3C register-bus client, control-table wire format and bus-health tracking |
 | `crates/rk-harness` | Layer 1c | Fixed-dt deterministic Embassy harness shared by simulator and replay |
@@ -54,6 +54,10 @@ Rocky Studio runs the exact same workstation UI on **Desktop** (`apps/rk-desktop
 | `firmware/rk-fw-core` | `#![no_std]` | Board-agnostic Embassy `ControlTask`, shared control/replay types, frame codec |
 | `firmware/rk-rp2350` | `thumbv8m.main-none-eabihf` | RP2350 firmware (`embassy-rp`) with `usb-cdc` (default) and `usb-net` (CDC-NCM + `embassy-net` UDP) |
 | `firmware/rk-esp32p4` | `riscv32imafc-unknown-none-elf` | ESP32-P4 firmware (`esp-hal` + `esp-rtos`) |
+
+Firmware is lean: no URDF is embedded in MCU flash, the model UDP service is removed,
+and the MCU-side bench plant is opt-in (`bench-plant` via `bench-loopback`). URDFs are
+owned by the workstation app; MCU model pull is unavailable.
 
 See [`firmware/README.md`](firmware/README.md) for wiring, pinouts, and flashing details.
 

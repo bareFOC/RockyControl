@@ -20,6 +20,7 @@
 ## Conventions
 
 - Use OpenSpec for planning non-trivial changes (propose → apply → sync/archive).
-- Delegate independent work to subagents with clear file ownership; no concurrent edits to the same file.
+- Delegate independent work (including full OpenSpec change implementation, verification, and sync/archival) to subagents with clear file ownership; no concurrent edits to the same file.
 - Verify with `cargo test` across host crates, `cargo test --manifest-path firmware/Cargo.toml -p rk-fw-core`, and thumb-target `cargo check` for RP2350 feature sets before declaring work complete.
 - Keep changes focused and avoid adding dependencies unless clearly justified.
+- Always use the ask tool (`ask_question`) for open questions and to clarify doubts.

@@ -2939,6 +2939,7 @@ version = "0.1.0"
 dependencies = [
  "libm",
  "rk-proto",
+ "rk-robot-profile",
  "serde",
 ]
 
@@ -2963,6 +2964,7 @@ dependencies = [
  "libm",
  "rk-control",
  "rk-proto",
+ "rk-robot-profile",
  "serde",
 ]
 
@@ -3008,6 +3010,7 @@ dependencies = [
  "k",
  "rk-control",
  "rk-proto",
+ "rk-robot-profile",
  "serde",
  "serde_json",
  "urdf-rs 0.10.0",
@@ -3023,6 +3026,7 @@ dependencies = [
  "embedded-hal-mock",
  "rk-control",
  "rk-proto",
+ "rk-robot-profile",
 ]
 
 [[package]]
@@ -3032,6 +3036,13 @@ dependencies = [
  "bitflags 2.13.2",
  "postcard",
  "serde",
+]
+
+[[package]]
+name = "rk-robot-profile"
+version = "0.1.0"
+dependencies = [
+ "rk-proto",
 ]
 
 [[package]]
@@ -3045,6 +3056,7 @@ dependencies = [
  "rk-harness",
  "rk-multibus",
  "rk-proto",
+ "rk-robot-profile",
  "serde",
  "serde_json",
 ]
@@ -4654,6 +4666,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "craft-xtask",
+ "urdf-rs 0.10.0",
 ]
 
 [[package]]

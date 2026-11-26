@@ -6,15 +6,22 @@ license = "Apache-2.0"
 description = "Board-agnostic no_std Embassy humanoid firmware core (shared across RP2350 and ESP32-P4)"
 
 [features]
-default = ["std"]
+# `bench-plant` is enabled by default for host tests; board crates depend with
+# `default-features = false` and opt in explicitly via their `bench-loopback` feature.
+default = ["std", "bench-plant"]
 std = [
     "rk-proto/std",
+    "rk-robot-profile/std",
     "rk-control/std",
     "serde/std",
     "critical-section/std",
 ]
+# Compile the MCU-side JointPlant loopback fallback into ServoBusSlot. Production
+# hardware builds leave this off so no bench plant is linked into firmware.
+bench-plant = []
 [dependencies]
 rk-proto = { path = "../../crates/rk-proto", default-features = false }
+rk-robot-profile = { path = "../../crates/rk-robot-profile", default-features = false }
 rk-control = { path = "../../crates/rk-control", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 critical-section = { version = "1.2", default-features = false }

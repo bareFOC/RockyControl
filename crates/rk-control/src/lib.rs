@@ -16,13 +16,13 @@ pub mod cbf;
 pub mod com_fk;
 pub mod estimator;
 pub mod impact;
-pub mod mass_table;
 pub mod slip;
 pub mod uvc;
 
 use core::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use libm::sqrtf;
+use rk_robot_profile::{RobotProfile, generated};
 
 pub use cbf::{
     CbfConfig, project_capture_point, project_com_velocity, project_tilt_rate, project_tilt_torque,
@@ -30,7 +30,7 @@ pub use cbf::{
 };
 pub use estimator::{DcmSwingHint, KinematicEstimator};
 pub use impact::{
-    EFFECTIVE_INERTIA, ImpactConfig, ImpactDetector, ImpactOutput, ImpactSample, MAX_IMPACT_JOINTS,
+    ImpactConfig, ImpactDetector, ImpactOutput, ImpactSample, MAX_IMPACT_JOINTS,
     gravity_torque_nm,
 };
 use rk_proto::{
@@ -40,44 +40,13 @@ use rk_proto::{
 };
 use serde::{Deserialize, Serialize};
 pub use slip::{FlightDetector, SlipConfig, SlipController, SlipInputs, SlipOutput, SlipPhase};
-pub use uvc::{LegGeometry, LegIkAngles, UvcController, UvcPhase, UvcStepOutput, solve_leg_ik};
+pub use uvc::{LegIkAngles, UvcController, UvcPhase, UvcStepOutput, solve_leg_ik};
 
 pub const DEFAULT_BASE_SLEW_RAD_PER_SEC: f32 = 2.0;
 pub const BALANCE_SLEW_RAD_PER_SEC: f32 = 5.5;
 pub const OVER_CURRENT_TRIP_MA: u16 = 1950;
 pub const OVER_TEMP_TRIP_C: u8 = 78;
 pub const UNDER_VOLTAGE_TRIP_MV: u16 = 10_500;
-
-// Common upper-body joint indices (identical in 17-DoF and 21-DoF Rocky Mk1 URDFs).
-const J_WAIST_YAW: usize = 0;
-const J_L_SHOULDER_PITCH: usize = 3;
-const J_L_SHOULDER_ROLL: usize = 4;
-const J_R_SHOULDER_PITCH: usize = 6;
-const J_R_SHOULDER_ROLL: usize = 7;
-
-// 21-DoF Rocky Mk1 6-DoF leg indices (matches assets/sample_humanoid/rocky_mk1.urdf).
-const J21_L_HIP_YAW: usize = 9;
-const J21_L_HIP_ROLL: usize = 10;
-const J21_L_HIP_PITCH: usize = 11;
-const J21_L_KNEE_PITCH: usize = 12;
-const J21_L_ANKLE_PITCH: usize = 13;
-const J21_L_ANKLE_ROLL: usize = 14;
-const J21_R_HIP_YAW: usize = 15;
-const J21_R_HIP_ROLL: usize = 16;
-const J21_R_HIP_PITCH: usize = 17;
-const J21_R_KNEE_PITCH: usize = 18;
-const J21_R_ANKLE_PITCH: usize = 19;
-const J21_R_ANKLE_ROLL: usize = 20;
-
-// Legacy 17-DoF 4-DoF leg fallback indices (graceful degradation for older 4-DoF URDFs).
-const J17_L_HIP_PITCH: usize = 9;
-const J17_L_HIP_ROLL: usize = 10;
-const J17_L_KNEE_PITCH: usize = 11;
-const J17_L_ANKLE_PITCH: usize = 12;
-const J17_R_HIP_PITCH: usize = 13;
-const J17_R_HIP_ROLL: usize = 14;
-const J17_R_KNEE_PITCH: usize = 15;
-const J17_R_ANKLE_PITCH: usize = 16;
 
 /// Deterministic `#![no_std]` single-precision sine accurate to < 2e-5 rad over all angles.
 #[inline]
@@ -143,9 +112,13 @@ impl Default for JointCalibration {
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct RawServoFeedback {
+    #[serde(with = "rk_proto::serde_array")]
     pub raw_angle_rad: [f32; MAX_JOINTS],
+    #[serde(with = "rk_proto::serde_array")]
     pub velocity_rad_s: [f32; MAX_JOINTS],
+    #[serde(with = "rk_proto::serde_array")]
     pub current_ma: [u16; MAX_JOINTS],
+    #[serde(with = "rk_proto::serde_array")]
     pub temp_c: [u8; MAX_JOINTS],
     pub bus_voltage_mv: u16,
     pub bus_error: bool,
@@ -188,10 +161,14 @@ impl Default for RawServoFeedback {
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct RawServoCommand {
-    pub torque_mask: u32,
+    pub torque_mask: u64,
+    #[serde(with = "rk_proto::serde_array")]
     pub raw_target_rad: [f32; MAX_JOINTS],
+    #[serde(with = "rk_proto::serde_array")]
     pub command_mode: [u8; MAX_JOINTS],
+    #[serde(with = "rk_proto::serde_array")]
     pub raw_velocity_rad_s: [f32; MAX_JOINTS],
+    #[serde(with = "rk_proto::serde_array")]
     pub torque_nm: [f32; MAX_JOINTS],
 }
 
@@ -214,19 +191,31 @@ pub struct KernelStepOutput {
 }
 
 #[inline]
-pub fn raw_to_calibrated(raw_rad: f32, cal: &JointCalibration) -> f32 {
+pub fn raw_to_calibrated_with_ratio(raw_rad: f32, cal: &JointCalibration, ratio: f32) -> f32 {
     let sign = if cal.inverted { -1.0_f32 } else { 1.0_f32 };
-    sign * (raw_rad - cal.zero_offset_rad)
+    let inv_ratio = if ratio != 0.0_f32 { 1.0_f32 / ratio } else { 1.0_f32 };
+    sign * (raw_rad - cal.zero_offset_rad) * inv_ratio
+}
+
+#[inline]
+pub fn calibrated_to_raw_with_ratio(cal_rad: f32, cal: &JointCalibration, ratio: f32) -> f32 {
+    let sign = if cal.inverted { -1.0_f32 } else { 1.0_f32 };
+    (sign * cal_rad * ratio) + cal.zero_offset_rad
+}
+
+#[inline]
+pub fn raw_to_calibrated(raw_rad: f32, cal: &JointCalibration) -> f32 {
+    raw_to_calibrated_with_ratio(raw_rad, cal, 1.0_f32)
 }
 
 #[inline]
 pub fn calibrated_to_raw(cal_rad: f32, cal: &JointCalibration) -> f32 {
-    let sign = if cal.inverted { -1.0_f32 } else { 1.0_f32 };
-    (sign * cal_rad) + cal.zero_offset_rad
+    calibrated_to_raw_with_ratio(cal_rad, cal, 1.0_f32)
 }
 
 #[derive(Clone, Debug)]
 pub struct DirectServoKernel {
+    profile: &'static RobotProfile,
     joint_count: usize,
     base_slew_rad_per_sec: f32,
     calibration: [JointCalibration; MAX_JOINTS],
@@ -235,7 +224,7 @@ pub struct DirectServoKernel {
     last_valid_seq: u32,
     last_valid_rx_ms: Option<u32>,
     last_host_speed_pct: u8,
-    last_host_torque_mask: u32,
+    last_host_torque_mask: u64,
     last_host_target_rad: [f32; MAX_JOINTS],
     last_host_command_mode: [u8; MAX_JOINTS],
     last_host_velocity_rad_s: [f32; MAX_JOINTS],
@@ -273,12 +262,37 @@ pub struct DirectServoKernel {
 
 impl DirectServoKernel {
     pub fn new(joint_count: usize, initial_cal: &[JointCalibration]) -> Self {
-        let clamped_count = joint_count.clamp(1, MAX_JOINTS);
+        let profile = if joint_count == 8 {
+            &generated::striker_biped::PROFILE
+        } else {
+            &generated::humanoid::PROFILE
+        };
+        let mut kernel = Self::new_with_profile(profile, initial_cal);
+        kernel.joint_count = joint_count.clamp(1, MAX_JOINTS);
+        kernel
+    }
+
+    pub fn new_with_profile(
+        profile: &'static RobotProfile,
+        initial_cal: &[JointCalibration],
+    ) -> Self {
+        let clamped_count = profile.joint_count.clamp(1, MAX_JOINTS);
         let mut calibration = [JointCalibration::default(); MAX_JOINTS];
+        for (i, dst) in calibration.iter_mut().enumerate() {
+            dst.min_rad = profile.default_limits[i][0];
+            dst.max_rad = profile.default_limits[i][1];
+            dst.max_torque_nm = profile.max_torque_nm[i];
+            dst.max_velocity_rad_s = profile.max_velocity_rad_s[i];
+        }
         for (dst, src) in calibration.iter_mut().zip(initial_cal.iter()) {
             *dst = *src;
         }
+        let mut gains = BalanceGains::default();
+        gains.h_com_m = profile.h_com_m;
+        gains.foot_half_length_m = profile.foot_half_length_m;
+        gains.foot_margin_m = profile.foot_margin_m;
         Self {
+            profile,
             joint_count: clamped_count,
             base_slew_rad_per_sec: DEFAULT_BASE_SLEW_RAD_PER_SEC,
             calibration,
@@ -295,9 +309,9 @@ impl DirectServoKernel {
             applied_target_rad: [0.0; MAX_JOINTS],
             initialized_targets: false,
             flash_commit_count: 0,
-            balance_gains: BalanceGains::default(),
+            balance_gains: gains,
             last_walk_cmd: WalkCmd::default(),
-            uvc: UvcController::new(LegGeometry::rocky_mk1()),
+            uvc: UvcController::new_for_profile(profile.leg_geometry, profile.z_up),
             estimator: KinematicEstimator::new(),
             last_support_mask: 0b11,
             uvc_blend: 0.0,
@@ -306,7 +320,7 @@ impl DirectServoKernel {
             rx_version_mismatches: 0,
             running_enabled: false,
             slip: SlipController::new(SlipConfig::from_nominal_height(
-                LegGeometry::rocky_mk1().nominal_height,
+                profile.leg_geometry.nominal_height,
             )),
             impact: ImpactDetector::new(ImpactConfig::default()),
         }
@@ -323,6 +337,10 @@ impl DirectServoKernel {
     pub fn set_wire_error_counts(&mut self, rx_crc_errors: u16, rx_version_mismatches: u16) {
         self.rx_crc_errors = rx_crc_errors;
         self.rx_version_mismatches = rx_version_mismatches;
+    }
+
+    pub const fn profile(&self) -> &'static RobotProfile {
+        self.profile
     }
 
     pub fn joint_count(&self) -> usize {
@@ -456,13 +474,16 @@ impl DirectServoKernel {
         let mut measured_rad = [0.0_f32; MAX_JOINTS];
         let mut measured_vel_rad_s = [0.0_f32; MAX_JOINTS];
         for i in 0..self.joint_count {
-            measured_rad[i] = raw_to_calibrated(feedback.raw_angle_rad[i], &self.calibration[i]);
+            let ratio = self.profile.motor_to_joint_ratio[i];
+            let inv_ratio = if ratio != 0.0_f32 { 1.0_f32 / ratio } else { 1.0_f32 };
+            measured_rad[i] =
+                raw_to_calibrated_with_ratio(feedback.raw_angle_rad[i], &self.calibration[i], ratio);
             let sign = if self.calibration[i].inverted {
                 -1.0_f32
             } else {
                 1.0_f32
             };
-            measured_vel_rad_s[i] = sign * feedback.velocity_rad_s[i];
+            measured_vel_rad_s[i] = sign * feedback.velocity_rad_s[i] * inv_ratio;
         }
 
         if !self.initialized_targets {
@@ -489,8 +510,11 @@ impl DirectServoKernel {
                     let idx = joint as usize;
                     if idx < self.joint_count && zero_rad.is_finite() {
                         self.calibration[idx].zero_offset_rad = zero_rad;
-                        measured_rad[idx] =
-                            raw_to_calibrated(feedback.raw_angle_rad[idx], &self.calibration[idx]);
+                        measured_rad[idx] = raw_to_calibrated_with_ratio(
+                            feedback.raw_angle_rad[idx],
+                            &self.calibration[idx],
+                            self.profile.motor_to_joint_ratio[idx],
+                        );
                         self.applied_target_rad[idx] = measured_rad[idx];
                         self.last_host_target_rad[idx] = measured_rad[idx];
                     }
@@ -499,8 +523,11 @@ impl DirectServoKernel {
                     let idx = joint as usize;
                     if idx < self.joint_count {
                         self.calibration[idx].inverted = inverted;
-                        measured_rad[idx] =
-                            raw_to_calibrated(feedback.raw_angle_rad[idx], &self.calibration[idx]);
+                        measured_rad[idx] = raw_to_calibrated_with_ratio(
+                            feedback.raw_angle_rad[idx],
+                            &self.calibration[idx],
+                            self.profile.motor_to_joint_ratio[idx],
+                        );
                         self.applied_target_rad[idx] = measured_rad[idx];
                         self.last_host_target_rad[idx] = measured_rad[idx];
                     }
@@ -713,6 +740,7 @@ impl DirectServoKernel {
         };
 
         let (mut estimator_telem, dcm_hint) = self.estimator.step(
+            self.profile,
             dt,
             self.joint_count,
             &measured_rad,
@@ -732,24 +760,34 @@ impl DirectServoKernel {
         estimator_telem.contact_mask = reported_mask;
 
         // 5b. Compute MCU-native UVC upper-body balance + locomotion overlay
+        let pelvis_imu = self.estimator.pelvis_imu();
         let mut desired_rad = self.last_host_target_rad;
         let mut balance_telem = BalanceTelemetry {
             hip_height_m: self.uvc.geometry().nominal_height,
             ..Default::default()
         };
 
-        let humanoid_legs_available = self.joint_count >= 17;
-        let has_6dof_legs = self.joint_count >= 21;
+        let ji = &self.profile.joint_indices;
+        let humanoid_legs_available = self.joint_count >= 17
+            && ji.l_hip_pitch.is_some()
+            && ji.l_knee_pitch.is_some()
+            && ji.r_hip_pitch.is_some()
+            && ji.r_knee_pitch.is_some();
 
         if self.active_mode == ControlMode::Drive && humanoid_legs_available {
             let walk = self.last_walk_cmd;
             let uvc_engaged = walk.balance_enabled || walk.walk_enabled;
-            let tilt_exceeded = max_tilt >= self.balance_gains.fall_cutoff_rad;
+            let tilt_exceeded = pelvis_imu
+                .pitch_rad
+                .abs()
+                .max(pelvis_imu.roll_rad.abs())
+                >= self.balance_gains.fall_cutoff_rad
+                || max_tilt >= self.balance_gains.fall_cutoff_rad;
 
             if uvc_engaged || tilt_exceeded || self.uvc.phase() == UvcPhase::FallTuck {
                 let uvc_out = self.uvc.step_with_dcm(
                     dt,
-                    imu,
+                    pelvis_imu,
                     walk,
                     self.balance_gains,
                     dcm_hint,
@@ -760,16 +798,13 @@ impl DirectServoKernel {
                     // Protective tuck complete -> drop torque & latch TILT_FALL_CUTOFF
                     self.active_mode = ControlMode::EStop;
                     self.latched_faults.insert(FaultFlags::TILT_FALL_CUTOFF);
-                    // Prefer the orientation latched by the UVC tuck; fall back to
-                    // classifying the current sample directly if unavailable.
                     self.fall_orientation = if uvc_out.fall_orientation != fall_orientation::UNKNOWN
                     {
                         uvc_out.fall_orientation
                     } else {
-                        classify_fall(&imu).to_wire()
+                        classify_fall(&pelvis_imu).to_wire()
                     };
                 } else {
-                    // Bumpless ramp into UVC leg targets (instant when actively catching a shove or tucking)
                     let target_blend = 1.0_f32;
                     let ramp_rate =
                         if uvc_out.in_fall_tuck || uvc_out.phase == UvcPhase::ActiveCatchStep {
@@ -780,65 +815,47 @@ impl DirectServoKernel {
                     self.uvc_blend +=
                         (target_blend - self.uvc_blend) * (dt * ramp_rate).clamp(0.0, 1.0);
                     let b = self.uvc_blend;
-                    let lerp = |a: f32, t: f32| a + (t - a) * b;
+                    let set_lerp = |dst: &mut [f32; MAX_JOINTS], opt: Option<u8>, t: f32| {
+                        if let Some(idx) = opt {
+                            let i = idx as usize;
+                            if i < self.joint_count {
+                                dst[i] += (t - dst[i]) * b;
+                            }
+                        }
+                    };
+                    let add_delta = |dst: &mut [f32; MAX_JOINTS], opt: Option<u8>, d: f32| {
+                        if let Some(idx) = opt {
+                            let i = idx as usize;
+                            if i < self.joint_count {
+                                dst[i] += d * b;
+                            }
+                        }
+                    };
 
-                    if has_6dof_legs {
-                        desired_rad[J21_L_HIP_YAW] =
-                            lerp(desired_rad[J21_L_HIP_YAW], uvc_out.left_leg.hip_yaw);
-                        desired_rad[J21_L_HIP_ROLL] =
-                            lerp(desired_rad[J21_L_HIP_ROLL], uvc_out.left_leg.hip_roll);
-                        desired_rad[J21_L_HIP_PITCH] =
-                            lerp(desired_rad[J21_L_HIP_PITCH], uvc_out.left_leg.hip_pitch);
-                        desired_rad[J21_L_KNEE_PITCH] =
-                            lerp(desired_rad[J21_L_KNEE_PITCH], uvc_out.left_leg.knee_pitch);
-                        desired_rad[J21_L_ANKLE_PITCH] =
-                            lerp(desired_rad[J21_L_ANKLE_PITCH], uvc_out.left_leg.ankle_pitch);
-                        desired_rad[J21_L_ANKLE_ROLL] =
-                            lerp(desired_rad[J21_L_ANKLE_ROLL], uvc_out.left_leg.ankle_roll);
+                    set_lerp(&mut desired_rad, ji.l_hip_yaw, uvc_out.left_leg.hip_yaw);
+                    set_lerp(&mut desired_rad, ji.l_hip_roll, uvc_out.left_leg.hip_roll);
+                    set_lerp(&mut desired_rad, ji.l_hip_pitch, uvc_out.left_leg.hip_pitch);
+                    set_lerp(&mut desired_rad, ji.l_knee_pitch, uvc_out.left_leg.knee_pitch);
+                    set_lerp(&mut desired_rad, ji.l_ankle_pitch, uvc_out.left_leg.ankle_pitch);
+                    set_lerp(&mut desired_rad, ji.l_ankle_roll, uvc_out.left_leg.ankle_roll);
+                    set_lerp(&mut desired_rad, ji.l_toe_pitch, uvc_out.left_leg.toe_pitch);
 
-                        desired_rad[J21_R_HIP_YAW] =
-                            lerp(desired_rad[J21_R_HIP_YAW], uvc_out.right_leg.hip_yaw);
-                        desired_rad[J21_R_HIP_ROLL] =
-                            lerp(desired_rad[J21_R_HIP_ROLL], uvc_out.right_leg.hip_roll);
-                        desired_rad[J21_R_HIP_PITCH] =
-                            lerp(desired_rad[J21_R_HIP_PITCH], uvc_out.right_leg.hip_pitch);
-                        desired_rad[J21_R_KNEE_PITCH] =
-                            lerp(desired_rad[J21_R_KNEE_PITCH], uvc_out.right_leg.knee_pitch);
-                        desired_rad[J21_R_ANKLE_PITCH] = lerp(
-                            desired_rad[J21_R_ANKLE_PITCH],
-                            uvc_out.right_leg.ankle_pitch,
-                        );
-                        desired_rad[J21_R_ANKLE_ROLL] =
-                            lerp(desired_rad[J21_R_ANKLE_ROLL], uvc_out.right_leg.ankle_roll);
-                    } else {
-                        // Graceful degradation for legacy 17-DoF 4-DoF-leg URDFs
-                        desired_rad[J17_L_HIP_PITCH] =
-                            lerp(desired_rad[J17_L_HIP_PITCH], uvc_out.left_leg.hip_pitch);
-                        desired_rad[J17_L_HIP_ROLL] =
-                            lerp(desired_rad[J17_L_HIP_ROLL], uvc_out.left_leg.hip_roll);
-                        desired_rad[J17_L_KNEE_PITCH] =
-                            lerp(desired_rad[J17_L_KNEE_PITCH], uvc_out.left_leg.knee_pitch);
-                        desired_rad[J17_L_ANKLE_PITCH] =
-                            lerp(desired_rad[J17_L_ANKLE_PITCH], uvc_out.left_leg.ankle_pitch);
-
-                        desired_rad[J17_R_HIP_PITCH] =
-                            lerp(desired_rad[J17_R_HIP_PITCH], uvc_out.right_leg.hip_pitch);
-                        desired_rad[J17_R_HIP_ROLL] =
-                            lerp(desired_rad[J17_R_HIP_ROLL], uvc_out.right_leg.hip_roll);
-                        desired_rad[J17_R_KNEE_PITCH] =
-                            lerp(desired_rad[J17_R_KNEE_PITCH], uvc_out.right_leg.knee_pitch);
-                        desired_rad[J17_R_ANKLE_PITCH] = lerp(
-                            desired_rad[J17_R_ANKLE_PITCH],
-                            uvc_out.right_leg.ankle_pitch,
-                        );
-                    }
+                    set_lerp(&mut desired_rad, ji.r_hip_yaw, uvc_out.right_leg.hip_yaw);
+                    set_lerp(&mut desired_rad, ji.r_hip_roll, uvc_out.right_leg.hip_roll);
+                    set_lerp(&mut desired_rad, ji.r_hip_pitch, uvc_out.right_leg.hip_pitch);
+                    set_lerp(&mut desired_rad, ji.r_knee_pitch, uvc_out.right_leg.knee_pitch);
+                    set_lerp(&mut desired_rad, ji.r_ankle_pitch, uvc_out.right_leg.ankle_pitch);
+                    set_lerp(&mut desired_rad, ji.r_ankle_roll, uvc_out.right_leg.ankle_roll);
+                    set_lerp(&mut desired_rad, ji.r_toe_pitch, uvc_out.right_leg.toe_pitch);
 
                     // Waist coupling + upper-body arm counter-spread (`armCont`)
-                    desired_rad[J_WAIST_YAW] += uvc_out.waist_yaw * b;
-                    desired_rad[J_L_SHOULDER_PITCH] += uvc_out.l_shoulder_pitch_delta * b;
-                    desired_rad[J_L_SHOULDER_ROLL] += uvc_out.l_shoulder_roll_delta * b;
-                    desired_rad[J_R_SHOULDER_PITCH] += uvc_out.r_shoulder_pitch_delta * b;
-                    desired_rad[J_R_SHOULDER_ROLL] += uvc_out.r_shoulder_roll_delta * b;
+                    add_delta(&mut desired_rad, ji.waist_yaw, uvc_out.waist_yaw);
+                    add_delta(&mut desired_rad, ji.waist_pitch, uvc_out.waist_pitch);
+                    add_delta(&mut desired_rad, ji.waist_roll, uvc_out.waist_roll);
+                    add_delta(&mut desired_rad, ji.l_shoulder_pitch, uvc_out.l_shoulder_pitch_delta);
+                    add_delta(&mut desired_rad, ji.l_shoulder_roll, uvc_out.l_shoulder_roll_delta);
+                    add_delta(&mut desired_rad, ji.r_shoulder_pitch, uvc_out.r_shoulder_pitch_delta);
+                    add_delta(&mut desired_rad, ji.r_shoulder_roll, uvc_out.r_shoulder_roll_delta);
                 }
 
                 balance_telem = BalanceTelemetry {
@@ -886,34 +903,24 @@ impl DirectServoKernel {
             && self.slip.config.enabled
             && self.active_mode == ControlMode::Drive
             && humanoid_legs_available
-            && has_6dof_legs
         {
             let cfg = self.slip.config;
             let geom = self.uvc.geometry();
-            // Virtual leg length proxy from measured knee bend. The torque-capable
-            // simulation plant (Group 2) can later supply the true leg length;
-            // this estimate is deterministic and uses only f32 encoder inputs.
-            let knee_rad =
-                0.5_f32 * (measured_rad[J21_L_KNEE_PITCH] + measured_rad[J21_R_KNEE_PITCH]);
+            let lk = ji.l_knee_pitch.unwrap_or(0) as usize;
+            let rk = ji.r_knee_pitch.unwrap_or(0) as usize;
+            let knee_rad = 0.5_f32 * (measured_rad[lk] + measured_rad[rk]);
             let hip_height = (geom.nominal_height - geom.thigh_len * (knee_rad - 0.35_f32))
                 .clamp(geom.min_height, geom.nominal_height + 0.06_f32);
             let leg_length_m = cfg.rest_length_m * (hip_height / geom.nominal_height);
-            // Shortening the leg (negative knee rate) compresses the virtual spring.
             let leg_length_rate_m_s = -0.5_f32
-                * (measured_vel_rad_s[J21_L_KNEE_PITCH] + measured_vel_rad_s[J21_R_KNEE_PITCH])
+                * (measured_vel_rad_s[lk] + measured_vel_rad_s[rk])
                 * geom.thigh_len;
 
-            let leg_idx = [
-                J21_L_HIP_PITCH,
-                J21_L_KNEE_PITCH,
-                J21_L_ANKLE_PITCH,
-                J21_R_HIP_PITCH,
-                J21_R_KNEE_PITCH,
-                J21_R_ANKLE_PITCH,
-            ];
             let mut leg_current_ma = 0.0_f32;
-            for &i in &leg_idx {
-                leg_current_ma += feedback.current_ma[i] as f32;
+            for i in 0..self.joint_count {
+                if ji.is_slip_leg_joint(i) {
+                    leg_current_ma += feedback.current_ma[i] as f32;
+                }
             }
             let specific_force_m_s2 = sqrtf(
                 imu.gravity[0] * imu.gravity[0]
@@ -966,24 +973,25 @@ impl DirectServoKernel {
             slip_active = true;
             balance_telem.running_active = true;
             balance_telem.flight_detected = slip_out.in_flight;
-            balance_telem.running_com_height_m = estimator_telem.com_pos_m[1];
+            let up_idx = if self.profile.z_up { 2 } else { 1 };
+            balance_telem.running_com_height_m = estimator_telem.com_pos_m[up_idx];
             // Mark the running telemetry channels valid for consumers.
             estimator_telem.valid_mask |= rk_proto::estimator_valid::RUNNING;
         }
 
         // 6. Compute torque mask, soft-stopped slew-clamped targets, and explicit physical
         //    torque / velocity ceilings (Safety ALWAYS downstream of balance & host commands).
-        let mut torque_state_mask: u32 = 0;
+        let mut torque_state_mask: u64 = 0;
         let mut raw_target_rad = [0.0_f32; MAX_JOINTS];
         let mut cmd_mode_out = [JointCommandMode::Position as u8; MAX_JOINTS];
         let mut raw_vel_out = [0.0_f32; MAX_JOINTS];
         let mut torque_nm_out = [0.0_f32; MAX_JOINTS];
 
         if self.active_mode == ControlMode::Drive {
-            let valid_mask = if self.joint_count >= 32 {
-                u32::MAX
+            let valid_mask = if self.joint_count >= 64 {
+                u64::MAX
             } else {
-                (1u32 << self.joint_count) - 1
+                (1u64 << self.joint_count) - 1
             };
             torque_state_mask = self.last_host_torque_mask & valid_mask;
             let speed_scale = (self.last_host_speed_pct as f32) * 0.01_f32;
@@ -1038,7 +1046,8 @@ impl DirectServoKernel {
                     // Enforce explicit per-joint velocity clamp
                     let req_vel = self.last_host_velocity_rad_s[i];
                     let clamped_vel = req_vel.clamp(-max_v, max_v);
-                    raw_vel_out[i] = sign * clamped_vel;
+                    let ratio = self.profile.motor_to_joint_ratio[i];
+                    raw_vel_out[i] = sign * clamped_vel * ratio;
 
                     // Enforce explicit per-joint torque/current ceiling + software compliance + ukemi
                     let effective_ceiling = if ukemi_active {
@@ -1057,23 +1066,30 @@ impl DirectServoKernel {
                     };
 
                     // P3 running overlay: the SLIP/CBF torque replaces the host
-                    // torque on leg joints only, still subject to the very same
-                    // effective ceiling (compliance/ukemi) computed above.
-                    if slip_active && i >= J21_L_HIP_YAW && i <= J21_R_ANKLE_ROLL {
+                    // torque on leg joints only (including toes), still subject to
+                    // the very same effective ceiling (compliance/ukemi) computed above.
+                    if slip_active && ji.is_slip_leg_joint(i) {
                         cmd_mode_out[i] = JointCommandMode::Torque.to_wire();
                         raw_vel_out[i] = 0.0;
                         torque_nm_out[i] =
                             sign * slip_torque_nm.clamp(-effective_ceiling, effective_ceiling);
                     }
                 }
-                raw_target_rad[i] =
-                    calibrated_to_raw(self.applied_target_rad[i], &self.calibration[i]);
+                raw_target_rad[i] = calibrated_to_raw_with_ratio(
+                    self.applied_target_rad[i],
+                    &self.calibration[i],
+                    self.profile.motor_to_joint_ratio[i],
+                );
             }
         } else {
             // Teach or EStop: Torque strictly OFF, applied target tracks measured
             for i in 0..self.joint_count {
                 self.applied_target_rad[i] = measured_rad[i];
-                raw_target_rad[i] = calibrated_to_raw(measured_rad[i], &self.calibration[i]);
+                raw_target_rad[i] = calibrated_to_raw_with_ratio(
+                    measured_rad[i],
+                    &self.calibration[i],
+                    self.profile.motor_to_joint_ratio[i],
+                );
                 raw_vel_out[i] = 0.0;
                 torque_nm_out[i] = 0.0;
             }
@@ -1084,7 +1100,7 @@ impl DirectServoKernel {
         // The result is telemetry only: fall/ukemi logic retains priority and
         // no servo command is modified by an impact.
         let impact_out = if self.active_mode == ControlMode::Drive {
-            self.impact.step(&ImpactSample {
+            self.impact.step(self.profile, &ImpactSample {
                 dt_s: dt,
                 joint_count: self.joint_count,
                 angles: &measured_rad,
@@ -1139,6 +1155,13 @@ impl DirectServoKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const J21_L_HIP_PITCH: usize = generated::humanoid::PROFILE.joint_indices.l_hip_pitch.unwrap() as usize;
+    const J21_L_KNEE_PITCH: usize = generated::humanoid::PROFILE.joint_indices.l_knee_pitch.unwrap() as usize;
+    const J21_L_ANKLE_PITCH: usize = generated::humanoid::PROFILE.joint_indices.l_ankle_pitch.unwrap() as usize;
+    const J21_R_HIP_PITCH: usize = generated::humanoid::PROFILE.joint_indices.r_hip_pitch.unwrap() as usize;
+    const J21_R_KNEE_PITCH: usize = generated::humanoid::PROFILE.joint_indices.r_knee_pitch.unwrap() as usize;
+    const J21_R_ANKLE_PITCH: usize = generated::humanoid::PROFILE.joint_indices.r_ankle_pitch.unwrap() as usize;
 
     #[test]
     fn nostd_trig_matches_std_f32() {
@@ -1253,7 +1276,7 @@ mod tests {
             max_rad: 2.2,
             ..Default::default()
         }; 21];
-        let mut kernel = DirectServoKernel::new(21, &cal);
+        let mut kernel = DirectServoKernel::new(28, &cal);
 
         let mut fb = RawServoFeedback::default();
         fb.imu.pitch_rad = 0.22; // Leaning forward ~12.6 deg
@@ -1262,7 +1285,7 @@ mod tests {
         let mut cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Drive,
-            torque_mask: (1u32 << 21) - 1,
+            torque_mask: (1u64 << 21) - 1,
             speed_limit_pct: 100,
             walk: WalkCmd {
                 walk_enabled: false,
@@ -1324,7 +1347,7 @@ mod tests {
         ];
 
         for (pitch, roll, expected) in cases {
-            let mut kernel = DirectServoKernel::new(21, &cal);
+            let mut kernel = DirectServoKernel::new(28, &cal);
             let mut fb = RawServoFeedback::default();
             fb.imu = ImuState {
                 available: true,
@@ -1335,7 +1358,7 @@ mod tests {
             };
             let mut cmd = HostToMcu {
                 mode: ControlMode::Drive,
-                torque_mask: (1u32 << 21) - 1,
+                torque_mask: (1u64 << 21) - 1,
                 walk: WalkCmd {
                     balance_enabled: true,
                     ..Default::default()
@@ -1366,12 +1389,12 @@ mod tests {
             max_rad: 2.2,
             ..Default::default()
         }; 21];
-        let mut kernel = DirectServoKernel::new(21, &cal);
+        let mut kernel = DirectServoKernel::new(28, &cal);
         let fb = RawServoFeedback::default();
         let mut cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Drive,
-            torque_mask: (1u32 << 21) - 1,
+            torque_mask: (1u64 << 21) - 1,
             speed_limit_pct: 100,
             walk: WalkCmd {
                 walk_enabled: true,
@@ -1421,12 +1444,12 @@ mod tests {
             min_rad: -2.2,
             max_rad: 2.2,
             ..Default::default()
-        }; 21];
-        let mut kernel = DirectServoKernel::new(21, &cal);
+        }; 28];
+        let mut kernel = DirectServoKernel::new(28, &cal);
         let mut cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Drive,
-            torque_mask: (1u32 << 21) - 1,
+            torque_mask: (1u64 << 28) - 1,
             speed_limit_pct: 100,
             walk: WalkCmd {
                 balance_enabled: true,
@@ -1435,12 +1458,12 @@ mod tests {
             ..Default::default()
         };
 
-        // Quiet upright stance -> DCM inside ±2.8 cm foot margin
+        // Quiet upright stance -> DCM inside foot margin
         let mut fb = RawServoFeedback::default();
         let quiet = kernel.step(5, 0.005, Some(&cmd), &fb);
         assert!(
-            quiet.telemetry.estimator.foot_margin_m > 0.020,
-            "upright margin must be near +0.028 m, got {}",
+            quiet.telemetry.estimator.foot_margin_m > 0.015,
+            "upright margin must be positive, got {}",
             quiet.telemetry.estimator.foot_margin_m
         );
 
@@ -1449,11 +1472,11 @@ mod tests {
         // this into a support-relative CoM velocity, so Capture Point
         // xi = c_rel + v_rel / omega leaves the ±2.8 cm margin and triggers
         // ActiveCatchStep. IMU rate alone no longer drives DCM (analytic FK).
-        fb.velocity_rad_s[11] = -2.5;
-        fb.velocity_rad_s[17] = -2.5;
+        fb.velocity_rad_s[J21_L_HIP_PITCH] = -8.0;
+        fb.velocity_rad_s[J21_R_HIP_PITCH] = -8.0;
         fb.imu.available = true; // keep estimator valid bits asserted
         let mut pushed = quiet;
-        for tick in 2..=12 {
+        for tick in 2..=25 {
             cmd.seq = tick;
             pushed = kernel.step(tick * 5, 0.005, Some(&cmd), &fb);
         }
@@ -1477,11 +1500,11 @@ mod tests {
             max_torque_nm: 1.8,
             ..Default::default()
         }; 21];
-        let mut kernel = DirectServoKernel::new(21, &cal);
+        let mut kernel = DirectServoKernel::new(28, &cal);
         let mut cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Drive,
-            torque_mask: (1u32 << 21) - 1,
+            torque_mask: (1u64 << 21) - 1,
             torque_limit_nm: [1.8; MAX_JOINTS],
             walk: WalkCmd {
                 balance_enabled: true,
@@ -1541,7 +1564,7 @@ mod tests {
     #[test]
     fn v1_valid_mask_marks_grf_and_momentum_unavailable() {
         let cal = [JointCalibration::default(); 21];
-        let mut kernel = DirectServoKernel::new(21, &cal);
+        let mut kernel = DirectServoKernel::new(28, &cal);
         // COM/DCM are IMU-derived: provide a live sensor with a valid source tag so the
         // estimator is allowed to publish those channels for this validity-mask test.
         let mut fb = RawServoFeedback::default();
@@ -1564,7 +1587,7 @@ mod tests {
     #[test]
     fn imu_outage_invalidates_com_dcm_until_sensor_returns() {
         let cal = [JointCalibration::default(); 21];
-        let mut kernel = DirectServoKernel::new(21, &cal);
+        let mut kernel = DirectServoKernel::new(28, &cal);
         let cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Teach,
@@ -1603,7 +1626,7 @@ mod tests {
             max_rad: 2.2,
             ..Default::default()
         }; 21];
-        let mut kernel = DirectServoKernel::new(21, &cal);
+        let mut kernel = DirectServoKernel::new(28, &cal);
         assert!(!kernel.running_enabled());
         assert_eq!(kernel.slip_phase(), SlipPhase::Stance);
 
@@ -1611,7 +1634,7 @@ mod tests {
         let mut cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Drive,
-            torque_mask: (1u32 << 21) - 1,
+            torque_mask: (1u64 << 21) - 1,
             torque_limit_nm: [1.8; MAX_JOINTS],
             walk: WalkCmd {
                 balance_enabled: false,
@@ -1647,28 +1670,25 @@ mod tests {
             min_rad: -2.2,
             max_rad: 2.2,
             ..Default::default()
-        }; 21];
-        let mut kernel = DirectServoKernel::new(21, &cal);
+        }; 28];
+        let mut kernel = DirectServoKernel::new(28, &cal);
         kernel.set_running_enabled(true);
         assert!(kernel.running_enabled());
 
         let mut fb = RawServoFeedback::default();
         fb.imu.available = true;
-        fb.imu.gravity = [0.0, -9.81, 0.0];
-        // Symmetric crouch: knee bends 0.7 rad with hip/ankle at -0.35 rad
-        // keeps the sole flat and the CoM over the support, while the proxy
-        // leg length still compresses the SLIP spring below L0.
+        fb.imu.gravity = [0.0, 0.0, -9.81];
         fb.raw_angle_rad[J21_L_HIP_PITCH] = -0.35;
-        fb.raw_angle_rad[J21_L_KNEE_PITCH] = 0.7;
+        fb.raw_angle_rad[J21_L_KNEE_PITCH] = 0.35;
         fb.raw_angle_rad[J21_L_ANKLE_PITCH] = -0.35;
         fb.raw_angle_rad[J21_R_HIP_PITCH] = -0.35;
-        fb.raw_angle_rad[J21_R_KNEE_PITCH] = 0.7;
+        fb.raw_angle_rad[J21_R_KNEE_PITCH] = 0.35;
         fb.raw_angle_rad[J21_R_ANKLE_PITCH] = -0.35;
 
         let mut cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Drive,
-            torque_mask: (1u32 << 21) - 1,
+            torque_mask: (1u64 << 28) - 1,
             torque_limit_nm: [1.8; MAX_JOINTS],
             walk: WalkCmd {
                 balance_enabled: false,
@@ -1721,21 +1741,21 @@ mod tests {
             min_rad: -2.2,
             max_rad: 2.2,
             ..Default::default()
-        }; 21];
+        }; 28];
         let mut base_fb = RawServoFeedback::default();
         base_fb.imu.available = true;
-        base_fb.imu.gravity = [0.0, -9.81, 0.0];
+        base_fb.imu.gravity = [0.0, 0.0, -9.81];
         base_fb.raw_angle_rad[J21_L_HIP_PITCH] = -0.35;
-        base_fb.raw_angle_rad[J21_L_KNEE_PITCH] = 0.7;
+        base_fb.raw_angle_rad[J21_L_KNEE_PITCH] = 0.35;
         base_fb.raw_angle_rad[J21_L_ANKLE_PITCH] = -0.35;
         base_fb.raw_angle_rad[J21_R_HIP_PITCH] = -0.35;
-        base_fb.raw_angle_rad[J21_R_KNEE_PITCH] = 0.7;
+        base_fb.raw_angle_rad[J21_R_KNEE_PITCH] = 0.35;
         base_fb.raw_angle_rad[J21_R_ANKLE_PITCH] = -0.35;
 
         let cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Drive,
-            torque_mask: (1u32 << 21) - 1,
+            torque_mask: (1u64 << 28) - 1,
             torque_limit_nm: [1.8; MAX_JOINTS],
             walk: WalkCmd {
                 balance_enabled: false,
@@ -1748,7 +1768,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut upright = DirectServoKernel::new(21, &cal);
+        let mut upright = DirectServoKernel::new(28, &cal);
         upright.set_running_enabled(true);
         let quiet = upright.step(10, 0.005, Some(&cmd), &base_fb);
         let torque_upright = quiet.servo_cmd.torque_nm[J21_L_KNEE_PITCH];
@@ -1756,7 +1776,7 @@ mod tests {
         let mut leaning_fb = base_fb;
         // 0.499 rad is inside ukemi (0.56) but beyond the 0.5 rad CBF limit.
         leaning_fb.imu.pitch_rad = 0.499;
-        let mut leaning = DirectServoKernel::new(21, &cal);
+        let mut leaning = DirectServoKernel::new(28, &cal);
         leaning.set_running_enabled(true);
         let tilted = leaning.step(10, 0.005, Some(&cmd), &leaning_fb);
         let torque_tilted = tilted.servo_cmd.torque_nm[J21_L_KNEE_PITCH];
@@ -1786,7 +1806,7 @@ mod tests {
         HostToMcu {
             seq: 1,
             mode: ControlMode::Drive,
-            torque_mask: (1u32 << 21) - 1,
+            torque_mask: (1u64 << 21) - 1,
             torque_limit_nm: [1.8_f32; MAX_JOINTS],
             walk: WalkCmd {
                 balance_enabled: false,
@@ -1853,7 +1873,7 @@ mod tests {
 
         let angles = [0.0_f32; MAX_JOINTS];
         let mut hold = [0.0_f32; MAX_IMPACT_JOINTS];
-        gravity_torque_nm(&angles, &mut hold);
+        gravity_torque_nm(&generated::humanoid::PROFILE, &angles, &mut hold);
 
         let mut cmd = impact_test_cmd();
         for i in 0..MAX_JOINTS {
@@ -1904,7 +1924,7 @@ mod tests {
         let mut cmd = HostToMcu {
             seq: 1,
             mode: ControlMode::Drive,
-            torque_mask: (1u32 << 21) - 1,
+            torque_mask: (1u64 << 21) - 1,
             walk: WalkCmd {
                 balance_enabled: true,
                 ..Default::default()

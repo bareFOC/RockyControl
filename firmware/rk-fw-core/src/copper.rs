@@ -80,6 +80,16 @@ impl ControlTask {
         }
     }
 
+    pub fn new_with_profile(
+        profile: &'static rk_robot_profile::RobotProfile,
+        initial_cal: &[JointCalibration],
+    ) -> Self {
+        Self {
+            kernel: DirectServoKernel::new_with_profile(profile, initial_cal),
+            tick_index: 0,
+        }
+    }
+
     /// Borrows the underlying kernel (e.g. for configuration after construction).
     pub fn kernel(&self) -> &DirectServoKernel {
         &self.kernel

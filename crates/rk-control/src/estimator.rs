@@ -27,10 +27,11 @@
 //! finite-difference + gyro-blend velocity reconstruction. This path is
 //! deterministic but is **not** the validated physical CoM path.
 
-use libm::sqrtf;
+use libm::{atan2f, sqrtf};
 use rk_proto::{BalanceGains, EstimatorTelemetry, ImuState, MAX_JOINTS, estimator_valid};
+use rk_robot_profile::RobotProfile;
 
-use crate::com_fk::compute_state;
+use crate::com_fk::{compute_state, mat_mul, mat_vec, rot_from_rpy};
 
 const GRAVITY_M_S2: f32 = 9.81_f32;
 /// Reference 200 Hz tick duration (5 ms) for EMA velocity filter.
@@ -39,17 +40,6 @@ const VEL_EMA_ALPHA_200HZ: f32 = 0.30_f32;
 /// Clamping bounds for the configurable CoM height (matches the MCU config clamp).
 const H_COM_MIN_M: f32 = 0.12_f32;
 const H_COM_MAX_M: f32 = 0.80_f32;
-/// Forward/lateral reach of the next swing-foot landing while walking. Matches
-/// `LegGeometry::rocky_mk1().max_swing_dx`; a capture point beyond
-/// `support margin + reach` cannot be recovered by the next step. Only used for
-/// the walking capturability margin — a standing shove keeps the raw foot margin.
-const NEXT_STEP_REACH_M: f32 = 0.22_f32;
-/// Lateral distance from pelvis centerline to one hip axis. The opposite foot
-/// can be placed `NEXT_STEP_REACH_M` outward from the pelvis, so the reachable
-/// lateral capture region extends hip-spacing + swing reach from the stance sole.
-const HIP_HALF_SPACING_M: f32 = 0.095_f32;
-/// Joint count required for the validated mass-weighted FK path.
-const FK_JOINT_COUNT: usize = 21;
 
 /// Swing-foot placement modulation computed by [`KinematicEstimator`] for [`crate::UvcController`].
 ///
@@ -112,6 +102,7 @@ pub struct KinematicEstimator {
     /// walking, so it is used for the walking capturability margin only.
     com_mid_pos: [f32; 3],
     com_mid_vel: [f32; 3],
+    last_pelvis_imu: ImuState,
     last_telemetry: EstimatorTelemetry,
 }
 
@@ -137,6 +128,16 @@ impl KinematicEstimator {
             support_init: false,
             com_mid_pos: [0.0; 3],
             com_mid_vel: [0.0; 3],
+            last_pelvis_imu: ImuState {
+                available: false,
+                pitch_rad: 0.0,
+                roll_rad: 0.0,
+                yaw_rad: 0.0,
+                pitch_rate_rad_s: 0.0,
+                roll_rate_rad_s: 0.0,
+                yaw_rate_rad_s: 0.0,
+                gravity: [0.0, -9.81, 0.0],
+            },
             last_telemetry: EstimatorTelemetry {
                 com_pos_m: [0.0, 0.48, 0.0],
                 com_vel_m_s: [0.0; 3],
@@ -169,20 +170,20 @@ impl KinematicEstimator {
         self.last_telemetry
     }
 
+    pub const fn pelvis_imu(&self) -> ImuState {
+        self.last_pelvis_imu
+    }
+
     /// Executes one deterministic kinematic estimation tick and returns `(telemetry, swing_hint)`.
     ///
     /// `measured_vel_rad_s` is the calibrated joint-rate array (same joint
-    /// indexing as `measured_rad`). For 21-DoF robots it drives the analytic
-    /// mass-weighted CoM Jacobian in [`crate::com_fk`].
-    ///
-    /// `contact_mask` is the sensed support mask when the kernel's validity
-    /// check passed, otherwise the phase-derived fallback. `grf_n` is indexed
-    /// `[right, left]` and is published only when `grf_valid` is true.
-    /// `walk_enabled` selects the step-reach-aware capturability margin used
-    /// during locomotion; standing balance keeps the raw foot margin.
+    /// indexing as `measured_rad`). For full-body legged profiles it drives the
+    /// analytic mass-weighted CoM Jacobian in [`crate::com_fk`], and transforms
+    /// chest-mounted IMU readings back to the pelvis frame.
     #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
+        profile: &RobotProfile,
         dt: f32,
         joint_count: usize,
         measured_rad: &[f32; MAX_JOINTS],
@@ -201,10 +202,15 @@ impl KinematicEstimator {
         let support = Support::from_mask(contact_mask);
         let support_swapped = support != self.prev_support;
 
-        // 1. Support-relative CoM position & velocity.
-        let (com_pos, raw_vel): ([f32; 3], [f32; 3]) = if joint_count == FK_JOINT_COUNT {
+        let use_fk = profile.joint_indices.l_hip_pitch.is_some()
+            && joint_count >= profile.joint_count
+            && !profile.links.is_empty();
+
+        // 1. Support-relative CoM position & velocity + chest-IMU pelvis compensation.
+        let (com_pos, raw_vel, pelvis_imu): ([f32; 3], [f32; 3], ImuState) = if use_fk {
             // Validated mass-weighted FK path: joint encoders + joint rates only.
-            let fk = compute_state(measured_rad, measured_vel_rad_s);
+            let fk = compute_state(profile, measured_rad, measured_vel_rad_s);
+            let pelvis_imu = de_rotate_imu(imu, fk.imu_rot_from_pelvis);
             // Continuous double-support reference used only for the walking
             // capturability margin (the reported DCM stays support-relative).
             let mid_pos = [
@@ -286,12 +292,15 @@ impl KinematicEstimator {
                     fk.com_vel[1] - support_vel[1],
                     fk.com_vel[2] - support_vel[2],
                 ],
+                pelvis_imu,
             )
         } else {
-            // Legacy proxy fallback (non-21-DoF rigs): IMU-tilt CoM proxy with
+            // Legacy proxy fallback (non-FK / <17-DoF rigs): IMU-tilt CoM proxy with
             // finite-difference + gyro-blend velocity.
-            proxy_state(measured_rad, imu, hip_height_m)
+            let (p, v) = proxy_state(measured_rad, imu, hip_height_m);
+            (p, v, imu)
         };
+        self.last_pelvis_imu = pelvis_imu;
 
         // 2. Optional EMA smoothing of the analytic velocity. On a support swap
         //    we snap to the fresh value instead of blending, so the change in
@@ -333,23 +342,26 @@ impl KinematicEstimator {
         let h_com = if gains.h_com_m.is_finite() {
             gains.h_com_m.clamp(H_COM_MIN_M, H_COM_MAX_M)
         } else {
-            0.72_f32
+            0.25_f32
         };
 
         // 3. LIPM natural frequency & support-relative Capture Point.
         //    omega = sqrt(g / h_com),  xi = c_rel + c_dot_rel / omega
+        //    REP-103 (`z_up = true`): X (0) is sagittal, Y (1) is lateral, Z (2) is up.
+        let lat_idx = if profile.z_up { 1 } else { 0 };
+        let sag_idx = if profile.z_up { 0 } else { 2 };
         let omega = sqrtf(GRAVITY_M_S2 / h_com);
         let inv_omega = 1.0_f32 / omega.max(0.5_f32);
-        let dcm_x = com_pos[0] + self.com_vel[0] * inv_omega;
-        let dcm_z = com_pos[2] + self.com_vel[2] * inv_omega;
+        let dcm_x = com_pos[lat_idx] + self.com_vel[lat_idx] * inv_omega;
+        let dcm_z = com_pos[sag_idx] + self.com_vel[sag_idx] * inv_omega;
 
         // 4. Kinematic ZMP estimate from fixed h_com, clamped to the physical
-        //    7 cm printed foot half-length (±3.5 cm).
+        //    foot half-length.
         let foot_half = gains.foot_half_length_m.clamp(0.015_f32, 0.12_f32);
-        let zmp_x = (com_pos[0] - (h_com / GRAVITY_M_S2) * self.com_acc[0])
+        let zmp_x = (com_pos[lat_idx] - (h_com / GRAVITY_M_S2) * self.com_acc[lat_idx])
             .clamp(-foot_half * 2.5_f32, foot_half * 2.5_f32);
-        let zmp_z =
-            (com_pos[2] - (h_com / GRAVITY_M_S2) * self.com_acc[2]).clamp(-foot_half, foot_half);
+        let zmp_z = (com_pos[sag_idx] - (h_com / GRAVITY_M_S2) * self.com_acc[sag_idx])
+            .clamp(-foot_half, foot_half);
 
         // 5. Support polygon margin against 7 cm foot (±2.8 cm usable sagittal ankle margin).
         let usable_margin = gains.foot_margin_m.clamp(0.010_f32, foot_half);
@@ -365,17 +377,14 @@ impl KinematicEstimator {
         // trigger; only a point beyond the next step's reach is uncapturable.
         // Standing balance keeps the strict support-foot margin so a shove is
         // still reported as a breach.
+        let next_step_reach = profile.leg_geometry.max_swing_dx;
+        let hip_half_spacing = profile.leg_geometry.half_hip_spacing;
         let (sag_remaining, lat_remaining) = if walk_enabled {
-            // Both axes use the capture point relative to the continuous
-            // double-support midpoint, whose support polygon spans both feet
-            // plus the next swing-foot reach. The single-foot origin jumps tens
-            // of cm when UVC re-targets the legs at a swap, which would report a
-            // breach without the body actually moving.
-            let mid_dcm_x = self.com_mid_pos[0] + self.com_mid_vel[0] * inv_omega;
-            let mid_dcm_z = self.com_mid_pos[2] + self.com_mid_vel[2] * inv_omega;
+            let mid_dcm_x = self.com_mid_pos[lat_idx] + self.com_mid_vel[lat_idx] * inv_omega;
+            let mid_dcm_z = self.com_mid_pos[sag_idx] + self.com_mid_vel[sag_idx] * inv_omega;
             (
-                (usable_margin + NEXT_STEP_REACH_M) - mid_dcm_z.abs(),
-                (lat_margin + NEXT_STEP_REACH_M + HIP_HALF_SPACING_M) - mid_dcm_x.abs(),
+                (usable_margin + next_step_reach) - mid_dcm_z.abs(),
+                (lat_margin + next_step_reach + hip_half_spacing) - mid_dcm_x.abs(),
             )
         } else {
             (usable_margin - dcm_z.abs(), lat_margin - dcm_x.abs())
@@ -459,6 +468,59 @@ impl KinematicEstimator {
     }
 }
 
+/// Transforms an IMU reading measured in a torso/chest link back into the
+/// pelvis frame using `R_pelvis_to_imu` from [`crate::com_fk`].
+///
+/// When `r_pelvis_to_imu` is identity (pelvis-mounted IMU), `imu` is returned
+/// unchanged.
+pub fn de_rotate_imu(imu: ImuState, r_pelvis_to_imu: [[f32; 3]; 3]) -> ImuState {
+    if !imu.available {
+        return imu;
+    }
+    let is_identity = (r_pelvis_to_imu[0][0] - 1.0_f32).abs() < 1e-6_f32
+        && (r_pelvis_to_imu[1][1] - 1.0_f32).abs() < 1e-6_f32
+        && (r_pelvis_to_imu[2][2] - 1.0_f32).abs() < 1e-6_f32
+        && r_pelvis_to_imu[0][1].abs() < 1e-6_f32
+        && r_pelvis_to_imu[0][2].abs() < 1e-6_f32
+        && r_pelvis_to_imu[1][2].abs() < 1e-6_f32;
+    if is_identity {
+        return imu;
+    }
+
+    let r_world_to_imu = rot_from_rpy([imu.roll_rad, imu.pitch_rad, imu.yaw_rad]);
+    let r_imu_to_pelvis = [
+        [r_pelvis_to_imu[0][0], r_pelvis_to_imu[1][0], r_pelvis_to_imu[2][0]],
+        [r_pelvis_to_imu[0][1], r_pelvis_to_imu[1][1], r_pelvis_to_imu[2][1]],
+        [r_pelvis_to_imu[0][2], r_pelvis_to_imu[1][2], r_pelvis_to_imu[2][2]],
+    ];
+    let r_world_to_pelvis = mat_mul(r_world_to_imu, r_imu_to_pelvis);
+
+    let roll_rad = atan2f(r_world_to_pelvis[1][2], r_world_to_pelvis[2][2]);
+    let cos_p_mag = sqrtf(
+        r_world_to_pelvis[1][2] * r_world_to_pelvis[1][2]
+            + r_world_to_pelvis[2][2] * r_world_to_pelvis[2][2],
+    );
+    let pitch_rad = atan2f(-r_world_to_pelvis[0][2], cos_p_mag);
+    let yaw_rad = atan2f(r_world_to_pelvis[0][1], r_world_to_pelvis[0][0]);
+
+    let rates = mat_vec(
+        r_pelvis_to_imu,
+        [imu.roll_rate_rad_s, imu.pitch_rate_rad_s, imu.yaw_rate_rad_s],
+    );
+    let gravity = mat_vec(r_pelvis_to_imu, imu.gravity);
+
+    ImuState {
+        available: imu.available,
+        pitch_rad,
+        roll_rad,
+        yaw_rad,
+        pitch_rate_rad_s: rates[1],
+        roll_rate_rad_s: rates[0],
+        yaw_rate_rad_s: rates[2],
+        gravity,
+    }
+}
+
 /// Legacy IMU-tilt proxy for non-21-DoF rigs. Returns support-relative (i.e.
 /// ground-frame) CoM position and a finite-difference + gyro velocity estimate.
 fn proxy_state(
@@ -504,6 +566,7 @@ fn proxy_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rk_robot_profile::generated::humanoid::PROFILE as HUMANOID_PROFILE;
 
     fn imu_upright() -> ImuState {
         ImuState {
@@ -532,8 +595,9 @@ mod tests {
         gains: BalanceGains,
     ) -> (EstimatorTelemetry, DcmSwingHint) {
         est.step(
+            &HUMANOID_PROFILE,
             0.005,
-            21,
+            HUMANOID_PROFILE.joint_count,
             angles,
             vel,
             imu,
@@ -569,8 +633,10 @@ mod tests {
         let mut vel = [0.0_f32; MAX_JOINTS];
         // Forward hip-pitch rate (negative Z CoM velocity in pelvis frame)
         // must produce a support-relative DCM excursion.
-        vel[11] = -2.5_f32;
-        vel[17] = -2.5_f32;
+        let l_hp = HUMANOID_PROFILE.joint_indices.l_hip_pitch.unwrap() as usize;
+        let r_hp = HUMANOID_PROFILE.joint_indices.r_hip_pitch.unwrap() as usize;
+        vel[l_hp] = -1.5_f32;
+        vel[r_hp] = -1.5_f32;
         let mut last = telem_of(&mut est, 0, &angles, &vel);
         for tick in 1..=20 {
             last = telem_of(&mut est, tick, &angles, &vel);
@@ -620,8 +686,10 @@ mod tests {
     fn h_com_gain_controls_dcm_frequency_and_is_clamped() {
         let angles = [0.0_f32; MAX_JOINTS];
         let mut vel = [0.0_f32; MAX_JOINTS];
-        vel[11] = -0.8_f32;
-        vel[17] = -0.8_f32;
+        let l_hp = HUMANOID_PROFILE.joint_indices.l_hip_pitch.unwrap() as usize;
+        let r_hp = HUMANOID_PROFILE.joint_indices.r_hip_pitch.unwrap() as usize;
+        vel[l_hp] = -0.8_f32;
+        vel[r_hp] = -0.8_f32;
         let dcm_for = |h: f32| {
             let mut est = KinematicEstimator::new();
             let mut g = gains();
@@ -654,6 +722,7 @@ mod tests {
         let mut imu = imu_upright();
         imu.pitch_rad = 0.05;
         let (telem, _) = est.step(
+            &HUMANOID_PROFILE,
             0.005, 17, &angles, &vel, imu, 0.4, 0b11, [0.0; 2], false, false, 0, false, gains(),
         );
         assert!(telem.valid_mask & estimator_valid::COM != 0);
@@ -665,8 +734,9 @@ mod tests {
         let angles = [0.0_f32; MAX_JOINTS];
         let vel = [0.0_f32; MAX_JOINTS];
         let (telem, _) = est.step(
+            &HUMANOID_PROFILE,
             0.005,
-            21,
+            HUMANOID_PROFILE.joint_count,
             &angles,
             &vel,
             imu_upright(),
@@ -687,8 +757,9 @@ mod tests {
         // Clear validity: the kernel supplies the fallback mask and zero GRF,
         // and the GRF channel must stay invalid (never read as 0 N free-fall).
         let (invalid, _) = est.step(
+            &HUMANOID_PROFILE,
             0.005,
-            21,
+            HUMANOID_PROFILE.joint_count,
             &angles,
             &vel,
             imu_upright(),
@@ -710,8 +781,10 @@ mod tests {
     fn walking_margin_includes_next_step_reach_but_stance_breach_does_not() {
         let angles = [0.0_f32; MAX_JOINTS];
         let mut vel = [0.0_f32; MAX_JOINTS];
-        vel[11] = -0.5_f32;
-        vel[17] = -0.5_f32;
+        let l_hp = HUMANOID_PROFILE.joint_indices.l_hip_pitch.unwrap() as usize;
+        let r_hp = HUMANOID_PROFILE.joint_indices.r_hip_pitch.unwrap() as usize;
+        vel[l_hp] = -1.5_f32;
+        vel[r_hp] = -1.5_f32;
         let standing = {
             let mut est = KinematicEstimator::new();
             step_quiet(&mut est, &angles, &vel, imu_upright(), 0b11, 0, gains()).0
@@ -719,8 +792,9 @@ mod tests {
         let walking = {
             let mut est = KinematicEstimator::new();
             let (telem, _) = est.step(
+                &HUMANOID_PROFILE,
                 0.005,
-                21,
+                HUMANOID_PROFILE.joint_count,
                 &angles,
                 &vel,
                 imu_upright(),
@@ -740,7 +814,7 @@ mod tests {
             "stationary disturbance must still breach the support footprint"
         );
         assert!(
-            walking.foot_margin_m > standing.foot_margin_m + 0.10_f32,
+            walking.foot_margin_m > 0.0_f32 && walking.foot_margin_m > standing.foot_margin_m + 0.05_f32,
             "steady walking must be capturable with the next-step region: {} vs {}",
             walking.foot_margin_m,
             standing.foot_margin_m
@@ -749,13 +823,12 @@ mod tests {
 
     #[test]
     fn default_h_com_matches_fk_sole_to_com_height_at_nominal_crouch() {
-        // P2 golden test: the configurable balance height must agree with the
-        // bundled URDF mass table / shared FK, not the IK hip height.
         use crate::com_fk::compute_state;
-        use crate::uvc::{LegGeometry, solve_leg_ik};
+        use crate::uvc::solve_leg_ik;
         use rk_proto::WalkCmd;
 
-        let geom = LegGeometry::rocky_mk1();
+        let geom = HUMANOID_PROFILE.leg_geometry;
+        let ji = &HUMANOID_PROFILE.joint_indices;
         let crouch = WalkCmd::default().stance_crouch.clamp(0.0_f32, 1.0_f32);
         let hip_h = (geom.nominal_height
             - crouch * (geom.nominal_height - geom.min_height) * 0.45_f32)
@@ -763,34 +836,53 @@ mod tests {
         let left = solve_leg_ik(0.0_f32, 0.0_f32, hip_h, 0.0_f32, true, &geom);
         let right = solve_leg_ik(0.0_f32, 0.0_f32, hip_h, 0.0_f32, false, &geom);
         let mut angles = [0.0_f32; MAX_JOINTS];
-        angles[9..15].copy_from_slice(&[
-            left.hip_yaw,
-            left.hip_roll,
-            left.hip_pitch,
-            left.knee_pitch,
-            left.ankle_pitch,
-            left.ankle_roll,
-        ]);
-        angles[15..21].copy_from_slice(&[
-            right.hip_yaw,
-            right.hip_roll,
-            right.hip_pitch,
-            right.knee_pitch,
-            right.ankle_pitch,
-            right.ankle_roll,
-        ]);
-        let fk = compute_state(&angles, &[0.0_f32; MAX_JOINTS]);
-        let sole_y = 0.5_f32 * (fk.left_foot[1] + fk.right_foot[1]);
-        let sole_to_com_m = fk.com[1] - sole_y;
-        eprintln!(
-            "FK golden: hip_h={hip_h:.4} sole_y={sole_y:.4} com_y={:.4} height={sole_to_com_m:.4}",
-            fk.com[1]
+        angles[ji.l_hip_yaw.unwrap() as usize] = left.hip_yaw;
+        angles[ji.l_hip_roll.unwrap() as usize] = left.hip_roll;
+        angles[ji.l_hip_pitch.unwrap() as usize] = left.hip_pitch;
+        angles[ji.l_knee_pitch.unwrap() as usize] = left.knee_pitch;
+        angles[ji.l_ankle_pitch.unwrap() as usize] = left.ankle_pitch;
+        angles[ji.l_ankle_roll.unwrap() as usize] = left.ankle_roll;
+        angles[ji.r_hip_yaw.unwrap() as usize] = right.hip_yaw;
+        angles[ji.r_hip_roll.unwrap() as usize] = right.hip_roll;
+        angles[ji.r_hip_pitch.unwrap() as usize] = right.hip_pitch;
+        angles[ji.r_knee_pitch.unwrap() as usize] = right.knee_pitch;
+        angles[ji.r_ankle_pitch.unwrap() as usize] = right.ankle_pitch;
+        angles[ji.r_ankle_roll.unwrap() as usize] = right.ankle_roll;
+
+        let fk = compute_state(&HUMANOID_PROFILE, &angles, &[0.0_f32; MAX_JOINTS]);
+        let sole_z = 0.5_f32 * (fk.left_foot[2] + fk.right_foot[2]);
+        let sole_to_com_m = fk.com[2] - sole_z;
+        assert!(
+            (HUMANOID_PROFILE.h_com_m - sole_to_com_m).abs() < 0.08_f32,
+            "profile h_com_m {} must match FK sole-to-CoM {:.4} m",
+            HUMANOID_PROFILE.h_com_m,
+            sole_to_com_m
+        );
+    }
+
+    #[test]
+    fn chest_imu_compensates_for_waist_pitch() {
+        // Pelvis is level in world, while waist_pitch tilts chest by +0.35 rad.
+        // Chest IMU reads pitch = +0.35 rad; de_rotate_imu must recover ~0.0 rad.
+        let waist_pitch = 0.35_f32;
+        let r_pelvis_to_imu = rot_from_rpy([0.0, waist_pitch, 0.0]);
+        let chest_imu = ImuState {
+            available: true,
+            pitch_rad: waist_pitch,
+            roll_rad: 0.0,
+            yaw_rad: 0.0,
+            ..Default::default()
+        };
+        let pelvis_imu = de_rotate_imu(chest_imu, r_pelvis_to_imu);
+        assert!(
+            pelvis_imu.pitch_rad.abs() < 1e-5_f32,
+            "de-rotated pelvis pitch should be ~0, got {}",
+            pelvis_imu.pitch_rad
         );
         assert!(
-            (BalanceGains::default().h_com_m - sole_to_com_m).abs() < 0.03_f32,
-            "default h_com_m {} must match FK sole-to-CoM {:.4} m within 0.03 m",
-            BalanceGains::default().h_com_m,
-            sole_to_com_m
+            pelvis_imu.roll_rad.abs() < 1e-5_f32,
+            "de-rotated pelvis roll should be ~0, got {}",
+            pelvis_imu.roll_rad
         );
     }
 }

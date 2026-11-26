@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 /// Built-in URDF preset identifiers exposed to MCP clients and completions.
 pub const URDF_PRESETS: &[(&str, &str)] = &[
-    ("rocky_mk1", "Rocky Mk1 (21-DoF Humanoid, 6-DoF UVC Legs)"),
+    ("humanoid", "Humanoid (28-DoF Humanoid, 6-DoF+Toe UVC Legs)"),
     ("striker_biped", "Striker Biped (8-DoF ROS Z-Up)"),
     ("combat_arm", "Combat Arm (6-DoF Continuous + Prismatic)"),
 ];
@@ -141,10 +141,10 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "robot_load_preset",
             "Load Built-in Robot Preset",
-            "Loads a bundled robot URDF preset (rocky_mk1, striker_biped, or combat_arm) in safe Teach mode.",
+            "Loads a bundled robot URDF preset (humanoid, striker_biped, or combat_arm) in safe Teach mode.",
             object(
                 json!({
-                    "preset": enum_str("Preset identifier", &["rocky_mk1", "striker_biped", "combat_arm"])
+                    "preset": enum_str("Preset identifier", &["humanoid", "striker_biped", "combat_arm"])
                 }),
                 &["preset"],
             ),
@@ -253,9 +253,9 @@ pub fn tool_definitions() -> Vec<Value> {
                     "arm_assist": num("Arm counter-spread balance assist gain (0.0..=1.5)"),
                     "fall_cutoff_rad": num("Protective fall tuck and torque cutoff tilt threshold in radians (0.30..=1.35)"),
                     "dcm_step_gain": num("Kinematic DCM swing-foot landing modulation gain (0.0..=1.5)"),
-                    "h_com_m": num("Fixed CoM height for DCM/ZMP in meters (0.12..=0.80, default 0.72)"),
+                    "h_com_m": num("Fixed CoM height for DCM/ZMP in meters (0.12..=0.80, default 0.25)"),
                     "foot_half_length_m": num("Physical printed foot half-length in meters (default 0.035 m = 7 cm foot)"),
-                    "foot_margin_m": num("Usable sagittal ankle/CoP margin before capture step (default 0.028 m = ±2.8 cm)"),
+                    "foot_margin_m": num("Usable sagittal ankle/CoP margin before capture step (default 0.025 m = ±2.5 cm)"),
                     "ukemi_tilt_rad": num("Ukemi pre-fall torque relaxation tilt threshold in radians (0.25..=1.20)"),
                     "ukemi_torque_scale": num("Ukemi torque ceiling multiplier (0.05..=0.50)"),
                     "compliance_scale": num("Global software current/torque compliance ceiling scale (0.10..=1.0)")
@@ -576,7 +576,7 @@ pub fn prompt_definitions() -> Vec<Value> {
             "title": "Calibrate Robot Joints & Soft Limits",
             "description": "Guided workflow to inspect joint limits, check zero offsets in Teach mode, and export a verified calibration JSON.",
             "arguments": [
-                {"name": "preset", "description": "Optional robot preset to load first (rocky_mk1, striker_biped, combat_arm)", "required": false}
+                {"name": "preset", "description": "Optional robot preset to load first (humanoid, striker_biped, combat_arm)", "required": false}
             ]
         }),
         json!({

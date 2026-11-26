@@ -1,0 +1,12 @@
+[package]
+name = "rk-robot-profile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["std"]
+std = ["rk-proto/std"]
+
+[dependencies]
+rk-proto.workspace = true

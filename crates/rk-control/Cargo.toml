@@ -6,9 +6,10 @@ license.workspace = true
 
 [features]
 default = ["std"]
-std = ["rk-proto/std", "serde/std"]
+std = ["rk-proto/std", "rk-robot-profile/std", "serde/std"]
 
 [dependencies]
 libm = "0.2"
 rk-proto.workspace = true
+rk-robot-profile.workspace = true
 serde.workspace = true

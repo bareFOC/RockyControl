@@ -1325,6 +1325,7 @@ version = "0.1.0"
 dependencies = [
  "libm",
  "rk-proto",
+ "rk-robot-profile",
  "serde",
 ]
 
@@ -1336,6 +1337,7 @@ dependencies = [
  "libm",
  "rk-control",
  "rk-proto",
+ "rk-robot-profile",
  "serde",
 ]
 
@@ -1347,6 +1349,21 @@ dependencies = [
  "embedded-hal 1.0.0",
  "rk-control",
  "rk-proto",
+ "rk-robot-profile",
+]
+
+[[package]]
+name = "rk-profile-humanoid"
+version = "0.1.0"
+dependencies = [
+ "rk-robot-profile",
+]
+
+[[package]]
+name = "rk-profile-striker"
+version = "0.1.0"
+dependencies = [
+ "rk-robot-profile",
 ]
 
 [[package]]
@@ -1356,6 +1373,13 @@ dependencies = [
  "bitflags 2.13.2",
  "postcard",
  "serde",
+]
+
+[[package]]
+name = "rk-robot-profile"
+version = "0.1.0"
+dependencies = [
+ "rk-proto",
 ]
 
 [[package]]
@@ -1378,7 +1402,10 @@ dependencies = [
  "rk-control",
  "rk-fw-core",
  "rk-multibus",
+ "rk-profile-humanoid",
+ "rk-profile-striker",
  "rk-proto",
+ "rk-robot-profile",
  "spin",
  "static_cell",
 ]

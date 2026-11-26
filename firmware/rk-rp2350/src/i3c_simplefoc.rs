@@ -46,20 +46,22 @@ use core::cell::RefCell;
 use critical_section::Mutex;
 use defmt::{info, warn};
 use rk_control::{RawServoCommand, RawServoFeedback};
-use rk_fw_core::config::DEFAULT_JOINT_COUNT;
 use rk_fw_core::imu::IMU_SLOT;
 use rk_fw_core::servo_bus::{SERVO_BUS_SLOT, ServoBusHooks};
 use rk_multibus::{
-    I2cTransport, JOINT_NODE_BASE, JointFeedback, MAX_I2C_WRITE_FRAME, MultibusBusTracker,
-    PioError, PioI3c, PioI3cBus, TorqueConstants, bind_joint, read_joint_feedback,
+    ControlTableClient, I2cTransport, JOINT_NODE_BASE, JointFeedback, MAX_I2C_WRITE_FRAME,
+    MultibusBusTracker, PioError, PioI3c, PioI3cBus, read_joint_feedback,
     write_joint_command,
 };
 
-/// Joints actually driven by this adapter (one BareFOC node per joint).
-/// Clamped to the node address space `0x20..=0x34` served by `rk-multibus`.
+/// Maximum number of independent I3C buses supported by the RP2350 adapter.
+pub const MAX_I3C_BUSES: usize = 4;
+
+/// Active joint count from the compile-time robot profile.
 const JOINT_COUNT: usize = {
-    let width = if DEFAULT_JOINT_COUNT < rk_proto::MAX_JOINTS {
-        DEFAULT_JOINT_COUNT
+    let profile_joints = crate::active_profile().joint_count;
+    let width = if profile_joints < rk_proto::MAX_JOINTS {
+        profile_joints
     } else {
         rk_proto::MAX_JOINTS
     };
@@ -92,17 +94,15 @@ impl PioI3c for NoHardwareTransport {
 
 struct I3cState {
     tracker: MultibusBusTracker,
-    /// `None` until the external PIO I3C master registers itself.
-    /// `Send` is required because this state lives in a `critical_section::Mutex`
-    /// static (the old board-local trait had the same bound).
-    transport: Option<&'static mut (dyn PioI3c + Send + 'static)>,
+    /// Up to 4 independent PIO I3C bus masters (`bus_id` 0..4).
+    transports: [Option<&'static mut (dyn PioI3c + Send + 'static)>; MAX_I3C_BUSES],
     last_cmd: RawServoCommand,
     last_feedback: RawServoFeedback,
 }
 
 static I3C_STATE: Mutex<RefCell<I3cState>> = Mutex::new(RefCell::new(I3cState {
-    tracker: MultibusBusTracker::new(DEFAULT_JOINT_COUNT),
-    transport: None,
+    tracker: MultibusBusTracker::new(JOINT_COUNT),
+    transports: [None, None, None, None],
     last_cmd: RawServoCommand {
         torque_mask: 0,
         raw_target_rad: [0.0_f32; rk_proto::MAX_JOINTS],
@@ -135,43 +135,48 @@ static I3C_STATE: Mutex<RefCell<I3cState>> = Mutex::new(RefCell::new(I3cState {
     },
 }));
 
-/// Registers the external RP2350 PIO I3C master with this adapter.
-///
-/// Call once from board init before the Embassy runtime starts. The driver
-/// must have `static` lifetime (e.g. `static_cell::StaticCell<MyPioI3c>`).
-#[allow(dead_code)] // Public board-integration entry point: called by the external PIO I3C driver crate.
-pub fn set_i3c_transport(transport: &'static mut (dyn PioI3c + Send + 'static)) {
+/// Registers an external RP2350 PIO I3C master for `bus_id` (`0..MAX_I3C_BUSES`).
+#[allow(dead_code)]
+pub fn set_i3c_bus_transport(
+    bus_id: usize,
+    transport: &'static mut (dyn PioI3c + Send + 'static),
+) {
+    if bus_id >= MAX_I3C_BUSES {
+        return;
+    }
     critical_section::with(|cs| {
-        I3C_STATE.borrow_ref_mut(cs).transport = Some(transport);
+        I3C_STATE.borrow_ref_mut(cs).transports[bus_id] = Some(transport);
     });
-    info!("External PIO I3C transport registered with BareFOC multibus servo adapter");
+    info!("External PIO I3C transport registered on bus {}", bus_id);
 }
 
-/// Performs all register transactions for one control tick.
-///
-/// This is deliberately independent of the global hook state so it can be
-/// exercised directly by tests with a loopback PIO driver. Every joint gets
-/// its own `ControlTableClient` bound to node `0x20 + joint`; a failed joint is
-/// counted and skipped without stalling the others.
-fn exchange_joints<P: PioI3c + ?Sized>(
-    pio: &mut P,
+/// Registers the primary external RP2350 PIO I3C master (bus 0).
+#[allow(dead_code)] // Public board-integration entry point: called by the external PIO I3C driver crate.
+pub fn set_i3c_transport(transport: &'static mut (dyn PioI3c + Send + 'static)) {
+    set_i3c_bus_transport(0, transport);
+}
+
+/// Performs all register transactions for one control tick across up to 4 I3C buses.
+fn exchange_joints(
+    buses: &mut [&mut dyn PioI3c; MAX_I3C_BUSES],
     cmd: &RawServoCommand,
     tracker: &mut MultibusBusTracker,
-    constants: &TorqueConstants,
+    profile: &rk_robot_profile::RobotProfile,
 ) {
-    let mut bus = PioI3cBus::new(PioRef(pio));
-
     for joint in 0..JOINT_COUNT {
         let _seq = tracker.next_seq();
-        let Some(mut client) =
-            bind_joint(joint, I2cTransport::<_, MAX_I2C_WRITE_FRAME>::new(&mut bus))
-        else {
-            continue;
+        let ep = profile.servo_endpoints[joint];
+        let bus_idx = (ep.bus_id as usize).min(MAX_I3C_BUSES - 1);
+        let node_addr = if ep.node_addr != 0 {
+            ep.node_addr
+        } else {
+            JOINT_NODE_BASE.saturating_add(joint as u8)
         };
+        let mut bus = PioI3cBus::new(PioRef(buses[bus_idx]));
+        let mut client =
+            ControlTableClient::new(node_addr, I2cTransport::<_, MAX_I2C_WRITE_FRAME>::new(&mut bus));
 
-        // Five register writes (torque, mode, position, velocity, current)
-        // through the exact wire encoding used by firmware and simulator.
-        let write_result = write_joint_command(&mut client, joint, cmd, constants);
+        let write_result = write_joint_command(&mut client, joint, cmd, &profile.torque_constants);
 
         // `read_joint_feedback` is the single mapper from burst bytes into
         // `RawServoFeedback`. The tracker owns the published snapshot, so copy
@@ -214,19 +219,34 @@ fn i3c_write_command(cmd: &RawServoCommand) {
     // ----- Phase 1: short critical section — snapshot shared state ---------
     // Clone the tracker so accounting can run entirely outside the lock. Take
     // the transport out so the exclusive `&mut` is not held across any I/O.
-    let (mut tracker, mut taken_transport) = critical_section::with(|cs| {
+    let (mut tracker, mut taken_transports) = critical_section::with(|cs| {
         let mut st = I3C_STATE.borrow_ref_mut(cs);
         st.last_cmd = *cmd;
-        (st.tracker.clone(), st.transport.take())
+        let transports = [
+            st.transports[0].take(),
+            st.transports[1].take(),
+            st.transports[2].take(),
+            st.transports[3].take(),
+        ];
+        (st.tracker.clone(), transports)
     });
 
     // ----- Phase 2: interrupts enabled — all hardware I/O and accounting ---
-    let mut stub = NoHardwareTransport;
-    let pio: &mut dyn PioI3c = match taken_transport.as_deref_mut() {
-        Some(t) => t,
-        None => &mut stub,
-    };
-    exchange_joints(pio, cmd, &mut tracker, &TorqueConstants::default());
+    let mut stubs = [
+        NoHardwareTransport,
+        NoHardwareTransport,
+        NoHardwareTransport,
+        NoHardwareTransport,
+    ];
+    let [t0, t1, t2, t3] = &mut taken_transports;
+    let [s0, s1, s2, s3] = &mut stubs;
+    let mut buses: [&mut dyn PioI3c; MAX_I3C_BUSES] = [
+        t0.as_deref_mut().map_or(s0 as &mut dyn PioI3c, |t| t),
+        t1.as_deref_mut().map_or(s1 as &mut dyn PioI3c, |t| t),
+        t2.as_deref_mut().map_or(s2 as &mut dyn PioI3c, |t| t),
+        t3.as_deref_mut().map_or(s3 as &mut dyn PioI3c, |t| t),
+    ];
+    exchange_joints(&mut buses, cmd, &mut tracker, crate::active_profile());
 
     // Merge the async IMU mailbox into the feedback returned to the host.
     // `IMU_SLOT` self-protects with its own critical section, so this can stay
@@ -240,11 +260,12 @@ fn i3c_write_command(cmd: &RawServoCommand) {
     // ----- Phase 3: short critical section — commit results ----------------
     critical_section::with(|cs| {
         let mut st = I3C_STATE.borrow_ref_mut(cs);
-        // Put the transport back, unless a new one was registered while the
-        // transactions were in flight — a fresh registration must win.
-        if let Some(t) = taken_transport {
-            if st.transport.is_none() {
-                st.transport = Some(t);
+        // Put transports back, unless a new one was registered while in flight.
+        for (slot, taken) in st.transports.iter_mut().zip(taken_transports.into_iter()) {
+            if let Some(t) = taken {
+                if slot.is_none() {
+                    *slot = Some(t);
+                }
             }
         }
         st.tracker = tracker;

@@ -4,6 +4,7 @@ members = [
     "xtask",
     "firmware/rk-fw-core",
     "crates/rk-proto",
+    "crates/rk-robot-profile",
     "crates/rk-control",
     "crates/rk-multibus",
     "crates/rk-harness",
@@ -30,6 +31,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Internal layered crates
 rk-proto = { path = "crates/rk-proto", default-features = false }
+rk-robot-profile = { path = "crates/rk-robot-profile", default-features = false }
 rk-control = { path = "crates/rk-control", default-features = false }
 rk-multibus = { path = "crates/rk-multibus", default-features = false }
 rk-harness = { path = "crates/rk-harness" }

@@ -30,7 +30,11 @@ const fn default_sim_seed() -> u64 {
     DEFAULT_SIM_SEED
 }
 
-const fn default_sim_servo_lag_factor() -> f32 {
+const fn default_bool_array() -> [bool; MAX_JOINTS] {
+    [false; MAX_JOINTS]
+}
+
+fn default_sim_servo_lag_factor() -> f32 {
     DEFAULT_SIM_SERVO_LAG_FACTOR
 }
 
@@ -48,11 +52,11 @@ const fn default_sim_foot_friction_mu() -> f32 {
 pub struct SimFaultSnapshot {
     #[serde(default)]
     pub drop_heartbeat: bool,
-    #[serde(default)]
+    #[serde(default = "default_bool_array", with = "rk_proto::serde_array")]
     pub stalled_joints: [bool; MAX_JOINTS],
     /// Per-joint servo-bus degradation: that node's register transactions fail
     /// while every other node keeps replying.
-    #[serde(default)]
+    #[serde(default = "default_bool_array", with = "rk_proto::serde_array")]
     pub degraded_joints: [bool; MAX_JOINTS],
     #[serde(default)]
     pub voltage_sag: bool,
@@ -160,6 +164,7 @@ pub enum SimEventKind {
 pub struct CopperReplayLog {
     pub version: u32,
     pub joint_count: usize,
+    #[serde(with = "rk_proto::serde_array")]
     pub initial_raw_pose: [f32; MAX_JOINTS],
     pub initial_calibration: Vec<JointCalibration>,
     pub ticks: Vec<CopperListTick>,

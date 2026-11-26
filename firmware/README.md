@@ -17,8 +17,9 @@ firmware/rk-fw-core      (#![no_std])  Board-agnostic MCU core:
   │                                          - ControlTask: plain DirectServoKernel::step() wrapper
   │                                          - Zero-alloc CobsStreamFramer (USB CDC-ACM)
   │                                          - UDP COBS datagram codec (USB CDC-NCM networking)
-  │                                          - BenchLoopbackBus (Day-1 USB-only testing) & ServoBusPort
+  │                                          - BenchLoopbackBus (opt-in `bench-plant`, USB-only testing) & ServoBusPort
   │                                          - Deterministic StatusLedMode (Teach / Drive / Fault)
+  │                                          - Model-store request codec (no URDF bundled; app owns models)
   ├── firmware/rk-rp2350  (Primary)    RP2350 Cortex-M33F (thumbv8m.main-none-eabihf)
   │                                          embassy-rp 0.10 + embassy-usb 0.6 + embassy-net 0.9
   └── firmware/rk-esp32p4 (Next MCU)   ESP32-P4 RV32IMAFC (riscv32imafc-unknown-none-elf)
@@ -46,6 +47,7 @@ embassy_time::Ticker (200 Hz)
   - `250 ms` RP2350 hardware `Watchdog` resets the MCU if the control loop itself ever wedges.
   - Onboard LED (`GPIO25` on Pico 2): **1 Hz slow heartbeat** = `Teach`, **Solid ON** = `Drive`, **8 Hz rapid strobe** = `EStop` / Watchdog / Fault.
 - **Deterministic replay** remains a host-side feature (`rk-cu-nodes::DirectServoTask`, `rk-sim`, UI, MCP). It is independent of the MCU runtime: no copper-rs code or `.copper` logging runs on the firmware.
+- **Model data is app-owned.** The MCU bundles no URDF and exposes no model pull service (the former UDP `:7778` model task is removed). Rocky Studio loads its bundled preset, uploaded `.urdf`/`.xml`/`.zip` bundles, or staged flash blobs; `Pull MCU` reports that the model is unavailable on real hardware. The shared `FlashModelStore` codec is kept only for the simulator/host tests and future runtime flash blobs.
 
 ---
 
@@ -60,8 +62,8 @@ Both wired transports carry the **exact same `postcard` COBS-encoded `HostToMcu`
 
 ### Bench Loopback vs. Real Servo Bus
 
-- **`bench-loopback`** *(default)*: Runs `BenchLoopbackBus` directly inside the MCU so you can flash RP2350, plug in a **single USB cable**, and test live 200 Hz Teach/Drive mirroring, bumpless transfer, E-Stop, and cable-pull watchdog trip with zero servos powered.
-- **`uart-servo-bus`** *(legacy, unused by the control application)*: Initializes RP2350 `UART0` (`GPIO0` TX / `GPIO1` RX @ `1 Mbps`) wired into `SERVO_BUS_SLOT` for physical Feetech STS3215 / Dynamixel Protocol 2.0 smart bus servos. `rk-multibus` is now the single servo wire path; this remains only as a bring-up placeholder.
+- **`bench-loopback`** *(default)*: Enables `rk-fw-core/bench-plant` and runs `BenchLoopbackBus` directly inside the MCU so you can flash RP2350, plug in a **single USB cable**, and test live 200 Hz Teach/Drive mirroring, bumpless transfer, E-Stop, and cable-pull watchdog trip with zero servos powered. Lean hardware builds omit this feature, so no bench plant is linked. Without hooks **and** without `bench-plant`, `ServoBusSlot` returns neutral feedback and discards commands instead of panicking.
+- **`uart-servo-bus`** *(legacy, unused by the control application)*: Initializes RP2350 `UART0` (`GPIO0` TX / `GPIO1` RX @ `1 Mbps`) wired into `SERVO_BUS_SLOT` for physical Feetech STS3215 / Dynamixel Protocol 2.0 smart bus servos. `rk-multibus` is now the single servo wire path; this remains only as a bring-up placeholder. It registers its own hooks, so it does not need `bench-plant`.
 
 > [!IMPORTANT]
 > **`bench-loopback` hooks are overridden whenever a hardware servo bus is enabled.** Both `uart-servo-bus` and `i3c-servo-bus` register their own `ServoBusHooks` in `SERVO_BUS_SLOT`, so the `bench-loopback` mirroring plant is not active in those builds even if the `bench-loopback` feature is still present. The two hardware bus features are mutually exclusive and enabling both is a compile error.
@@ -114,6 +116,16 @@ cargo build --release --manifest-path firmware/rk-rp2350/Cargo.toml \
 # 5. Flash & view defmt RTT logs via probe-rs (SWD debug probe)
 cargo run --release --manifest-path firmware/rk-rp2350/Cargo.toml
 ```
+
+Lean production build (USB network + IMU + I3C hardware servo bus, no bench plant):
+
+```bash
+cargo build --release --manifest-path firmware/rk-rp2350/Cargo.toml \
+  --no-default-features --features usb-net,imu-lsm6dsv,i3c-servo-bus
+```
+
+The firmware release profile uses fat LTO (`lto = "fat"`) with `opt-level = "s"` and
+`codegen-units = 1`; no model data and no bench plant are linked into that build.
 
 ### USB Networking Quick Test (`usb-net`)
 

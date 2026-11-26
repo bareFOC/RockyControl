@@ -1,19 +1,27 @@
-//! Board-agnostic servo bus abstraction (`ServoBusPort`) + Day-1 USB bench loopback plant.
+//! Board-agnostic servo bus abstraction (`ServoBusPort`) + optional bench loopback plant.
 //!
-//! - **Milestone 2.1 (Wired USB Bench Bring-Up):** Use [`BenchLoopbackBus`] so you can flash
+//! - **Bench bring-up (feature `bench-plant`):** Use `BenchLoopbackBus` so you can flash
 //!   RP2350 or ESP32-P4, plug in a single USB cable (CDC-ACM or USB Ethernet NCM), and verify
-//!   real MCU `copper-rs` 200 Hz mirroring, bumpless transfer, E-Stop, and 100 ms watchdog
-//!   with zero servos attached.
-//! - **Milestone 2.2 (Hardware Servo Bus):** Bind a board UART/PIO half-duplex or CAN/TWAI
-//!   servo driver implementing [`ServoBusPort`] into [`SERVO_BUS_SLOT`].
+//!   the MCU's 200 Hz mirroring, bumpless transfer, E-Stop, and watchdog with zero servos
+//!   attached. Board crates opt in via their `bench-loopback` feature.
+//! - **Hardware servo bus:** Bind a board UART/PIO half-duplex or CAN/TWAI servo driver
+//!   implementing [`ServoBusPort`] into [`SERVO_BUS_SLOT`] via [`ServoBusSlot::register_hooks`].
+//!
+//! Production hardware builds compile without `bench-plant`: when no hardware hooks are
+//! registered either, [`ServoBusSlot::read_feedback`] returns a neutral snapshot and
+//! [`ServoBusSlot::write_command`] discards commands. Registered hardware hooks always
+//! take precedence, with or without the bench plant.
 
 use core::cell::RefCell;
 
 use critical_section::Mutex;
 use rk_control::{RawServoCommand, RawServoFeedback};
+#[cfg(feature = "bench-plant")]
 use rk_proto::{JointCommandMode, MAX_JOINTS};
 
+#[cfg(feature = "bench-plant")]
 use crate::config::DEFAULT_JOINT_COUNT;
+#[cfg(feature = "bench-plant")]
 use crate::joint_plant::{IDLE_CURRENT_MA, JointPlant, DEFAULT_NM_PER_AMP};
 
 /// Hardware-independent servo bus interface called once per `copper-rs` control iteration.
@@ -27,6 +35,7 @@ pub trait ServoBusPort: Send {
 /// Uses the same [`JointPlant`] model as the simulator, so USB bench tuning transfers to
 /// simulation and back. Bus voltage sag, the default (absent) IMU and bus-fault injection
 /// remain bench-specific.
+#[cfg(feature = "bench-plant")]
 pub struct BenchLoopbackBus {
     joint_count: usize,
     plant: JointPlant<MAX_JOINTS>,
@@ -34,12 +43,14 @@ pub struct BenchLoopbackBus {
     bus_fault: bool,
 }
 
+#[cfg(feature = "bench-plant")]
 impl Default for BenchLoopbackBus {
     fn default() -> Self {
         Self::new(DEFAULT_JOINT_COUNT)
     }
 }
 
+#[cfg(feature = "bench-plant")]
 impl BenchLoopbackBus {
     pub const fn new(joint_count: usize) -> Self {
         Self {
@@ -57,6 +68,7 @@ impl BenchLoopbackBus {
     }
 }
 
+#[cfg(feature = "bench-plant")]
 impl ServoBusPort for BenchLoopbackBus {
     fn read_feedback(&mut self, dt_sec: f32) -> RawServoFeedback {
         let dt = dt_sec.clamp(0.001_f32, 0.05_f32);
@@ -67,7 +79,7 @@ impl ServoBusPort for BenchLoopbackBus {
         let mut temp_c = [28u8; MAX_JOINTS];
 
         for i in 0..self.joint_count.min(MAX_JOINTS) {
-            let energized = (self.last_cmd.torque_mask & (1u32 << i)) != 0;
+            let energized = (self.last_cmd.torque_mask & (1u64 << i)) != 0;
             let limit = if energized { self.last_cmd.torque_nm[i].max(0.0_f32) } else { 0.0_f32 };
             let (angle, velocity, ma, _) = self.plant.step(
                 i,
@@ -108,12 +120,14 @@ impl ServoBusPort for BenchLoopbackBus {
     }
 }
 
-/// Static servo bus registration slot consumed by `copper-rs` `ServoBusBridge`.
+/// Static servo bus registration slot consumed by the board control task.
 ///
-/// Boards install either [`BenchLoopbackBus`] or a hardware UART/PIO/TWAI driver before
-/// starting the `copper-rs` runtime, keeping `ServoBusBridge` 100% portable across MCUs.
+/// Boards install a hardware UART/PIO/TWAI driver before starting the control loop;
+/// bench builds may instead rely on the optional `BenchLoopbackBus` fallback.
+/// Keeping the slot board-agnostic makes the control path portable across MCUs.
 pub struct ServoBusSlot {
-    /// Active fallback bench bus (used when no custom hardware callback is registered).
+    /// Active fallback bench bus (only present with feature `bench-plant`).
+    #[cfg(feature = "bench-plant")]
     bench: Mutex<RefCell<BenchLoopbackBus>>,
     /// Optional board hardware hooks `(read_fn, write_fn)`.
     hooks: Mutex<RefCell<Option<ServoBusHooks>>>,
@@ -128,6 +142,7 @@ pub struct ServoBusHooks {
 impl ServoBusSlot {
     pub const fn new() -> Self {
         Self {
+            #[cfg(feature = "bench-plant")]
             bench: Mutex::new(RefCell::new(BenchLoopbackBus::new(DEFAULT_JOINT_COUNT))),
             hooks: Mutex::new(RefCell::new(None)),
         }
@@ -140,7 +155,10 @@ impl ServoBusSlot {
         });
     }
 
-    /// Clears custom hardware hooks and reverts to the built-in `BenchLoopbackBus`.
+    /// Clears custom hardware hooks and reverts to the built-in bench plant.
+    ///
+    /// Without the `bench-plant` feature this leaves no active bus: reads return
+    /// neutral feedback and writes are discarded until hooks are registered again.
     pub fn use_bench_loopback(&self) {
         critical_section::with(|cs| {
             *self.hooks.borrow_ref_mut(cs) = None;
@@ -152,7 +170,19 @@ impl ServoBusSlot {
         if let Some(read_fn) = maybe_fn {
             read_fn(dt_sec)
         } else {
-            critical_section::with(|cs| self.bench.borrow_ref_mut(cs).read_feedback(dt_sec))
+            #[cfg(feature = "bench-plant")]
+            {
+                critical_section::with(|cs| self.bench.borrow_ref_mut(cs).read_feedback(dt_sec))
+            }
+            #[cfg(not(feature = "bench-plant"))]
+            {
+                // No hooks and no compiled-in plant: safe neutral snapshot instead
+                // of a panic. `imu_source_mask = 0` avoids claiming a valid IMU.
+                RawServoFeedback {
+                    imu_source_mask: 0,
+                    ..Default::default()
+                }
+            }
         }
     }
 
@@ -161,7 +191,11 @@ impl ServoBusSlot {
         if let Some(write_fn) = maybe_fn {
             write_fn(cmd);
         } else {
-            critical_section::with(|cs| self.bench.borrow_ref_mut(cs).write_command(cmd));
+            #[cfg(feature = "bench-plant")]
+            {
+                critical_section::with(|cs| self.bench.borrow_ref_mut(cs).write_command(cmd));
+            }
+            // Without `bench-plant` there is no fallback plant: discard the command.
         }
     }
 }
@@ -172,13 +206,14 @@ impl Default for ServoBusSlot {
     }
 }
 
-/// Global servo bus bridge slot shared between board BSP initialization and `copper-rs`.
+/// Global servo bus slot shared between board BSP initialization and the control task.
 pub static SERVO_BUS_SLOT: ServoBusSlot = ServoBusSlot::new();
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "bench-plant")]
     #[test]
     fn bench_loopback_tracks_when_energized_and_holds_when_off() {
         let mut bus = BenchLoopbackBus::new(17);
@@ -201,5 +236,39 @@ mod tests {
         let fb_off = bus.read_feedback(0.005);
         assert!((fb_off.raw_angle_rad[3] - fb_on.raw_angle_rad[3]).abs() < 1e-6);
         assert_eq!(fb_off.current_ma[3], 45);
+    }
+
+    #[cfg(not(feature = "bench-plant"))]
+    #[test]
+    fn slot_without_plant_or_hooks_is_safe_no_op() {
+        let slot = ServoBusSlot::new();
+        let fb = slot.read_feedback(0.005);
+        assert_eq!(fb.imu_source_mask, 0);
+        assert_eq!(fb.bus_voltage_mv, RawServoFeedback::default().bus_voltage_mv);
+        assert!(!fb.bus_error);
+        // No panic when writing with no registered bus.
+        slot.write_command(&RawServoCommand::default());
+        slot.use_bench_loopback();
+        let _ = slot.read_feedback(0.005);
+    }
+
+    #[cfg(not(feature = "bench-plant"))]
+    #[test]
+    fn registered_hooks_win_without_bench_plant() {
+        fn read(_dt: f32) -> RawServoFeedback {
+            let mut fb = RawServoFeedback::default();
+            fb.raw_angle_rad[0] = 0.25;
+            fb
+        }
+        fn write(_cmd: &RawServoCommand) {}
+
+        let slot = ServoBusSlot::new();
+        slot.register_hooks(ServoBusHooks {
+            read_feedback: read,
+            write_command: write,
+        });
+        let fb = slot.read_feedback(0.005);
+        assert_eq!(fb.raw_angle_rad[0], 0.25);
+        slot.write_command(&RawServoCommand::default());
     }
 }
