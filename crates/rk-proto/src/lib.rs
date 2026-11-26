@@ -76,7 +76,8 @@ pub const MAX_COBS_FRAME_BYTES: usize = 1024;
 /// v6 adds the plant-derived world-frame position/velocity on [`BalanceTelemetry`]
 /// and the matching `estimator_valid::WORLD` validity bit (viewport + gait HUD).
 /// v7 widens `MAX_JOINTS` to 36 and `torque_mask` to `u64` for 28-DoF humanoid profiles.
-pub const PROTOCOL_VERSION: u16 = 7;
+/// v8 adds runtime tuning `ConfigCmd` variants (`SetUvcGait`, `SetActuatorLimits`, `SetImpactConfig`).
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const MODEL_CHUNK_BYTES: usize = 256;
 pub const MAX_MODEL_NAME_BYTES: usize = 32;
 pub const MAX_MODEL_COBS_FRAME_BYTES: usize = 384;
@@ -484,16 +485,16 @@ impl Default for BalanceGains {
     fn default() -> Self {
         Self {
             uvc_gain_pitch: 0.25,
-            uvc_gain_roll: 0.25,
-            tilt_deadband_rad: 0.033,
+            uvc_gain_roll: 0.45,
+            tilt_deadband_rad: 0.042,
             gyro_damp_pitch: 0.08,
-            gyro_damp_roll: 0.10,
-            arm_assist: 0.65,
+            gyro_damp_roll: 0.25,
+            arm_assist: 0.75,
             fall_cutoff_rad: 0.65,
-            dcm_step_gain: 0.65,
+            dcm_step_gain: 0.40,
             foot_half_length_m: 0.035,
             foot_margin_m: 0.025,
-            h_com_m: 0.25,
+            h_com_m: 0.22,
             ukemi_tilt_rad: 0.56,
             ukemi_torque_scale: 0.15,
             compliance_scale: 1.0,
@@ -595,6 +596,106 @@ pub struct BalanceTelemetry {
     pub world_vel_m_s: [f32; 3],
 }
 
+/// Runtime-configurable UVC gait, swing clearance, and upper-body assist parameters.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct UvcGaitConfig {
+    pub max_foot_lift: f32,
+    pub max_sway: f32,
+    pub max_dx: f32,
+    pub max_dy: f32,
+    pub max_swing_dx: f32,
+    pub max_swing_dy: f32,
+    pub step_duration_s: f32,
+    pub toe_push_off_gain: f32,
+    pub waist_balance_gain: f32,
+    pub arm_swing_gain: f32,
+}
+
+impl Default for UvcGaitConfig {
+    fn default() -> Self {
+        Self {
+            max_foot_lift: 0.040,
+            max_sway: 0.025,
+            max_dx: 0.050,
+            max_dy: 0.045,
+            max_swing_dx: 0.070,
+            max_swing_dy: 0.060,
+            step_duration_s: 0.18,
+            toe_push_off_gain: 0.18,
+            waist_balance_gain: 0.25,
+            arm_swing_gain: 1.25,
+        }
+    }
+}
+
+impl UvcGaitConfig {
+    pub fn all_finite(&self) -> bool {
+        self.max_foot_lift.is_finite()
+            && self.max_sway.is_finite()
+            && self.max_dx.is_finite()
+            && self.max_dy.is_finite()
+            && self.max_swing_dx.is_finite()
+            && self.max_swing_dy.is_finite()
+            && self.step_duration_s.is_finite()
+            && self.toe_push_off_gain.is_finite()
+            && self.waist_balance_gain.is_finite()
+            && self.arm_swing_gain.is_finite()
+    }
+
+    pub fn sanitized(&self) -> Self {
+        let d = Self::default();
+        let f = |v: f32, def: f32| if v.is_finite() { v } else { def };
+        Self {
+            max_foot_lift: f(self.max_foot_lift, d.max_foot_lift).clamp(0.005, 0.15),
+            max_sway: f(self.max_sway, d.max_sway).clamp(0.005, 0.12),
+            max_dx: f(self.max_dx, d.max_dx).clamp(0.01, 0.25),
+            max_dy: f(self.max_dy, d.max_dy).clamp(0.01, 0.25),
+            max_swing_dx: f(self.max_swing_dx, d.max_swing_dx).clamp(0.01, 0.30),
+            max_swing_dy: f(self.max_swing_dy, d.max_swing_dy).clamp(0.01, 0.30),
+            step_duration_s: f(self.step_duration_s, d.step_duration_s).clamp(0.16, 0.45),
+            toe_push_off_gain: f(self.toe_push_off_gain, d.toe_push_off_gain).clamp(0.0, 0.60),
+            waist_balance_gain: f(self.waist_balance_gain, d.waist_balance_gain).clamp(0.0, 1.0),
+            arm_swing_gain: f(self.arm_swing_gain, d.arm_swing_gain).clamp(0.0, 2.0),
+        }
+    }
+}
+
+/// Wire-serializable combat impact detector configuration (`#![no_std]`).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct ImpactWireConfig {
+    pub torque_capable: bool,
+    pub k_o: f32,
+    pub threshold_nm: f32,
+    pub debounce_ticks: u8,
+    pub refractory_s: f32,
+    pub current_spike_ma: f32,
+    pub ma_per_nm: f32,
+}
+
+impl Default for ImpactWireConfig {
+    fn default() -> Self {
+        Self {
+            torque_capable: false,
+            k_o: 80.0,
+            threshold_nm: 0.20,
+            debounce_ticks: 2,
+            refractory_s: 0.08,
+            current_spike_ma: 200.0,
+            ma_per_nm: 1111.0,
+        }
+    }
+}
+
+impl ImpactWireConfig {
+    pub fn all_finite(&self) -> bool {
+        self.k_o.is_finite()
+            && self.threshold_nm.is_finite()
+            && self.refractory_s.is_finite()
+            && self.current_spike_ma.is_finite()
+            && self.ma_per_nm.is_finite()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
 pub enum ConfigCmd {
     #[default]
@@ -613,6 +714,13 @@ pub enum ConfigCmd {
         max_rad: f32,
     },
     SetBalanceGains(BalanceGains),
+    SetUvcGait(UvcGaitConfig),
+    SetActuatorLimits {
+        joint: u8,
+        max_torque_nm: f32,
+        max_velocity_rad_s: f32,
+    },
+    SetImpactConfig(ImpactWireConfig),
     CommitFlash,
     ClearFaults,
 }
@@ -1191,6 +1299,19 @@ pub fn validate_host_packet(pkt: &HostToMcu) -> Result<(), CodecError> {
         {
             return Err(CodecError::NonFiniteFloat);
         }
+        ConfigCmd::SetUvcGait(g) if !g.all_finite() => {
+            return Err(CodecError::NonFiniteFloat);
+        }
+        ConfigCmd::SetActuatorLimits {
+            max_torque_nm,
+            max_velocity_rad_s,
+            ..
+        } if !max_torque_nm.is_finite() || !max_velocity_rad_s.is_finite() => {
+            return Err(CodecError::NonFiniteFloat);
+        }
+        ConfigCmd::SetImpactConfig(c) if !c.all_finite() => {
+            return Err(CodecError::NonFiniteFloat);
+        }
         _ => {}
     }
     Ok(())
@@ -1465,7 +1586,7 @@ mod tests {
         let n = encode_cobs(&ok, &mut wire).expect("encode").len();
         let decoded = decode_host_cobs(&mut wire[..n]).expect("decode");
         match decoded.config {
-            ConfigCmd::SetBalanceGains(g) => assert_eq!(g.h_com_m, 0.25),
+            ConfigCmd::SetBalanceGains(g) => assert_eq!(g.h_com_m, BalanceGains::default().h_com_m),
             _ => panic!("expected SetBalanceGains"),
         }
     }
@@ -1805,5 +1926,64 @@ mod tests {
             .len();
         let decoded = decode_model_resp_cobs(&mut wire[..n]).expect("decode chunk");
         assert_eq!(decoded, resp_chunk);
+    }
+
+    #[test]
+    fn runtime_tuning_config_cmds_round_trip_and_reject_nan() {
+        let mut wire = [0u8; MAX_COBS_FRAME_BYTES];
+        let cmds = [
+            ConfigCmd::SetUvcGait(UvcGaitConfig {
+                max_foot_lift: 0.05,
+                step_duration_s: 0.24,
+                toe_push_off_gain: 0.25,
+                waist_balance_gain: 0.40,
+                arm_swing_gain: 1.25,
+                ..Default::default()
+            }),
+            ConfigCmd::SetActuatorLimits {
+                joint: 3,
+                max_torque_nm: 1.4,
+                max_velocity_rad_s: 6.5,
+            },
+            ConfigCmd::SetImpactConfig(ImpactWireConfig {
+                torque_capable: true,
+                k_o: 90.0,
+                threshold_nm: 0.25,
+                debounce_ticks: 3,
+                refractory_s: 0.1,
+                current_spike_ma: 250.0,
+                ma_per_nm: 1000.0,
+            }),
+        ];
+        for cfg in cmds {
+            let pkt = HostToMcu {
+                config: cfg,
+                ..Default::default()
+            };
+            let n = encode_cobs(&pkt, &mut wire).expect("encode").len();
+            let decoded = decode_host_cobs(&mut wire[..n]).expect("decode");
+            assert_eq!(decoded.config, cfg);
+        }
+
+        let bad_gait = HostToMcu {
+            config: ConfigCmd::SetUvcGait(UvcGaitConfig {
+                max_foot_lift: f32::NAN,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let n = encode_cobs(&bad_gait, &mut wire).expect("encode").len();
+        assert_eq!(decode_host_cobs(&mut wire[..n]), Err(CodecError::NonFiniteFloat));
+
+        let bad_limits = HostToMcu {
+            config: ConfigCmd::SetActuatorLimits {
+                joint: 0,
+                max_torque_nm: f32::INFINITY,
+                max_velocity_rad_s: 5.0,
+            },
+            ..Default::default()
+        };
+        let n = encode_cobs(&bad_limits, &mut wire).expect("encode").len();
+        assert_eq!(decode_host_cobs(&mut wire[..n]), Err(CodecError::NonFiniteFloat));
     }
 }

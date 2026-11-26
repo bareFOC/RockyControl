@@ -1006,6 +1006,154 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
                 self.host.model_mut().walk_cmd = w;
                 self.ok_json(name, format!("cadence={:.2}Hz", w.cadence_hz), self.balance_json())
             }
+            "uvc_gait_get" => {
+                let g = self.host.model().uvc_gait;
+                self.ok_json(name, "read", json!({
+                    "max_foot_lift": g.max_foot_lift,
+                    "max_sway": g.max_sway,
+                    "max_dx": g.max_dx,
+                    "max_dy": g.max_dy,
+                    "max_swing_dx": g.max_swing_dx,
+                    "max_swing_dy": g.max_swing_dy,
+                    "step_duration_s": g.step_duration_s,
+                    "toe_push_off_gain": g.toe_push_off_gain,
+                    "waist_balance_gain": g.waist_balance_gain,
+                    "arm_swing_gain": g.arm_swing_gain,
+                }))
+            }
+            "uvc_gait_set" => {
+                let mut g = self.host.model().uvc_gait;
+                let updates: [(&str, f32, f32, &mut f32); 10] = [
+                    ("max_foot_lift", 0.005, 0.15, &mut g.max_foot_lift),
+                    ("max_sway", 0.005, 0.12, &mut g.max_sway),
+                    ("max_dx", 0.01, 0.25, &mut g.max_dx),
+                    ("max_dy", 0.01, 0.25, &mut g.max_dy),
+                    ("max_swing_dx", 0.01, 0.30, &mut g.max_swing_dx),
+                    ("max_swing_dy", 0.01, 0.30, &mut g.max_swing_dy),
+                    ("step_duration_s", 0.16, 0.45, &mut g.step_duration_s),
+                    ("toe_push_off_gain", 0.0, 0.60, &mut g.toe_push_off_gain),
+                    ("waist_balance_gain", 0.0, 1.0, &mut g.waist_balance_gain),
+                    ("arm_swing_gain", 0.0, 2.0, &mut g.arm_swing_gain),
+                ];
+                for (key, lo, hi, field) in updates {
+                    match Self::finite_f32(args, key, lo, hi) {
+                        Ok(Some(v)) => *field = v,
+                        Ok(None) => {}
+                        Err(e) => {
+                            let raw = args.get(key).cloned().unwrap_or(Value::Null);
+                            return self.invalid_gain_result(name, key, raw, lo, hi, e);
+                        }
+                    }
+                }
+                self.host.model_mut().update_uvc_gait(g);
+                if self.host.is_connected() {
+                    self.host.step_ticks(2, 0.01);
+                }
+                let g = self.host.model().uvc_gait;
+                self.ok_json(name, "updated uvc gait", json!({
+                    "max_foot_lift": g.max_foot_lift,
+                    "max_sway": g.max_sway,
+                    "max_dx": g.max_dx,
+                    "max_dy": g.max_dy,
+                    "max_swing_dx": g.max_swing_dx,
+                    "max_swing_dy": g.max_swing_dy,
+                    "step_duration_s": g.step_duration_s,
+                    "toe_push_off_gain": g.toe_push_off_gain,
+                    "waist_balance_gain": g.waist_balance_gain,
+                    "arm_swing_gain": g.arm_swing_gain,
+                }))
+            }
+            "actuator_set_limits" => {
+                let idx = match self.resolve_joint(args.get("joint").unwrap_or(&Value::Null)) {
+                    Ok(i) => i,
+                    Err(e) => return self.err_result(name, "joint", e),
+                };
+                let cur = self.host.model().calibration[idx];
+                let max_torque_nm = match Self::finite_f32(args, "max_torque_nm", 0.05, 10.0) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => cur.max_torque_nm,
+                    Err(e) => return self.err_result(name, "max_torque_nm", e),
+                };
+                let max_velocity_rad_s =
+                    match Self::finite_f32(args, "max_velocity_rad_s", 0.5, 30.0) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => cur.max_velocity_rad_s,
+                        Err(e) => return self.err_result(name, "max_velocity_rad_s", e),
+                    };
+                self.host
+                    .model_mut()
+                    .update_actuator_limits(idx, max_torque_nm, max_velocity_rad_s);
+                if self.host.is_connected() {
+                    self.host.step_ticks(2, 0.01);
+                }
+                self.ok_json(
+                    name,
+                    format!("joint #{idx} limits updated"),
+                    json!({
+                        "joint": idx,
+                        "max_torque_nm": max_torque_nm,
+                        "max_velocity_rad_s": max_velocity_rad_s,
+                    }),
+                )
+            }
+            "impact_get_config" => {
+                let c = self.host.model().impact_config;
+                self.ok_json(name, "read", json!({
+                    "torque_capable": c.torque_capable,
+                    "k_o": c.k_o,
+                    "threshold_nm": c.threshold_nm,
+                    "debounce_ticks": c.debounce_ticks,
+                    "refractory_s": c.refractory_s,
+                    "current_spike_ma": c.current_spike_ma,
+                    "ma_per_nm": c.ma_per_nm,
+                }))
+            }
+            "impact_set_config" => {
+                let mut c = self.host.model().impact_config;
+                if let Some(b) = args.get("torque_capable").and_then(Value::as_bool) {
+                    c.torque_capable = b;
+                }
+                if let Some(d) = args.get("debounce_ticks").and_then(Value::as_u64) {
+                    c.debounce_ticks = d.clamp(1, 20) as u8;
+                }
+                let updates: [(&str, f32, f32, &mut f32); 5] = [
+                    ("k_o", 1.0, 200.0, &mut c.k_o),
+                    ("threshold_nm", 0.01, 5.0, &mut c.threshold_nm),
+                    ("refractory_s", 0.0, 1.0, &mut c.refractory_s),
+                    ("current_spike_ma", 1.0, 3000.0, &mut c.current_spike_ma),
+                    ("ma_per_nm", 100.0, 5000.0, &mut c.ma_per_nm),
+                ];
+                for (key, lo, hi, field) in updates {
+                    match Self::finite_f32(args, key, lo, hi) {
+                        Ok(Some(v)) => *field = v,
+                        Ok(None) => {}
+                        Err(e) => {
+                            let raw = args.get(key).cloned().unwrap_or(Value::Null);
+                            return self.invalid_gain_result(name, key, raw, lo, hi, e);
+                        }
+                    }
+                }
+                self.host.model_mut().update_impact_config(c);
+                if self.host.is_connected() {
+                    self.host.step_ticks(2, 0.01);
+                }
+                self.ok_json(name, "updated impact config", json!({
+                    "torque_capable": c.torque_capable,
+                    "k_o": c.k_o,
+                    "threshold_nm": c.threshold_nm,
+                    "debounce_ticks": c.debounce_ticks,
+                    "refractory_s": c.refractory_s,
+                    "current_spike_ma": c.current_spike_ma,
+                    "ma_per_nm": c.ma_per_nm,
+                }))
+            }
+            "flash_commit" => {
+                self.host.model_mut().commit_flash();
+                if self.host.is_connected() {
+                    self.host.step_ticks(2, 0.01);
+                }
+                self.ok_json(name, "committed to flash", self.status_json())
+            }
             "mode_set" => {
                 let mode_str = args.get("mode").and_then(Value::as_str).unwrap_or("teach");
                 if self.host.model().is_estop_active() {

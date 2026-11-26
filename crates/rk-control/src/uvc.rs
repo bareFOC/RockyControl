@@ -13,8 +13,8 @@ use core::f32::consts::PI;
 
 use libm::{acosf, asinf, atan2f, cosf, logf, sinf, sqrtf};
 use rk_proto::{
-    BalanceGains, EstimatorTelemetry, ImuState, WalkCmd, classify_fall, estimator_valid,
-    fall_orientation, uvc_phase,
+    BalanceGains, EstimatorTelemetry, ImuState, UvcGaitConfig, WalkCmd, classify_fall,
+    estimator_valid, fall_orientation, uvc_phase,
 };
 use rk_robot_profile::LegGeometry;
 
@@ -215,6 +215,7 @@ pub struct UvcStepOutput {
 #[derive(Clone, Debug)]
 pub struct UvcController {
     geom: LegGeometry,
+    gait: UvcGaitConfig,
     z_up: bool,
     phase: UvcPhase,
     phase_elapsed_sec: f32,
@@ -270,6 +271,18 @@ impl UvcController {
     pub const fn new_for_profile(geom: LegGeometry, z_up: bool) -> Self {
         Self {
             geom,
+            gait: UvcGaitConfig {
+                max_foot_lift: geom.max_foot_lift,
+                max_sway: geom.max_sway,
+                max_dx: geom.max_dx,
+                max_dy: geom.max_dy,
+                max_swing_dx: geom.max_swing_dx,
+                max_swing_dy: geom.max_swing_dy,
+                step_duration_s: 0.18,
+                toe_push_off_gain: 0.18,
+                waist_balance_gain: 0.25,
+                arm_swing_gain: 1.25,
+            },
             z_up,
             phase: UvcPhase::Idle,
             phase_elapsed_sec: 0.0,
@@ -302,6 +315,14 @@ impl UvcController {
 
     pub const fn geometry(&self) -> &LegGeometry {
         &self.geom
+    }
+
+    pub const fn gait_config(&self) -> UvcGaitConfig {
+        self.gait
+    }
+
+    pub fn set_gait_config(&mut self, cfg: UvcGaitConfig) {
+        self.gait = cfg.sanitized();
     }
 
     pub const fn phase(&self) -> UvcPhase {
@@ -529,7 +550,7 @@ impl UvcController {
         let step_dur_nom = if wants_walk {
             walk_step_dur_nom
         } else {
-            0.18_f32
+            self.gait.step_duration_s.clamp(STEP_DUR_MIN_SEC, STEP_DUR_MAX_SEC)
         };
         // Khadiv step-time adaptation: a capture error beyond the usable foot
         // margin shortens both the timer-driven recovery step and the walking
@@ -706,18 +727,18 @@ impl UvcController {
 
                 // Superpose commanded walking stride (`WalkCmd`) onto UVC foot landing target
                 if wants_walk {
-                    let target_walk_x = vx * self.geom.max_dx * 0.68_f32;
+                    let target_walk_x = vx * self.gait.max_dx * 0.68_f32;
                     let lat_sign = if self.support_foot == 0 {
                         -1.0_f32
                     } else {
                         1.0_f32
                     };
-                    let target_walk_y = (vy * lat_sign * self.geom.max_dy * 0.55_f32).max(0.0_f32);
+                    let target_walk_y = (vy * lat_sign * self.gait.max_dy * 0.55_f32).max(0.0_f32);
                     let walk_blend = (dt * 7.5_f32).clamp(0.0_f32, 1.0_f32);
                     self.dxi = (self.dxi + (target_walk_x - self.dxi) * walk_blend)
-                        .clamp(-self.geom.max_dx, self.geom.max_dx);
+                        .clamp(-self.gait.max_dx, self.gait.max_dx);
                     self.dyi = (self.dyi + (target_walk_y - self.dyi) * walk_blend)
-                        .clamp(0.0_f32, self.geom.max_dy);
+                        .clamp(0.0_f32, self.gait.max_dy);
                 }
 
                 // Swing-foot landing ONLY. With a valid DCM channel the capture target
@@ -729,20 +750,20 @@ impl UvcController {
                     1.0_f32
                 };
                 if capture_valid {
-                    self.dxis = capture_sag.clamp(-self.geom.max_swing_dx, self.geom.max_swing_dx);
+                    self.dxis = capture_sag.clamp(-self.gait.max_swing_dx, self.gait.max_swing_dx);
                     // Right-positive world lateral -> outward-from-pelvis on the swing side.
                     // Bidirectional: a negative capture offset places the swing sole
                     // inward instead of clamping it to the nominal hip line. That
                     // removes the one-sided lateral bias that used to push the CoP
                     // away from the body every step.
                     self.dyis = (capture_lat * swing_lat_sign)
-                        .clamp(-self.geom.max_swing_dy, self.geom.max_swing_dy);
+                        .clamp(-self.gait.max_swing_dy, self.gait.max_swing_dy);
                 } else {
                     let dcm_swing_y = dcm.swing_dy_m * swing_lat_sign;
                     self.dxis = (-self.dxi + dcm.swing_dx_m)
-                        .clamp(-self.geom.max_swing_dx, self.geom.max_swing_dx);
+                        .clamp(-self.gait.max_swing_dx, self.gait.max_swing_dx);
                     self.dyis = (self.dyi + dcm_swing_y)
-                        .clamp(-self.geom.max_swing_dy, self.geom.max_swing_dy);
+                        .clamp(-self.gait.max_swing_dy, self.gait.max_swing_dy);
                 }
                 // Keep the swing sole from crossing the stance sole even when
                 // the capture law asks for a large inward placement.
@@ -757,7 +778,7 @@ impl UvcController {
                 } else {
                     // Scale catch-step lift with disturbance magnitude so tiny corrections don't stomp
                     let offset_norm = (sqrtf(self.dxi * self.dxi + self.dyi * self.dyi)
-                        / self.geom.max_dx)
+                        / self.gait.max_dx.max(0.001_f32))
                         .clamp(0.28_f32, 1.0_f32);
                     step_h_scale * offset_norm
                 };
@@ -767,12 +788,12 @@ impl UvcController {
                 // sine lifted too early and landed too late, so the plant saw
                 // 0b00 flight ticks at every steady support swap.
                 let lift_s = sinf(PI * progress);
-                swing_lift_m = self.geom.max_foot_lift * lift_scale * lift_s * lift_s;
+                swing_lift_m = self.gait.max_foot_lift * lift_scale * lift_s * lift_s;
 
                 // Pelvis waist/hip yaw twist (`feetCont1`: wt = 0.5 * atan2(dxi, dyi + half_hip))
                 let wt_geom = 0.35_f32 * atan2f(self.dxi, self.dyi + self.geom.half_hip_spacing);
                 self.waist_yaw = (wt_geom + yaw_cmd * 0.24_f32).clamp(-0.45_f32, 0.45_f32);
-                self.wk = (self.dxi.abs() * 0.33_f32).min(self.geom.max_dx * 0.33_f32);
+                self.wk = (self.dxi.abs() * 0.33_f32).min(self.gait.max_dx * 0.33_f32);
 
                 // Step landing -> swap support/swing foot. While walking the
                 // accumulator already performed the swap at the half-cycle
@@ -816,7 +837,7 @@ impl UvcController {
                 } else if self.phase_elapsed_sec >= 0.22_f32 {
                     // Prepare ReturnToNeutral sway amplitude from residual foot offset
                     let resid = sqrtf(0.5_f32 * self.dxi * self.dxi + self.dyi * self.dyi);
-                    self.sway_max = (resid * 0.65_f32).min(self.geom.max_sway);
+                    self.sway_max = (resid * 0.65_f32).min(self.gait.max_sway);
                     self.ret_start_dxi = self.dxi;
                     self.ret_start_dyi = self.dyi;
                     self.ret_start_dxis = self.dxis;
@@ -839,7 +860,7 @@ impl UvcController {
                 self.auto_h = self.ret_start_h + (target_h - self.ret_start_h) * p;
                 self.waist_yaw = self.ret_start_wt * remain;
                 self.sway = self.sway_max * sinf(PI * p);
-                swing_lift_m = self.geom.max_foot_lift * 0.35_f32 * sinf(PI * p);
+                swing_lift_m = self.gait.max_foot_lift * 0.35_f32 * sinf(PI * p);
 
                 if wants_walk
                     || (walk.balance_enabled
@@ -891,7 +912,7 @@ impl UvcController {
             .clamp(self.geom.min_height, self.geom.nominal_height);
 
         let swg_x = self.dxis;
-        let swg_y = (self.dyis + self.sway).clamp(-self.geom.max_swing_dy, self.geom.max_swing_dy);
+        let swg_y = (self.dyis + self.sway).clamp(-self.gait.max_swing_dy, self.gait.max_swing_dy);
         let swg_h = (self.auto_h - swing_lift_m)
             .clamp(self.geom.min_height * 0.85_f32, self.geom.nominal_height);
 
@@ -932,7 +953,7 @@ impl UvcController {
 
         // Toe push-off on stance foot & dorsiflexion on swing foot during active stepping.
         let toe_push = if wants_walk || walk.walk_enabled {
-            0.18_f32 * sinf(self.gait_phase_rad).max(0.0_f32)
+            self.gait.toe_push_off_gain * sinf(self.gait_phase_rad).max(0.0_f32)
         } else {
             0.0_f32
         };
@@ -945,12 +966,12 @@ impl UvcController {
         }
 
         // Waist pitch/roll balance assist (applied when profile has waist_pitch/waist_roll).
-        let waist_pitch = 0.35_f32 * pitch_corr;
-        let waist_roll = 0.35_f32 * roll_corr;
+        let waist_pitch = self.gait.waist_balance_gain * pitch_corr;
+        let waist_roll = self.gait.waist_balance_gain * roll_corr;
 
         // 7. Arm counter-spread (`armCont` proportional to lateral step offset + sagittal lean)
-        let arm_gain = gains.arm_assist.clamp(0.0_f32, 1.5_f32);
-        let lat_ratio = (self.dyis / self.geom.max_swing_dy.max(0.01_f32)).clamp(0.0_f32, 1.0_f32);
+        let arm_gain = (gains.arm_assist * self.gait.arm_swing_gain).clamp(0.0_f32, 3.0_f32);
+        let lat_ratio = (self.dyis / self.gait.max_swing_dy.max(0.01_f32)).clamp(0.0_f32, 1.0_f32);
         let spread = arm_gain * (0.48_f32 * lat_ratio + 0.32_f32 * raw_roll.abs());
         let sag_swing = arm_gain * (0.45_f32 * raw_pitch);
 
@@ -1039,7 +1060,7 @@ impl UvcController {
         let cos_k_lat = cosf(k_lat).max(0.25_f32);
         let kl_lat = h_safe / cos_k_lat;
         let ks_lat = (k_lat + roll_t).clamp(-0.75_f32, 0.75_f32);
-        self.dyi = (kl_lat * sinf(ks_lat) + self.sway).clamp(0.0_f32, self.geom.max_dy);
+        self.dyi = (kl_lat * sinf(ks_lat) + self.sway).clamp(0.0_f32, self.gait.max_dy);
         let h_after_lat = (kl_lat * cosf(ks_lat)).max(self.geom.min_height);
 
         // Sagittal spherical projection: rotate (dxi, auto_h) by pitch_t
@@ -1047,7 +1068,7 @@ impl UvcController {
         let cos_k_sag = cosf(k_sag).max(0.25_f32);
         let kl_sag = h_after_lat / cos_k_sag;
         let ks_sag = (k_sag + pitch_t).clamp(-0.75_f32, 0.75_f32);
-        self.dxi = (kl_sag * sinf(ks_sag)).clamp(-self.geom.max_dx, self.geom.max_dx);
+        self.dxi = (kl_sag * sinf(ks_sag)).clamp(-self.gait.max_dx, self.gait.max_dx);
         self.auto_h = (kl_sag * cosf(ks_sag)).clamp(self.geom.min_height, self.geom.nominal_height);
     }
 

@@ -297,6 +297,80 @@ pub fn tool_definitions() -> Vec<Value> {
             ),
             Effect::Edits,
         ),
+        tool(
+            "uvc_gait_get",
+            "Get Runtime UVC Gait Config",
+            "Returns the active runtime UVC gait and swing parameters.",
+            object(json!({}), &[]),
+            Effect::ReadOnly,
+        ),
+        tool(
+            "uvc_gait_set",
+            "Tune Runtime UVC Gait Config",
+            "Updates one or more runtime UVC gait & swing parameters and queues ConfigCmd::SetUvcGait to the MCU.",
+            object(
+                json!({
+                    "max_foot_lift": num("Peak swing foot lift in meters (0.005..=0.15)"),
+                    "max_sway": num("Max lateral pelvis sway in meters (0.005..=0.12)"),
+                    "max_dx": num("Max sagittal support offset in meters (0.01..=0.25)"),
+                    "max_dy": num("Max lateral support offset in meters (0.01..=0.25)"),
+                    "max_swing_dx": num("Max sagittal swing offset in meters (0.01..=0.30)"),
+                    "max_swing_dy": num("Max lateral swing offset in meters (0.01..=0.30)"),
+                    "step_duration_s": num("Nominal catch-step duration in seconds (0.16..=0.45)"),
+                    "toe_push_off_gain": num("Toe push-off pitch gain (0.0..=0.60)"),
+                    "waist_balance_gain": num("Waist pitch/roll balance coupling gain (0.0..=1.0)"),
+                    "arm_swing_gain": num("Arm swing/counter-spread multiplier (0.0..=2.0)")
+                }),
+                &[],
+            ),
+            Effect::Edits,
+        ),
+        tool(
+            "actuator_set_limits",
+            "Set Joint Actuator Limits",
+            "Updates per-joint torque and velocity limits (clamped to hardware bounds) via ConfigCmd::SetActuatorLimits.",
+            object(
+                json!({
+                    "joint": joint_ref("Joint index (0..N-1) or exact joint name"),
+                    "max_torque_nm": num("Max torque limit in N*m (0.05..=10.0)"),
+                    "max_velocity_rad_s": num("Max velocity limit in rad/s (0.5..=30.0)")
+                }),
+                &["joint"],
+            ),
+            Effect::Edits,
+        ),
+        tool(
+            "impact_get_config",
+            "Get Combat Impact Config",
+            "Returns the active combat impact detector parameters.",
+            object(json!({}), &[]),
+            Effect::ReadOnly,
+        ),
+        tool(
+            "impact_set_config",
+            "Configure Combat Impact Detector",
+            "Updates combat impact detector parameters and queues ConfigCmd::SetImpactConfig to the MCU.",
+            object(
+                json!({
+                    "torque_capable": boolean("Use momentum observer (true) or v1 current spike (false)"),
+                    "k_o": num("Observer gain K_O in s^-1 (1.0..=200.0)"),
+                    "threshold_nm": num("Residual threshold in N*m (0.01..=5.0)"),
+                    "debounce_ticks": integer("Consecutive ticks above threshold (1..=20)"),
+                    "refractory_s": num("Refractory suppression window in seconds (0.0..=1.0)"),
+                    "current_spike_ma": num("Current jump threshold in mA (1.0..=3000.0)"),
+                    "ma_per_nm": num("mA per N*m conversion factor (100.0..=5000.0)")
+                }),
+                &[],
+            ),
+            Effect::Edits,
+        ),
+        tool(
+            "flash_commit",
+            "Commit Calibration & Tuning to Flash",
+            "Queues ConfigCmd::CommitFlash to persist calibration, balance gains, UVC gait config, and impact config to MCU flash.",
+            object(json!({}), &[]),
+            Effect::Edits,
+        ),
         // --- Safety & Authority Control ---
         tool(
             "mode_set",

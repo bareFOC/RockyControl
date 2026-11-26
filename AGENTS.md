@@ -24,3 +24,4 @@
 - Verify with `cargo test` across host crates, `cargo test --manifest-path firmware/Cargo.toml -p rk-fw-core`, and thumb-target `cargo check` for RP2350 feature sets before declaring work complete.
 - Keep changes focused and avoid adding dependencies unless clearly justified.
 - Always use the ask tool (`ask_question`) for open questions and to clarify doubts.
+- Use professional and concise language in documentation and responses; avoid promotional and marketing style.

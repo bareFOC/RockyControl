@@ -10,7 +10,7 @@ imu_link = "Chest_1"
 imu_mounting_rpy = [0.0, 0.0, 0.0]
 foot_half_length_m = 0.035
 foot_margin_m = 0.025
-h_com_m = 0.25
+h_com_m = 0.22
 
 [leg_geometry]
 thigh_len = 0.108
@@ -24,7 +24,7 @@ max_dx = 0.050
 max_dy = 0.045
 max_swing_dx = 0.070
 max_swing_dy = 0.060
-max_foot_lift = 0.035
+max_foot_lift = 0.040
 max_sway = 0.025
 
 # 28 actuators across 4 I3C buses:

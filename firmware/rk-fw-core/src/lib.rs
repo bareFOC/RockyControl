@@ -8,6 +8,7 @@
 pub mod config;
 pub mod control_task;
 pub mod copper;
+pub mod flash_config;
 pub mod imu;
 pub mod joint_plant;
 pub mod lsm6dsv;

@@ -516,6 +516,64 @@ impl RockyStudioApp {
                 .text("Cadence"),
         );
 
+        ui.add_space(6.0);
+        ui.collapsing("Runtime UVC Gait & Impact", |ui| {
+            let mut ug = self.model.uvc_gait;
+            let mut ug_changed = false;
+            ug_changed |= ui
+                .add(egui::Slider::new(&mut ug.max_foot_lift, 0.005..=0.15).text("Max Foot Lift (m)"))
+                .changed();
+            ug_changed |= ui
+                .add(egui::Slider::new(&mut ug.max_sway, 0.005..=0.12).text("Max Sway (m)"))
+                .changed();
+            ug_changed |= ui
+                .add(egui::Slider::new(&mut ug.max_dx, 0.01..=0.25).text("Max dx (m)"))
+                .changed();
+            ug_changed |= ui
+                .add(egui::Slider::new(&mut ug.max_dy, 0.01..=0.25).text("Max dy (m)"))
+                .changed();
+            ug_changed |= ui
+                .add(egui::Slider::new(&mut ug.max_swing_dx, 0.01..=0.30).text("Max Swing dx (m)"))
+                .changed();
+            ug_changed |= ui
+                .add(egui::Slider::new(&mut ug.max_swing_dy, 0.01..=0.30).text("Max Swing dy (m)"))
+                .changed();
+            ug_changed |= ui
+                .add(egui::Slider::new(&mut ug.step_duration_s, 0.16..=0.45).text("Step Duration (s)"))
+                .changed();
+            ug_changed |= ui
+                .add(egui::Slider::new(&mut ug.toe_push_off_gain, 0.0..=0.60).text("Toe Push Gain"))
+                .changed();
+            ug_changed |= ui
+                .add(egui::Slider::new(&mut ug.waist_balance_gain, 0.0..=1.0).text("Waist Bal Gain"))
+                .changed();
+            ug_changed |= ui
+                .add(egui::Slider::new(&mut ug.arm_swing_gain, 0.0..=2.0).text("Arm Swing Gain"))
+                .changed();
+            if ug_changed {
+                self.model.update_uvc_gait(ug);
+            }
+
+            ui.separator();
+            let mut ic = self.model.impact_config;
+            let mut ic_changed = false;
+            ic_changed |= ui
+                .add(egui::Slider::new(&mut ic.k_o, 1.0..=200.0).text("Impact K_O"))
+                .changed();
+            ic_changed |= ui
+                .add(egui::Slider::new(&mut ic.threshold_nm, 0.01..=5.0).text("Impact Thresh (Nm)"))
+                .changed();
+            ic_changed |= ui
+                .add(egui::Slider::new(&mut ic.refractory_s, 0.0..=1.0).text("Refractory (s)"))
+                .changed();
+            ic_changed |= ui
+                .add(egui::Slider::new(&mut ic.current_spike_ma, 1.0..=3000.0).text("Spike (mA)"))
+                .changed();
+            if ic_changed {
+                self.model.update_impact_config(ic);
+            }
+        });
+
         ui.add_space(8.0);
         ui.separator();
         ui.label(

@@ -14,7 +14,7 @@
 use core::future::Future;
 
 use rk_control::{JointCalibration, RawServoCommand, RawServoFeedback};
-use rk_proto::{HostToMcu, MAX_JOINTS, McuToHost};
+use rk_proto::{BalanceGains, HostToMcu, ImpactWireConfig, MAX_JOINTS, McuToHost, UvcGaitConfig};
 
 use crate::config::{CONTROL_DT_SEC, DEFAULT_JOINT_COUNT};
 use crate::copper::{ControlTask, ControlTick};
@@ -53,6 +53,24 @@ pub trait RobotIo {
     fn calibration(&self) -> [JointCalibration; MAX_JOINTS] {
         [JointCalibration::default(); MAX_JOINTS]
     }
+
+    /// Optional persisted balance gains loaded at boot.
+    fn initial_balance_gains(&self) -> Option<BalanceGains> {
+        None
+    }
+
+    /// Optional persisted UVC gait config loaded at boot.
+    fn initial_uvc_gait(&self) -> Option<UvcGaitConfig> {
+        None
+    }
+
+    /// Optional persisted impact config loaded at boot.
+    fn initial_impact_config(&self) -> Option<ImpactWireConfig> {
+        None
+    }
+
+    /// Called when `ConfigCmd::CommitFlash` increments `flash_commit_count`.
+    fn on_flash_commit(&mut self, _control: &ControlTask) {}
 
     /// Takes the freshest pending host command (latest-wins), if any.
     fn take_cmd(&mut self) -> Option<HostToMcu>;
@@ -106,6 +124,22 @@ impl<T: RobotIo + ?Sized> RobotIo for &mut T {
         (**self).calibration()
     }
 
+    fn initial_balance_gains(&self) -> Option<BalanceGains> {
+        (**self).initial_balance_gains()
+    }
+
+    fn initial_uvc_gait(&self) -> Option<UvcGaitConfig> {
+        (**self).initial_uvc_gait()
+    }
+
+    fn initial_impact_config(&self) -> Option<ImpactWireConfig> {
+        (**self).initial_impact_config()
+    }
+
+    fn on_flash_commit(&mut self, control: &ControlTask) {
+        (**self).on_flash_commit(control);
+    }
+
     fn take_cmd(&mut self) -> Option<HostToMcu> {
         (**self).take_cmd()
     }
@@ -147,9 +181,13 @@ pub fn step_control_tick<I: RobotIo>(io: &mut I, control: &mut ControlTask) {
     let wire_errors = io.wire_error_counts();
     let fb = io.read_feedback(dt_sec);
 
+    let prev_commits = control.kernel().flash_commit_count();
     let (step, tick) =
         control.step_recorded(now_ms, dt_sec, cmd.as_ref(), &fb, wire_errors);
 
+    if control.kernel().flash_commit_count() != prev_commits {
+        io.on_flash_commit(control);
+    }
     io.write_command(&step.servo_cmd);
     io.publish_telemetry(step.telemetry);
     io.record_tick(&tick);
@@ -162,6 +200,15 @@ pub fn step_control_tick<I: RobotIo>(io: &mut I, control: &mut ControlTask) {
 /// (kernel construction, fixed dt, tick fan-out) lives here.
 pub async fn control_task<I: RobotIo>(mut io: I) {
     let mut control = ControlTask::new_with_profile(io.profile(), &io.calibration());
+    if let Some(gains) = io.initial_balance_gains() {
+        control.kernel_mut().set_balance_gains(gains);
+    }
+    if let Some(gait) = io.initial_uvc_gait() {
+        control.kernel_mut().set_uvc_gait_config(gait);
+    }
+    if let Some(impact) = io.initial_impact_config() {
+        control.kernel_mut().set_impact_wire_config(impact);
+    }
     loop {
         io.wait_tick().await;
         step_control_tick(&mut io, &mut control);

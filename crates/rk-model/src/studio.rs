@@ -2,8 +2,8 @@
 
 use rk_control::{DEFAULT_MAX_TORQUE_NM, JointCalibration};
 use rk_proto::{
-    BalanceGains, ConfigCmd, ControlMode, FaultFlags, HostToMcu, JointCommandMode, MAX_JOINTS,
-    McuToHost, PROTOCOL_VERSION, WalkCmd,
+    BalanceGains, ConfigCmd, ControlMode, FaultFlags, HostToMcu, ImpactWireConfig,
+    JointCommandMode, MAX_JOINTS, McuToHost, PROTOCOL_VERSION, UvcGaitConfig, WalkCmd,
 };
 use serde::{Deserialize, Serialize};
 
@@ -646,6 +646,8 @@ pub struct StudioModel {
     pub recovery_playback: bool,
     pub walk_cmd: WalkCmd,
     pub balance_gains: BalanceGains,
+    pub uvc_gait: UvcGaitConfig,
+    pub impact_config: ImpactWireConfig,
     pub pending_config: Vec<ConfigCmd>,
     pub tx_seq: u32,
     pub status_message: String,
@@ -693,6 +695,8 @@ impl StudioModel {
             recovery_playback: false,
             walk_cmd: WalkCmd::default(),
             balance_gains: BalanceGains::default(),
+            uvc_gait: UvcGaitConfig::default(),
+            impact_config: ImpactWireConfig::default(),
             pending_config: Vec::new(),
             tx_seq: 0,
             status_message: "Ready in Teach mode (Torque OFF). Press Space at any time for E-Stop."
@@ -811,6 +815,45 @@ impl StudioModel {
     pub fn update_balance_gains(&mut self, gains: BalanceGains) {
         self.balance_gains = gains;
         self.pending_config.push(ConfigCmd::SetBalanceGains(gains));
+    }
+
+    /// Updates runtime UVC gait & swing parameters and queues `ConfigCmd::SetUvcGait`.
+    pub fn update_uvc_gait(&mut self, cfg: UvcGaitConfig) {
+        let sanitized = cfg.sanitized();
+        self.uvc_gait = sanitized;
+        self.pending_config.push(ConfigCmd::SetUvcGait(sanitized));
+    }
+
+    /// Updates per-joint actuator torque/velocity limits and queues `ConfigCmd::SetActuatorLimits`.
+    pub fn update_actuator_limits(
+        &mut self,
+        joint: usize,
+        max_torque_nm: f32,
+        max_velocity_rad_s: f32,
+    ) {
+        if let Some(cal) = self.calibration.get_mut(joint) {
+            let t = max_torque_nm.max(0.05);
+            let v = max_velocity_rad_s.max(0.5);
+            cal.max_torque_nm = t;
+            cal.max_velocity_rad_s = v;
+            self.pending_config.push(ConfigCmd::SetActuatorLimits {
+                joint: joint as u8,
+                max_torque_nm: t,
+                max_velocity_rad_s: v,
+            });
+        }
+    }
+
+    /// Updates combat impact detector parameters and queues `ConfigCmd::SetImpactConfig`.
+    pub fn update_impact_config(&mut self, cfg: ImpactWireConfig) {
+        self.impact_config = cfg;
+        self.pending_config.push(ConfigCmd::SetImpactConfig(cfg));
+    }
+
+    /// Queues `ConfigCmd::CommitFlash` to persist active calibration and tuning to MCU flash.
+    pub fn commit_flash(&mut self) {
+        self.pending_config.push(ConfigCmd::CommitFlash);
+        self.status_message = "Queued ConfigCmd::CommitFlash to MCU.".to_string();
     }
 
     /// Authority mode toggle enforcing **Mandatory Safety Rule 1 (Bumpless Transfer)**.

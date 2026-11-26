@@ -27,6 +27,7 @@ mod imu_bno055;
 mod imu_lsm6dsv;
 #[cfg(feature = "i3c-servo-bus")]
 mod i3c_simplefoc;
+mod flash_store;
 mod servo_uart;
 mod usb_cdc;
 mod usb_net;
@@ -35,20 +36,22 @@ use defmt::info;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
+use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::Peri;
 use embassy_rp::peripherals::{USB, WATCHDOG};
 use embassy_rp::usb::{Driver as UsbDriver, InterruptHandler as UsbInterruptHandler};
 use embassy_rp::watchdog::Watchdog;
 use embassy_time::{Duration, Instant, Ticker};
-use rk_control::{RawServoCommand, RawServoFeedback};
+use rk_control::{JointCalibration, RawServoCommand, RawServoFeedback};
 use rk_fw_core::config::{CONTROL_PERIOD_MS, HW_WATCHDOG_TIMEOUT_MS};
 use rk_fw_core::control_task::{RobotIo, control_task as shared_control_task};
-use rk_fw_core::copper::current_led_mode;
+use rk_fw_core::copper::{ControlTask, current_led_mode};
+use rk_fw_core::flash_config::PersistedConfig;
 use rk_fw_core::imu::IMU_SLOT;
 use rk_fw_core::servo_bus::SERVO_BUS_SLOT;
 use rk_fw_core::transport::HOST_LINK_MAILBOX;
-use rk_proto::{HostToMcu, McuToHost};
+use rk_proto::{BalanceGains, HostToMcu, ImpactWireConfig, MAX_JOINTS, McuToHost, UvcGaitConfig};
 use panic_probe as _;
 
 // The high-rate LSM6DSV (SPI1) and legacy BNO055 (I2C0) IMUs are mutually
@@ -110,11 +113,43 @@ struct HardwareRobotIo {
     led: Output<'static>,
     watchdog: Watchdog,
     wd_timeout: Duration,
+    boot_config: Option<PersistedConfig>,
 }
 
 impl RobotIo for HardwareRobotIo {
     fn profile(&self) -> &'static rk_robot_profile::RobotProfile {
         active_profile()
+    }
+
+    fn calibration(&self) -> [JointCalibration; MAX_JOINTS] {
+        if let Some(cfg) = self.boot_config {
+            return cfg.calibration;
+        }
+        let p = active_profile();
+        let mut cal = [JointCalibration::default(); MAX_JOINTS];
+        for i in 0..p.joint_count.min(MAX_JOINTS) {
+            cal[i].min_rad = p.default_limits[i][0];
+            cal[i].max_rad = p.default_limits[i][1];
+            cal[i].max_torque_nm = p.max_torque_nm[i];
+            cal[i].max_velocity_rad_s = p.max_velocity_rad_s[i];
+        }
+        cal
+    }
+
+    fn initial_balance_gains(&self) -> Option<BalanceGains> {
+        self.boot_config.map(|c| c.balance_gains)
+    }
+
+    fn initial_uvc_gait(&self) -> Option<UvcGaitConfig> {
+        self.boot_config.map(|c| c.uvc_gait)
+    }
+
+    fn initial_impact_config(&self) -> Option<ImpactWireConfig> {
+        self.boot_config.map(|c| c.impact)
+    }
+
+    fn on_flash_commit(&mut self, control: &ControlTask) {
+        flash_store::request_commit(PersistedConfig::from_kernel(control.kernel()));
     }
 
     async fn wait_tick(&mut self) {
@@ -177,7 +212,11 @@ impl RobotIo for HardwareRobotIo {
 /// the exact same code path. This task only supplies the board I/O adapter and
 /// starts the watchdog.
 #[embassy_executor::task]
-async fn control_task(led: Output<'static>, watchdog: Peri<'static, WATCHDOG>) {
+async fn control_task(
+    led: Output<'static>,
+    watchdog: Peri<'static, WATCHDOG>,
+    boot_config: Option<PersistedConfig>,
+) {
     let wd_timeout = Duration::from_millis(HW_WATCHDOG_TIMEOUT_MS);
     let mut hw_watchdog = Watchdog::new(watchdog);
     hw_watchdog.start(wd_timeout);
@@ -187,6 +226,7 @@ async fn control_task(led: Output<'static>, watchdog: Peri<'static, WATCHDOG>) {
         led,
         watchdog: hw_watchdog,
         wd_timeout,
+        boot_config,
     };
 
     info!("Embassy control runtime started @ 200 Hz (5 ms period) in Teach mode");
@@ -243,6 +283,13 @@ async fn main(spawner: Spawner) {
         usb_net::spawn_usb_net(&spawner, usb_driver);
     }
 
+    // 3b. Load persisted calibration & tuning from QSPI flash before starting control_task,
+    // then hand the flash peripheral to the async writer task.
+    let mut qspi_flash = Flash::<_, Blocking, { flash_store::FLASH_SIZE_BYTES }>::new_blocking(p.FLASH);
+    let boot_config = flash_store::load_boot_config(&mut qspi_flash);
+    spawner
+        .spawn(flash_store::flash_writer_task(qspi_flash).expect("spawn flash_writer_task"));
+
     // 4. Spawn the single deterministic control task. Embassy owns all scheduling.
-    spawner.spawn(control_task(status_led, p.WATCHDOG).expect("spawn control_task"));
+    spawner.spawn(control_task(status_led, p.WATCHDOG, boot_config).expect("spawn control_task"));
 }

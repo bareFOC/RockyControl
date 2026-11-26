@@ -34,9 +34,10 @@ pub use impact::{
     gravity_torque_nm,
 };
 use rk_proto::{
-    BalanceGains, BalanceTelemetry, ConfigCmd, ControlMode, FaultFlags, HostToMcu, ImuState,
-    JointCommandMode, MAX_JOINTS, McuToHost, PROTOCOL_VERSION, RunningConfig, WATCHDOG_TIMEOUT_MS,
-    WalkCmd, classify_fall, estimator_valid, fall_orientation, uvc_phase,
+    BalanceGains, BalanceTelemetry, ConfigCmd, ControlMode, FaultFlags, HostToMcu,
+    ImpactWireConfig, ImuState, JointCommandMode, MAX_JOINTS, McuToHost, PROTOCOL_VERSION,
+    RunningConfig, UvcGaitConfig, WATCHDOG_TIMEOUT_MS, WalkCmd, classify_fall, estimator_valid,
+    fall_orientation, uvc_phase,
 };
 use serde::{Deserialize, Serialize};
 pub use slip::{FlightDetector, SlipConfig, SlipController, SlipInputs, SlipOutput, SlipPhase};
@@ -359,6 +360,48 @@ impl DirectServoKernel {
         self.balance_gains
     }
 
+    pub fn set_balance_gains(&mut self, gains: BalanceGains) {
+        self.balance_gains = gains;
+    }
+
+    pub const fn uvc_gait_config(&self) -> UvcGaitConfig {
+        self.uvc.gait_config()
+    }
+
+    pub fn set_uvc_gait_config(&mut self, cfg: UvcGaitConfig) {
+        self.uvc.set_gait_config(cfg);
+    }
+
+    pub const fn impact_wire_config(&self) -> ImpactWireConfig {
+        let c = self.impact.config();
+        ImpactWireConfig {
+            torque_capable: c.torque_capable,
+            k_o: c.k_o,
+            threshold_nm: c.threshold_nm,
+            debounce_ticks: c.debounce_ticks,
+            refractory_s: c.refractory_s,
+            current_spike_ma: c.current_spike_ma,
+            ma_per_nm: c.ma_per_nm,
+        }
+    }
+
+    pub fn set_impact_wire_config(&mut self, cfg: ImpactWireConfig) {
+        self.impact.set_config(ImpactConfig {
+            torque_capable: cfg.torque_capable,
+            k_o: cfg.k_o,
+            threshold_nm: cfg.threshold_nm,
+            debounce_ticks: cfg.debounce_ticks,
+            refractory_s: cfg.refractory_s,
+            current_spike_ma: cfg.current_spike_ma,
+            ma_per_nm: cfg.ma_per_nm,
+        });
+    }
+
+    pub fn set_calibration(&mut self, cal: &[JointCalibration]) {
+        let n = self.joint_count.min(cal.len());
+        self.calibration[..n].copy_from_slice(&cal[..n]);
+    }
+
     pub fn flash_commit_count(&self) -> u32 {
         self.flash_commit_count
     }
@@ -584,6 +627,34 @@ impl DirectServoKernel {
                             ukemi_torque_scale: g.ukemi_torque_scale.clamp(0.05, 0.50),
                             compliance_scale: g.compliance_scale.clamp(0.10, 1.0),
                         };
+                    }
+                }
+                ConfigCmd::SetUvcGait(g) => {
+                    if g.all_finite() {
+                        self.uvc.set_gait_config(g);
+                    }
+                }
+                ConfigCmd::SetActuatorLimits {
+                    joint,
+                    max_torque_nm,
+                    max_velocity_rad_s,
+                } => {
+                    let idx = joint as usize;
+                    if idx < self.joint_count
+                        && max_torque_nm.is_finite()
+                        && max_velocity_rad_s.is_finite()
+                    {
+                        let hw_max_t = self.profile.max_torque_nm[idx].max(0.05_f32);
+                        let hw_max_v = self.profile.max_velocity_rad_s[idx].max(0.5_f32);
+                        self.calibration[idx].max_torque_nm =
+                            max_torque_nm.clamp(0.05_f32, hw_max_t);
+                        self.calibration[idx].max_velocity_rad_s =
+                            max_velocity_rad_s.clamp(0.5_f32, hw_max_v);
+                    }
+                }
+                ConfigCmd::SetImpactConfig(c) => {
+                    if c.all_finite() {
+                        self.set_impact_wire_config(c);
                     }
                 }
                 ConfigCmd::CommitFlash => {
@@ -1958,5 +2029,57 @@ mod tests {
         assert!(ukemi.telemetry.estimator.ukemi_active);
         assert!(!ukemi.telemetry.balance.impact_detected);
         assert_eq!(ukemi.telemetry.active_mode, ControlMode::Drive);
+    }
+
+    #[test]
+    fn runtime_tuning_cmds_update_uvc_limits_and_impact_with_clamping() {
+        let mut kernel = DirectServoKernel::new(21, &[JointCalibration::default(); MAX_JOINTS]);
+        let fb = RawServoFeedback::default();
+
+        let mut gait = kernel.uvc_gait_config();
+        gait.max_foot_lift = 0.045;
+        gait.step_duration_s = 0.25;
+        gait.toe_push_off_gain = 0.30;
+        gait.waist_balance_gain = 0.50;
+        gait.arm_swing_gain = 1.40;
+        let cmd1 = HostToMcu {
+            seq: 1,
+            config: ConfigCmd::SetUvcGait(gait),
+            ..Default::default()
+        };
+        kernel.step(5, 0.005, Some(&cmd1), &fb);
+        assert_eq!(kernel.uvc_gait_config(), gait);
+
+        let hw_max_t = kernel.profile().max_torque_nm[2];
+        let hw_max_v = kernel.profile().max_velocity_rad_s[2];
+        let cmd2 = HostToMcu {
+            seq: 2,
+            config: ConfigCmd::SetActuatorLimits {
+                joint: 2,
+                max_torque_nm: 999.0,
+                max_velocity_rad_s: 0.1,
+            },
+            ..Default::default()
+        };
+        kernel.step(10, 0.005, Some(&cmd2), &fb);
+        assert_eq!(kernel.calibration()[2].max_torque_nm, hw_max_t);
+        assert_eq!(kernel.calibration()[2].max_velocity_rad_s, 0.5_f32.min(hw_max_v));
+
+        let ic = ImpactWireConfig {
+            torque_capable: true,
+            k_o: 120.0,
+            threshold_nm: 0.35,
+            debounce_ticks: 4,
+            refractory_s: 0.12,
+            current_spike_ma: 350.0,
+            ma_per_nm: 1200.0,
+        };
+        let cmd3 = HostToMcu {
+            seq: 3,
+            config: ConfigCmd::SetImpactConfig(ic),
+            ..Default::default()
+        };
+        kernel.step(15, 0.005, Some(&cmd3), &fb);
+        assert_eq!(kernel.impact_wire_config(), ic);
     }
 }
