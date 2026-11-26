@@ -13,3 +13,4 @@ egui_glow.workspace = true
 glow.workspace = true
 three-d.workspace = true
 three-d-asset.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }

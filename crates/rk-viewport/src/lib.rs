@@ -16,8 +16,8 @@ mod view_cube;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use egui::{Color32, CornerRadius, FontId, Pos2, Rect, Stroke, pos2, vec2};
 use glow::HasContext as _;
@@ -213,6 +213,14 @@ enum ActiveViewportDrag {
     },
 }
 
+/// Encoded PNG screenshot captured from the 3D viewport framebuffer.
+#[derive(Clone, Debug)]
+pub struct ViewportScreenshot {
+    pub width: u32,
+    pub height: u32,
+    pub png_bytes: Vec<u8>,
+}
+
 /// Public handle held by `rk-ui` to render the embedded 3D mirror viewport.
 pub struct HumanoidViewport {
     pub orbit: OrbitState,
@@ -230,6 +238,7 @@ pub struct HumanoidViewport {
     active_drag: Option<ActiveViewportDrag>,
     /// Latest per-foot contact/GRF signal used to mark the rendered feet.
     feet: FootContactState,
+    pending_screenshot: Option<Arc<Mutex<Option<Result<ViewportScreenshot, String>>>>>,
 }
 
 impl Drop for HumanoidViewport {
@@ -264,7 +273,25 @@ impl HumanoidViewport {
             view_cube: ViewCubeState::default(),
             active_drag: None,
             feet: FootContactState::default(),
+            pending_screenshot: None,
         }
+    }
+
+    /// Requests a PNG screenshot of the 3D viewport on the next rendered frame.
+    pub fn request_screenshot(&mut self) {
+        if self.pending_screenshot.is_none() {
+            self.pending_screenshot = Some(Arc::new(Mutex::new(None)));
+        }
+    }
+
+    /// Takes the completed screenshot if the render callback has finished capturing it.
+    pub fn take_screenshot(&mut self) -> Option<Result<ViewportScreenshot, String>> {
+        let slot = self.pending_screenshot.as_ref()?;
+        let result = slot.lock().ok()?.take();
+        if result.is_some() {
+            self.pending_screenshot = None;
+        }
+        result
     }
 
     /// Updates the simulator-only per-foot contact/GRF signal used to mark the
@@ -348,21 +375,24 @@ impl HumanoidViewport {
 
         let world_offset = opts.effective_world_offset();
 
-        // Always fit the robot's bounding sphere cleanly inside the current viewport aspect ratio.
+        // Always fit the robot's bounding sphere cleanly inside the current viewport aspect ratio,
+        // unless custom framing (target/distance) was explicitly set by an agent.
         // The camera follows the plant world position so the walking robot stays framed
         // while the floor grid remains a fixed world-space motion reference.
-        let aspect = (rect.width() / rect.height().max(1.0)).max(0.2);
-        let rig_center = rig.bounds_center();
-        self.orbit.fit_to_bounds(
-            [
-                rig_center[0] + world_offset[0],
-                rig_center[1] + world_offset[1],
-                rig_center[2] + world_offset[2],
-            ],
-            rig.bounds_radius(),
-            aspect,
-            CAMERA_FOV_DEG,
-        );
+        if !self.orbit.custom_framing {
+            let aspect = (rect.width() / rect.height().max(1.0)).max(0.2);
+            let rig_center = rig.bounds_center();
+            self.orbit.fit_to_bounds(
+                [
+                    rig_center[0] + world_offset[0],
+                    rig_center[1] + world_offset[1],
+                    rig_center[2] + world_offset[2],
+                ],
+                rig.bounds_radius(),
+                aspect,
+                CAMERA_FOV_DEG,
+            );
+        }
 
         let (eff_pitch_rad, eff_roll_rad) = opts.effective_imu_tilt();
         // Heading is not yet threaded into viewport options; pass 0.0 until fall visuals land.
@@ -381,7 +411,7 @@ impl HumanoidViewport {
             .map(|(name, iso)| (name.clone(), apply_world_offset(iso, world_offset)))
             .collect();
 
-        let marker_radius = (rig.bounds_radius() * 0.024).clamp(0.012, 0.034);
+        let marker_radius = (rig.bounds_radius() * 0.018).clamp(0.004, 0.026);
         let pick_scale = self.pick_radius_scale.clamp(0.9, 2.0);
         let hit_pad = if self.touch_mode { 0.012 } else { 0.008 } * (pick_scale / 1.25);
 
@@ -697,6 +727,8 @@ impl HumanoidViewport {
         let bundle_files = bundle.files.clone();
         let bundle_source = bundle.source.clone();
         let generation = self.rig_generation;
+        let screenshot_sink = self.pending_screenshot.clone();
+        let egui_ctx = ui.ctx().clone();
 
         let callback = egui_glow::CallbackFn::new(move |info, painter| {
             let gl = painter.gl().clone();
@@ -760,6 +792,17 @@ impl HumanoidViewport {
                     let screen_h = info.screen_size_px[1].max(1);
 
                     res.render(viewport, scissor, screen_w, screen_h, &frame_data);
+
+                    if let Some(sink) = &screenshot_sink {
+                        let should_capture = sink.lock().map(|g| g.is_none()).unwrap_or(false);
+                        if should_capture {
+                            let captured = capture_framebuffer_png(&gl, scissor);
+                            if let Ok(mut guard) = sink.lock() {
+                                *guard = Some(captured);
+                            }
+                            egui_ctx.request_repaint();
+                        }
+                    }
 
                     unsafe {
                         gl.bind_vertex_array(None);
@@ -854,7 +897,7 @@ impl HumanoidViewport {
 
             let grf = if is_left { self.feet.grf_left_n } else { self.feet.grf_right_n };
             let loaded = self.feet.loaded(is_left);
-            let radius = (marker_radius * 1.6).clamp(0.018, 0.05);
+            let radius = (marker_radius * 1.4).clamp(0.006, 0.036);
             // Screen-space radius from world marker size via the camera projection.
             let px = (self.project_world_to_screen(
                 Point3::new(t.x + radius, t.y, t.z),
@@ -1289,4 +1332,85 @@ mod tests {
         assert!(!vp.hits_any_robot_part(pos2(590.0, 400.0), rect));
         assert!(vp.pick_hit_at(pos2(590.0, 400.0), rect).is_none());
     }
+
+    #[test]
+    fn encode_rgba_png_flips_rows_vertically_and_produces_valid_png() {
+        // 2x2 bottom-to-top RGBA buffer: row 0 (bottom) = blue, row 1 (top) = red.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[0, 0, 255, 255, 0, 0, 255, 255]); // bottom row
+        raw.extend_from_slice(&[255, 0, 0, 255, 255, 0, 0, 255]); // top row
+
+        let shot = encode_rgba_png(2, 2, &raw).expect("PNG encode");
+        assert_eq!(shot.width, 2);
+        assert_eq!(shot.height, 2);
+        assert!(shot.png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let decoded = image::load_from_memory_with_format(&shot.png_bytes, image::ImageFormat::Png)
+            .expect("decode PNG")
+            .to_rgba8();
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]); // top-left is red
+        assert_eq!(decoded.get_pixel(0, 1).0, [0, 0, 255, 255]); // bottom-left is blue
+    }
+}
+
+fn capture_framebuffer_png(
+    gl: &glow::Context,
+    scissor: ScissorBox,
+) -> Result<ViewportScreenshot, String> {
+    let w = scissor.width.max(1);
+    let h = scissor.height.max(1);
+    let byte_len = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| "Viewport dimensions overflowed pixel buffer size".to_string())?;
+    let mut raw = vec![0u8; byte_len];
+    unsafe {
+        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+        gl.read_pixels(
+            scissor.x,
+            scissor.y,
+            w as i32,
+            h as i32,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(Some(&mut raw)),
+        );
+    }
+    encode_rgba_png(w, h, &raw)
+}
+
+fn encode_rgba_png(width: u32, height: u32, bottom_up_rgba: &[u8]) -> Result<ViewportScreenshot, String> {
+    use image::ImageEncoder as _;
+    use image::codecs::png::PngEncoder;
+
+    let w = width as usize;
+    let h = height as usize;
+    let row_bytes = w * 4;
+    if bottom_up_rgba.len() != row_bytes * h {
+        return Err(format!(
+            "Unexpected RGBA buffer length {} for {}x{}",
+            bottom_up_rgba.len(),
+            width,
+            height
+        ));
+    }
+
+    let mut top_down = vec![0u8; row_bytes * h];
+    for row in 0..h {
+        let src_start = (h - 1 - row) * row_bytes;
+        let dst_start = row * row_bytes;
+        top_down[dst_start..dst_start + row_bytes]
+            .copy_from_slice(&bottom_up_rgba[src_start..src_start + row_bytes]);
+    }
+
+    let mut png_bytes = Vec::new();
+    PngEncoder::new(&mut png_bytes)
+        .write_image(&top_down, width, height, image::ExtendedColorType::Rgba8)
+        .map_err(|e| format!("PNG encode failed: {e}"))?;
+
+    Ok(ViewportScreenshot {
+        width,
+        height,
+        png_bytes,
+    })
 }

@@ -1,5 +1,7 @@
 //! Bidirectional mirroring authority state machine (`StudioModel`), keyframes, and cubic Hermite playback.
 
+use std::collections::VecDeque;
+
 use rk_control::{DEFAULT_MAX_TORQUE_NM, JointCalibration};
 use rk_proto::{
     BalanceGains, ConfigCmd, ControlMode, FaultFlags, HostToMcu, ImpactWireConfig,
@@ -614,6 +616,18 @@ pub fn default_recovery_library(rig: &KinematicRig) -> Vec<ActionMove> {
     ]
 }
 
+/// Maximum number of recent events retained in [`StudioModel::events`].
+pub const MAX_STUDIO_EVENTS: usize = 64;
+
+/// Timestamped studio/MCU lifecycle event recorded in [`StudioModel::events`].
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StudioEvent {
+    pub seq: u64,
+    pub uptime_ms: u32,
+    pub kind: String,
+    pub detail: String,
+}
+
 /// Calibration persistence file format.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CalibrationFile {
@@ -651,6 +665,9 @@ pub struct StudioModel {
     pub pending_config: Vec<ConfigCmd>,
     pub tx_seq: u32,
     pub status_message: String,
+    /// Bounded ring buffer of recent mode, fault, E-Stop, abort, and URDF events.
+    pub events: VecDeque<StudioEvent>,
+    next_event_seq: u64,
 }
 
 impl StudioModel {
@@ -701,7 +718,30 @@ impl StudioModel {
             tx_seq: 0,
             status_message: "Ready in Teach mode (Torque OFF). Press Space at any time for E-Stop."
                 .to_string(),
+            events: VecDeque::with_capacity(MAX_STUDIO_EVENTS),
+            next_event_seq: 0,
         }
+    }
+
+    /// Appends a timestamped event to the bounded [`MAX_STUDIO_EVENTS`] ring buffer.
+    pub fn record_event(&mut self, kind: impl Into<String>, detail: impl Into<String>) {
+        if self.events.len() >= MAX_STUDIO_EVENTS {
+            self.events.pop_front();
+        }
+        self.next_event_seq += 1;
+        self.events.push_back(StudioEvent {
+            seq: self.next_event_seq,
+            uptime_ms: self.latest_telemetry.uptime_ms,
+            kind: kind.into(),
+            detail: detail.into(),
+        });
+    }
+
+    /// Returns up to `limit` most recent events in chronological order.
+    pub fn recent_events(&self, limit: usize) -> Vec<StudioEvent> {
+        let len = self.events.len();
+        let skip = len.saturating_sub(limit);
+        self.events.iter().skip(skip).cloned().collect()
     }
 
     /// Clears host-side sequencing state that must not leak into a scripted
@@ -769,8 +809,16 @@ impl StudioModel {
             rig.up_axis.label(),
             rig.links.len(),
         );
+        let event_detail = format!(
+            "Loaded '{}' ({} DoF, {} links, {})",
+            rig.robot_name,
+            rig.joints.len(),
+            rig.links.len(),
+            bundle.source.label()
+        );
         self.bundle = bundle;
         self.rig = rig;
+        self.record_event("urdf_loaded", event_detail);
         Ok(())
     }
 
@@ -795,6 +843,7 @@ impl StudioModel {
         self.walk_cmd.yaw_rate = 0.0;
         self.status_message =
             "E-STOP ACTIVE — Torque forced OFF. Click Reset E-Stop to return to Teach.".to_string();
+        self.record_event("estop_triggered", "E-Stop triggered (Torque forced OFF)");
     }
 
     /// Explicit operator confirmation: clears faults and returns strictly to `Teach` (never directly to `Drive`).
@@ -808,6 +857,7 @@ impl StudioModel {
         self.walk_cmd.yaw_rate = 0.0;
         self.target_rad = self.latest_telemetry.measured_rad;
         self.pending_config.push(ConfigCmd::ClearFaults);
+        self.record_event("estop_reset", "E-Stop reset to Teach (ClearFaults queued)");
         self.status_message = "E-Stop reset -> Teach mode (Torque OFF).".to_string();
     }
 
@@ -861,6 +911,7 @@ impl StudioModel {
         if self.is_estop_active() && mode != ControlMode::EStop {
             return;
         }
+        let prev_mode = self.requested_mode;
         if mode == ControlMode::Drive && self.requested_mode != ControlMode::Drive {
             for i in 0..self.rig.joints.len() {
                 self.target_rad[i] = self.latest_telemetry.measured_rad[i];
@@ -873,6 +924,9 @@ impl StudioModel {
             self.status_message = "Switched to Teach mode (Robot -> GUI, Torque OFF).".to_string();
         }
         self.requested_mode = mode;
+        if prev_mode != mode {
+            self.record_event("mode_transition", format!("{prev_mode:?} -> {mode:?}"));
+        }
     }
 
     /// Enables or disables torque on a single joint while enforcing bumpless sync when enabling.
@@ -970,6 +1024,7 @@ impl StudioModel {
         self.walk_cmd.walk_enabled = false;
         self.target_rad = self.latest_telemetry.measured_rad;
         self.status_message = format!("'{name}' ABORTED ({reason}) — recovery handoff.");
+        self.record_event("action_aborted", format!("'{name}' aborted: {reason}"));
     }
 
     /// Sets the current raw angle of `joint` as zero offset via `ConfigCmd::SetZeroOffset`.
@@ -1114,6 +1169,8 @@ impl StudioModel {
     }
 
     pub fn ingest_telemetry(&mut self, telem: McuToHost) {
+        let prev_mode = self.latest_telemetry.active_mode;
+        let prev_faults = self.latest_telemetry.faults;
         let fault_abort = telem.active_mode == ControlMode::EStop
             || telem.faults.intersects(
                 FaultFlags::ESTOP_ACTIVE
@@ -1122,6 +1179,19 @@ impl StudioModel {
             );
         let tilt_abort = Self::tilt_breach(&telem, &self.balance_gains);
         self.latest_telemetry = telem;
+
+        if telem.active_mode != prev_mode {
+            self.record_event(
+                "mcu_mode_transition",
+                format!("{prev_mode:?} -> {:?}", telem.active_mode),
+            );
+        }
+        let newly_latched = telem.faults & !prev_faults;
+        if !newly_latched.is_empty() {
+            self.record_event("fault_latched", format!("{newly_latched:?}"));
+        } else if !prev_faults.is_empty() && telem.faults.is_empty() {
+            self.record_event("faults_cleared", "All MCU faults cleared");
+        }
 
         // Only an action playback is aborted here. Approved get-up playback is
         // intentionally allowed to exceed the normal tilt bound; its safety gates
@@ -1470,5 +1540,46 @@ mod tests {
         };
         check_lib(default_recovery_library(&model.rig), "recovery");
         check_lib(default_combat_library(&model.rig), "combat");
+    }
+
+    #[test]
+    fn event_ring_buffer_records_lifecycle_and_enforces_bound() {
+        let mut model = StudioModel::new_default();
+        assert!(model.events.is_empty());
+
+        model.set_authority_mode(ControlMode::Drive);
+        assert!(model.events.iter().any(|e| e.kind == "mode_transition"));
+
+        model.trigger_estop();
+        assert!(model.events.iter().any(|e| e.kind == "estop_triggered"));
+        model.reset_estop();
+        assert!(model.events.iter().any(|e| e.kind == "estop_reset"));
+
+        let mut telem = model.latest_telemetry;
+        telem.uptime_ms = 1234;
+        telem.faults = FaultFlags::OVER_CURRENT;
+        model.ingest_telemetry(telem);
+        assert!(
+            model
+                .events
+                .iter()
+                .any(|e| e.kind == "fault_latched" && e.uptime_ms == 1234)
+        );
+
+        model.abort_playback("unit test abort");
+        assert!(model.events.iter().any(|e| e.kind == "action_aborted"));
+
+        let bundle = AssetBundle::bundled_humanoid();
+        model.load_bundle(bundle).expect("load bundled humanoid");
+        assert!(model.events.iter().any(|e| e.kind == "urdf_loaded"));
+
+        // Verify bounded capacity (MAX_STUDIO_EVENTS = 64).
+        for i in 0..80 {
+            model.record_event("mode_transition", format!("step {i}"));
+        }
+        assert_eq!(model.events.len(), MAX_STUDIO_EVENTS);
+        let tail = model.recent_events(5);
+        assert_eq!(tail.len(), 5);
+        assert_eq!(tail.last().unwrap().detail, "step 79");
     }
 }

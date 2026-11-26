@@ -335,8 +335,13 @@ fn build_visual_items(
     for vis in &rig.visuals {
         let (solid_cpu, wire_cpu, _pick_radius) = build_link_meshes(vis, bundle, rig.up_axis);
 
-        let is_accent = vis.link_name.contains("forearm") || vis.link_name.contains("shoulder");
-        let is_metal_joint = vis.link_name.contains("hip") || vis.link_name.contains("neck");
+        let lower = vis.link_name.to_ascii_lowercase();
+        let is_accent = lower.contains("forearm") || lower.contains("shoulder");
+        let is_metal_joint = lower.contains("hip")
+            || lower.contains("neck")
+            || lower.contains("knee")
+            || lower.contains("elbow")
+            || lower.contains("ankle");
         let solid_mat = PhysicalMaterial::new_opaque(
             ctx,
             &CpuMaterial {
@@ -347,13 +352,13 @@ fn build_visual_items(
                     255,
                 ),
                 roughness: if is_metal_joint {
-                    0.30
+                    0.35
                 } else if is_accent {
-                    0.38
+                    0.48
                 } else {
-                    0.52
+                    0.62
                 },
-                metallic: if is_metal_joint { 0.72 } else { 0.35 },
+                metallic: if is_metal_joint { 0.65 } else { 0.06 },
                 ..Default::default()
             },
         );
@@ -457,7 +462,7 @@ fn build_link_meshes(
                     let _ = cpu_mesh.transform(Mat4::from_nonuniform_scale(
                         scale[0], scale[1], scale[2],
                     ));
-                    cpu_mesh.compute_normals();
+                    compute_smooth_stl_normals(&mut cpu_mesh);
                     let aabb = cpu_mesh.compute_aabb();
                     let sz = aabb.size();
                     let hx = (sz.x * 0.5).max(0.02);
@@ -478,6 +483,60 @@ fn build_link_meshes(
             (fallback, wire, 0.07)
         }
     }
+}
+
+/// Computes angle-aware smooth normals for unindexed STL triangle soups by welding
+/// coincident vertices within a 50-degree crease threshold.
+fn compute_smooth_stl_normals(cpu_mesh: &mut CpuMesh) {
+    cpu_mesh.compute_normals();
+    if !matches!(cpu_mesh.indices, three_d_asset::Indices::None) {
+        return;
+    }
+    let positions = cpu_mesh.positions.to_f32();
+    let Some(face_normals) = cpu_mesh.normals.as_ref() else {
+        return;
+    };
+    if positions.len() != face_normals.len() || positions.is_empty() {
+        return;
+    }
+
+    let mut groups: HashMap<[i32; 3], Vec<usize>> = HashMap::with_capacity(positions.len() / 3);
+    for (idx, p) in positions.iter().enumerate() {
+        let key = [
+            (p.x * 10_000.0).round() as i32,
+            (p.y * 10_000.0).round() as i32,
+            (p.z * 10_000.0).round() as i32,
+        ];
+        groups.entry(key).or_default().push(idx);
+    }
+
+    const CREASE_COS: f32 = 0.6428; // cos(50 deg)
+    let mut smooth = Vec::with_capacity(face_normals.len());
+    for (idx, p) in positions.iter().enumerate() {
+        let n_self = face_normals[idx];
+        let key = [
+            (p.x * 10_000.0).round() as i32,
+            (p.y * 10_000.0).round() as i32,
+            (p.z * 10_000.0).round() as i32,
+        ];
+        let mut acc = vec3(0.0, 0.0, 0.0);
+        if let Some(neighbors) = groups.get(&key) {
+            for &nb in neighbors {
+                let n_nb = face_normals[nb];
+                let dot = n_self.x * n_nb.x + n_self.y * n_nb.y + n_self.z * n_nb.z;
+                if dot >= CREASE_COS {
+                    acc += n_nb;
+                }
+            }
+        }
+        let len2 = acc.x * acc.x + acc.y * acc.y + acc.z * acc.z;
+        smooth.push(if len2 > 1e-10 {
+            acc / len2.sqrt()
+        } else {
+            n_self
+        });
+    }
+    cpu_mesh.normals = Some(smooth);
 }
 
 /// Builds a crisp 12-edge 3D wireframe cage compatible with both Desktop OpenGL and WebGL2.

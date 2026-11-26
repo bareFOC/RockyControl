@@ -102,14 +102,43 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "viewport_camera",
             "Orient 3D Camera",
-            "Snaps the 3D viewport camera to a standard orthographic/isometric preset or refits the active robot.",
+            "Snaps the 3D viewport camera to a standard orthographic/isometric preset, refits the active robot, or applies custom orbit target/distance/yaw/pitch.",
             object(
                 json!({
-                    "preset": enum_str("Camera preset", CAMERA_PRESETS)
+                    "preset": enum_str("Optional camera preset", CAMERA_PRESETS),
+                    "target": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "description": "Optional [x, y, z] orbit target in meters"
+                    },
+                    "distance": num("Optional camera distance from target in meters"),
+                    "yaw_deg": num("Optional horizontal azimuth angle in degrees"),
+                    "pitch_deg": num("Optional elevation pitch angle in degrees")
                 }),
-                &["preset"],
+                &[],
             ),
             Effect::Edits,
+        ),
+        tool(
+            "viewport_inspect",
+            "Inspect 3D Viewport & Rig",
+            "Returns live 3D camera state (or null in headless CLI mode), rig bounding sphere, per-link world positions, and URDF mesh resolution diagnostics.",
+            object(json!({}), &[]),
+            Effect::ReadOnly,
+        ),
+        tool(
+            "viewport_screenshot",
+            "Capture 3D Viewport Screenshot",
+            "Captures a PNG screenshot of the live 3D viewport on the next rendered frame. Returns base64-encoded PNG image content and dimensions, or writes to a confined path when `path` is provided.",
+            object(
+                json!({
+                    "path": string("Optional output file path inside --automation-write-root (native CLI only)")
+                }),
+                &[],
+            ),
+            Effect::ReadOnly,
         ),
         tool(
             "telemetry_snapshot",
@@ -128,6 +157,25 @@ pub fn tool_definitions() -> Vec<Value> {
             "Read Walk Quality Snapshot",
             "Returns all 14 accumulated walk-quality metrics (speed, tilt, CoM height/drift, foot slip, GRF, support counts, currents, margins and contact swaps) plus the acceptance `bounds`, per-metric `violations` and `pass` verdict. Metrics are null on wired transports.",
             object(json!({}), &[]),
+            Effect::ReadOnly,
+        ),
+        tool(
+            "diagnostics_snapshot",
+            "Read Diagnostics Snapshot",
+            "Returns wire errors, faults, active mode, estimator CoM/DCM/ZMP/foot-margin/GRF/contact/ukemi/fall state, and per-joint current/temp/limit-clamped summary in one call.",
+            object(json!({}), &[]),
+            Effect::ReadOnly,
+        ),
+        tool(
+            "events_tail",
+            "Tail Recent Studio Events",
+            "Returns the most recent timestamped mode transitions, fault latches, E-Stop triggers, action aborts, and URDF loads from the StudioModel ring buffer.",
+            object(
+                json!({
+                    "limit": integer("Optional max number of recent events to return (default 20, max 64)")
+                }),
+                &[],
+            ),
             Effect::ReadOnly,
         ),
         // --- Robot Model & Configuration ---

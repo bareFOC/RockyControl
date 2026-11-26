@@ -19,8 +19,8 @@ pub use kinematics::{
     JointKind, JointMeta, KinematicRig, LimbGroup, LinkSummary, LinkVisual, UpAxis, VisualShape,
 };
 pub use studio::{
-    ActionMove, CalibrationFile, Keyframe, PlaybackState, StudioModel, cubic_smoothstep,
-    default_combat_library, sample_action_move,
+    ActionMove, CalibrationFile, Keyframe, MAX_STUDIO_EVENTS, PlaybackState, StudioEvent,
+    StudioModel, cubic_smoothstep, default_combat_library, sample_action_move,
 };
 pub use strike_optimizer::{
     BindingConstraint, OptimizedStrike, OptimizerError, StrikeExport, StrikeMetrics, StrikeParams,

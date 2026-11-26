@@ -27,7 +27,9 @@ pub use bridge::{
     mcp_bridge_channel,
 };
 pub use headless::{AutomationRoots, HeadlessHost};
-pub use host::{McpActivityEntry, McpCallOutcome, McpHost, McpPolicy};
+pub use host::{
+    CameraOrbitRequest, McpActivityEntry, McpCallOutcome, McpHost, McpPolicy, ViewportCameraState,
+};
 #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub use http_server::{HttpServerHandle, serve_http, spawn_http_bridge};
 pub use tools::{RockyMcpTools, dispatch_json_rpc, server_info, server_options};

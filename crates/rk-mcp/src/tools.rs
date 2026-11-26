@@ -11,7 +11,7 @@ use rk_proto::{BalanceGains, ControlMode, FallOrientation, ModelRequest, ModelRe
 use rk_sim::{ExperimentScript, WalkQualityBounds};
 use serde_json::{Value, json};
 
-use crate::host::{McpActivityEntry, McpCallOutcome, McpHost};
+use crate::host::{CameraOrbitRequest, McpActivityEntry, McpCallOutcome, McpHost};
 use crate::schema::{
     EXPERIMENT_FIXTURES, URDF_PRESETS, prompt_definitions, resource_definitions,
     resource_template_definitions, tool_definitions,
@@ -425,6 +425,111 @@ impl<'a, H: McpHost> RockyMcpTools<'a, H> {
         })
     }
 
+    fn viewport_inspect_json(&self) -> Value {
+        let m = self.host.model();
+        let t = &m.latest_telemetry;
+        let transforms = m.rig.compute_link_transforms_with_tilt(
+            &t.measured_rad,
+            t.imu.pitch_rad,
+            t.imu.roll_rad,
+            0.0,
+        );
+        let links: Vec<Value> = m
+            .rig
+            .links
+            .iter()
+            .map(|link| {
+                let pos = transforms
+                    .get(&link.name)
+                    .map(|iso| {
+                        let v = iso.translation.vector;
+                        [v.x, v.y, v.z]
+                    })
+                    .unwrap_or([0.0, 0.0, 0.0]);
+                json!({
+                    "link_name": link.name,
+                    "joint_index": link.joint_index,
+                    "pos": pos,
+                })
+            })
+            .collect();
+        let diag = m.bundle.diagnostics(&m.rig);
+        let camera = self.host.viewport_camera_state().map(|c| {
+            json!({
+                "eye": c.eye,
+                "target": c.target,
+                "distance": c.distance,
+                "yaw_rad": c.yaw_rad,
+                "pitch_rad": c.pitch_rad,
+                "fov_deg": c.fov_deg,
+            })
+        });
+        json!({
+            "camera": camera,
+            "bounds_center": m.rig.bounds_center(),
+            "bounds_radius": m.rig.bounds_radius(),
+            "root_y_offset": m.rig.root_y_offset,
+            "links": links,
+            "resolved_meshes_count": diag.resolved_meshes.len(),
+            "missing_meshes_count": diag.missing_meshes.len(),
+            "resolved_meshes": diag.resolved_meshes,
+            "missing_meshes": diag.missing_meshes,
+        })
+    }
+
+    fn diagnostics_json(&self) -> Value {
+        let m = self.host.model();
+        let t = &m.latest_telemetry;
+        let dof = m.rig.joints.len().min(rk_proto::MAX_JOINTS);
+        let mut peak_current_ma = 0u16;
+        let mut max_temp_c = 0u8;
+        let mut clamped_joint_count = 0usize;
+        let joints: Vec<Value> = (0..dof)
+            .map(|i| {
+                let j = &m.rig.joints[i];
+                let current_ma = t.current_ma[i];
+                let temp_c = t.temp_c[i];
+                peak_current_ma = peak_current_ma.max(current_ma);
+                max_temp_c = max_temp_c.max(temp_c);
+                let limit_clamped = m.calibration.get(i).is_some_and(|c| {
+                    t.applied_target_rad[i] <= c.min_rad + 1e-4
+                        || t.applied_target_rad[i] >= c.max_rad - 1e-4
+                        || (m.target_rad[i] - t.applied_target_rad[i]).abs() > 1e-3
+                });
+                if limit_clamped {
+                    clamped_joint_count += 1;
+                }
+                json!({
+                    "index": i,
+                    "name": j.name,
+                    "current_ma": current_ma,
+                    "temp_c": temp_c,
+                    "limit_clamped": limit_clamped,
+                })
+            })
+            .collect();
+        json!({
+            "rx_crc_errors": t.rx_crc_errors,
+            "rx_version_mismatches": t.rx_version_mismatches,
+            "faults": format!("{:?}", t.faults),
+            "active_mode": format!("{:?}", t.active_mode),
+            "est_com_pos_m": t.estimator.com_pos_m,
+            "est_com_vel_m_s": t.estimator.com_vel_m_s,
+            "est_dcm_xy_m": t.estimator.dcm_xy_m,
+            "est_zmp_xy_m": t.estimator.zmp_xy_m,
+            "foot_margin_m": t.estimator.foot_margin_m,
+            "left_grf_n": t.estimator.grf_left_n,
+            "right_grf_n": t.estimator.grf_right_n,
+            "contact_mask": t.estimator.contact_mask,
+            "ukemi_active": t.estimator.ukemi_active,
+            "fall_orientation": FallOrientation::from_wire(t.balance.fall_orientation).label(),
+            "peak_current_ma": peak_current_ma,
+            "max_temp_c": max_temp_c,
+            "clamped_joint_count": clamped_joint_count,
+            "joints": joints,
+        })
+    }
+
     fn robot_json(&self) -> Value {
         let m = self.host.model();
         let joints: Vec<Value> = m
@@ -735,10 +840,149 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
                 }
             }
             "viewport_camera" => {
-                let preset = args.get("preset").and_then(Value::as_str).unwrap_or("iso");
-                match self.host.set_camera_preset(preset) {
-                    Ok(()) => self.ok_json(name, preset, json!({"camera_preset": preset})),
-                    Err(err) => self.err_result(name, preset, err),
+                let preset = args.get("preset").and_then(Value::as_str).map(str::to_string);
+                let target = if let Some(val) = args.get("target") {
+                    let Some(arr) = val.as_array() else {
+                        return self.err_result(name, "target", "`target` must be [x, y, z]");
+                    };
+                    if arr.len() != 3 {
+                        return self.err_result(name, "target", "`target` must have 3 elements");
+                    }
+                    let mut xyz = [0.0_f32; 3];
+                    for (i, v) in arr.iter().enumerate() {
+                        let Some(f) = v.as_f64() else {
+                            return self.err_result(name, "target", "`target` entries must be numbers");
+                        };
+                        let f = f as f32;
+                        if !f.is_finite() {
+                            return self.err_result(name, "target", "`target` entries must be finite");
+                        }
+                        xyz[i] = f;
+                    }
+                    Some(xyz)
+                } else {
+                    None
+                };
+                let distance = match args.get("distance") {
+                    Some(v) => match v.as_f64() {
+                        Some(f) if f.is_finite() && f > 0.0 => Some(f as f32),
+                        _ => {
+                            return self.err_result(
+                                name,
+                                "distance",
+                                "`distance` must be a positive finite number",
+                            );
+                        }
+                    },
+                    None => None,
+                };
+                let yaw_deg = match args.get("yaw_deg") {
+                    Some(v) => match v.as_f64() {
+                        Some(f) if f.is_finite() => Some(f as f32),
+                        _ => {
+                            return self.err_result(
+                                name,
+                                "yaw_deg",
+                                "`yaw_deg` must be a finite number",
+                            );
+                        }
+                    },
+                    None => None,
+                };
+                let pitch_deg = match args.get("pitch_deg") {
+                    Some(v) => match v.as_f64() {
+                        Some(f) if f.is_finite() => Some(f as f32),
+                        _ => {
+                            return self.err_result(
+                                name,
+                                "pitch_deg",
+                                "`pitch_deg` must be a finite number",
+                            );
+                        }
+                    },
+                    None => None,
+                };
+                if preset.is_none()
+                    && target.is_none()
+                    && distance.is_none()
+                    && yaw_deg.is_none()
+                    && pitch_deg.is_none()
+                {
+                    return self.err_result(
+                        name,
+                        "empty",
+                        "viewport_camera requires at least one of preset, target, distance, yaw_deg, or pitch_deg",
+                    );
+                }
+                let req = CameraOrbitRequest {
+                    preset: preset.clone(),
+                    target,
+                    distance,
+                    yaw_deg,
+                    pitch_deg,
+                };
+                let summary = preset.clone().unwrap_or_else(|| "custom_orbit".to_string());
+                match self.host.set_camera_orbit(&req) {
+                    Ok(()) => self.ok_json(
+                        name,
+                        summary,
+                        json!({
+                            "camera_preset": preset,
+                            "target": target,
+                            "distance": distance,
+                            "yaw_deg": yaw_deg,
+                            "pitch_deg": pitch_deg,
+                            "camera": self.host.viewport_camera_state(),
+                        }),
+                    ),
+                    Err(err) => self.err_result(name, summary, err),
+                }
+            }
+            "viewport_inspect" => {
+                self.ok_json(name, "inspect", self.viewport_inspect_json())
+            }
+            "viewport_screenshot" => {
+                let path = args.get("path").and_then(Value::as_str);
+                match self.host.capture_viewport_screenshot() {
+                    Ok((width, height, png_bytes)) => {
+                        let mut written_path = None;
+                        if let Some(p) = path {
+                            match self.host.write_confined_file(p, &png_bytes) {
+                                Ok(dest) => written_path = Some(dest),
+                                Err(err) => return self.err_result(name, p, err),
+                            }
+                        }
+                        let b64 = encode_base64(&png_bytes);
+                        let meta = json!({
+                            "width": width,
+                            "height": height,
+                            "mime_type": "image/png",
+                            "bytes": png_bytes.len(),
+                            "written_path": written_path,
+                        });
+                        let summary = format!("{width}x{height}");
+                        self.log(
+                            name,
+                            summary,
+                            McpCallOutcome::Ok,
+                            format!("{width}x{height} PNG ({} B)", png_bytes.len()),
+                        );
+                        json!({
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "data": b64,
+                                    "mimeType": "image/png"
+                                },
+                                {
+                                    "type": "text",
+                                    "text": serde_json::to_string_pretty(&meta).unwrap_or_else(|_| meta.to_string())
+                                }
+                            ],
+                            "isError": false
+                        })
+                    }
+                    Err(err) => self.err_result(name, "screenshot", err),
                 }
             }
             "telemetry_snapshot" => {
@@ -764,6 +1008,27 @@ impl<H: McpHost> Tools for RockyMcpTools<'_, H> {
                     name,
                     if is_sim { "walk quality" } else { "quality unavailable" },
                     self.quality_json(),
+                )
+            }
+            "diagnostics_snapshot" => {
+                self.ok_json(name, "diagnostics", self.diagnostics_json())
+            }
+            "events_tail" => {
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .min(rk_model::MAX_STUDIO_EVENTS as u64) as usize;
+                let events = self.host.model().recent_events(limit);
+                let total = self.host.model().events.len();
+                self.ok_json(
+                    name,
+                    format!("{} events", events.len()),
+                    json!({
+                        "total_buffered": total,
+                        "limit": limit,
+                        "events": events,
+                    }),
                 )
             }
             "robot_list_presets" => {
@@ -3244,4 +3509,302 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn encode_base64_matches_rfc4648_vectors() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn viewport_screenshot_returns_clear_error_in_headless_mode() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
+        let resp = dispatch_json_rpc(
+            &mut host,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 101,
+                "method": "tools/call",
+                "params": { "name": "viewport_screenshot", "arguments": {} }
+            }),
+        )
+        .expect("JSON-RPC response");
+        assert_eq!(resp["result"]["isError"], json!(true));
+        let msg = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+        assert!(msg.contains("headless") || msg.contains("live 3D GUI"), "unexpected msg: {msg}");
+    }
+
+    #[test]
+    fn viewport_screenshot_returns_image_content_and_metadata() {
+        struct MockViewportHost {
+            inner: HeadlessHost,
+            png: Vec<u8>,
+            written: Option<(String, Vec<u8>)>,
+        }
+
+        impl McpHost for MockViewportHost {
+            fn model(&self) -> &rk_model::StudioModel { self.inner.model() }
+            fn model_mut(&mut self) -> &mut rk_model::StudioModel { self.inner.model_mut() }
+            fn transport(&self) -> &dyn rk_link::RobotTransport { self.inner.transport() }
+            fn transport_mut(&mut self) -> &mut dyn rk_link::RobotTransport { self.inner.transport_mut() }
+            fn is_connected(&self) -> bool { self.inner.is_connected() }
+            fn connect(&mut self, kind: TransportKind) -> Result<String, String> { self.inner.connect(kind) }
+            fn disconnect(&mut self) { self.inner.disconnect() }
+            fn load_bundle(&mut self, bundle: AssetBundle) -> Result<String, String> { self.inner.load_bundle(bundle) }
+            fn sync_mcu_model(&mut self) -> Result<String, String> { self.inner.sync_mcu_model() }
+            fn active_screen_name(&self) -> &'static str { self.inner.active_screen_name() }
+            fn navigate_screen(&mut self, screen: &str) -> Result<(), String> { self.inner.navigate_screen(screen) }
+            fn set_camera_preset(&mut self, preset: &str) -> Result<(), String> { self.inner.set_camera_preset(preset) }
+            fn apply_joint_angle(&mut self, joint_idx: usize, rad: f32) -> Result<(), String> { self.inner.apply_joint_angle(joint_idx, rad) }
+            fn set_walk_override(&mut self, vx: f32, vy: f32, yaw_rate: f32, enabled: bool) { self.inner.set_walk_override(vx, vy, yaw_rate, enabled) }
+            fn step_ticks(&mut self, ticks: usize, dt_sec: f32) { self.inner.step_ticks(ticks, dt_sec) }
+            fn policy(&self) -> McpPolicy { self.inner.policy() }
+            fn set_drive_armed(&mut self, armed: bool) { self.inner.set_drive_armed(armed) }
+            fn trigger_estop_and_disarm(&mut self) { self.inner.trigger_estop_and_disarm() }
+            fn reset_estop_upright(&mut self) { self.inner.reset_estop_upright() }
+            fn record_activity(&mut self, entry: McpActivityEntry) { self.inner.record_activity(entry) }
+            fn write_confined_file(&self, path: &str, bytes: &[u8]) -> Result<String, String> {
+                let _ = (path, bytes);
+                Ok(format!("/confined/{path}"))
+            }
+            fn capture_viewport_screenshot(&mut self) -> Result<(u32, u32, Vec<u8>), String> {
+                Ok((640, 480, self.png.clone()))
+            }
+        }
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = MockViewportHost {
+            inner: HeadlessHost::new(McpPolicy::default(), AutomationRoots::default()),
+            png: b"\x89PNG\r\n\x1a\nFAKE".to_vec(),
+            written: None,
+        };
+        let resp = dispatch_json_rpc(
+            &mut host,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 102,
+                "method": "tools/call",
+                "params": {
+                    "name": "viewport_screenshot",
+                    "arguments": { "path": "shot.png" }
+                }
+            }),
+        )
+        .expect("JSON-RPC response");
+
+        assert_eq!(resp["result"]["isError"], json!(false));
+        let content = resp["result"]["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], json!("image"));
+        assert_eq!(content[0]["mimeType"], json!("image/png"));
+        assert_eq!(content[0]["data"], json!(encode_base64(b"\x89PNG\r\n\x1a\nFAKE")));
+
+        let meta: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(meta["width"], json!(640));
+        assert_eq!(meta["height"], json!(480));
+        assert_eq!(meta["written_path"], json!("/confined/shot.png"));
+    }
+
+    fn call_tool_json<H: McpHost>(host: &mut H, name: &str, arguments: Value) -> (Value, Value) {
+        let resp = dispatch_json_rpc(
+            host,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }),
+        )
+        .expect("JSON-RPC response");
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("{}");
+        let parsed: Value = serde_json::from_str(text).unwrap_or_else(|_| json!({}));
+        (resp, parsed)
+    }
+
+    #[test]
+    fn viewport_inspect_returns_rig_and_bundle_diagnostics_in_headless_mode() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
+        let (resp, v) = call_tool_json(&mut host, "viewport_inspect", json!({}));
+        assert_ne!(resp["result"]["isError"], json!(true));
+        assert!(v["camera"].is_null());
+        assert!(v["bounds_center"].as_array().is_some_and(|a| a.len() == 3));
+        assert!(v["bounds_radius"].as_f64().is_some_and(|r| r > 0.0));
+        assert!(v["root_y_offset"].is_number());
+        assert!(v["links"].as_array().is_some_and(|a| !a.is_empty()));
+        assert!(v["resolved_meshes_count"].is_u64());
+        assert!(v["missing_meshes_count"].is_u64());
+        assert!(v["resolved_meshes"].is_array());
+        assert!(v["missing_meshes"].is_array());
+    }
+
+    #[test]
+    fn viewport_inspect_and_custom_viewport_camera_work_with_live_camera_host() {
+        use crate::host::{CameraOrbitRequest, ViewportCameraState};
+
+        struct MockCameraHost {
+            inner: HeadlessHost,
+            camera: ViewportCameraState,
+        }
+        impl McpHost for MockCameraHost {
+            fn model(&self) -> &rk_model::StudioModel { self.inner.model() }
+            fn model_mut(&mut self) -> &mut rk_model::StudioModel { self.inner.model_mut() }
+            fn transport(&self) -> &dyn rk_link::RobotTransport { self.inner.transport() }
+            fn transport_mut(&mut self) -> &mut dyn rk_link::RobotTransport { self.inner.transport_mut() }
+            fn is_connected(&self) -> bool { self.inner.is_connected() }
+            fn connect(&mut self, kind: TransportKind) -> Result<String, String> { self.inner.connect(kind) }
+            fn disconnect(&mut self) { self.inner.disconnect() }
+            fn load_bundle(&mut self, bundle: AssetBundle) -> Result<String, String> { self.inner.load_bundle(bundle) }
+            fn sync_mcu_model(&mut self) -> Result<String, String> { self.inner.sync_mcu_model() }
+            fn active_screen_name(&self) -> &'static str { self.inner.active_screen_name() }
+            fn navigate_screen(&mut self, s: &str) -> Result<(), String> { self.inner.navigate_screen(s) }
+            fn set_camera_preset(&mut self, p: &str) -> Result<(), String> { self.inner.set_camera_preset(p) }
+            fn set_camera_orbit(&mut self, req: &CameraOrbitRequest) -> Result<(), String> {
+                if let Some(p) = req.preset.as_deref() {
+                    self.set_camera_preset(p)?;
+                }
+                if let Some(t) = req.target {
+                    self.camera.target = t;
+                }
+                if let Some(d) = req.distance {
+                    self.camera.distance = d;
+                }
+                if let Some(y) = req.yaw_deg {
+                    self.camera.yaw_rad = y.to_radians();
+                }
+                if let Some(p) = req.pitch_deg {
+                    self.camera.pitch_rad = p.to_radians();
+                }
+                Ok(())
+            }
+            fn viewport_camera_state(&self) -> Option<ViewportCameraState> {
+                Some(self.camera)
+            }
+            fn apply_joint_angle(&mut self, idx: usize, rad: f32) -> Result<(), String> {
+                self.inner.apply_joint_angle(idx, rad)
+            }
+            fn set_walk_override(&mut self, vx: f32, vy: f32, yr: f32, en: bool) {
+                self.inner.set_walk_override(vx, vy, yr, en);
+            }
+            fn step_ticks(&mut self, ticks: usize, dt: f32) { self.inner.step_ticks(ticks, dt); }
+            fn policy(&self) -> McpPolicy { self.inner.policy() }
+            fn set_drive_armed(&mut self, armed: bool) { self.inner.set_drive_armed(armed); }
+            fn trigger_estop_and_disarm(&mut self) { self.inner.trigger_estop_and_disarm(); }
+            fn reset_estop_upright(&mut self) { self.inner.reset_estop_upright(); }
+            fn record_activity(&mut self, entry: McpActivityEntry) { self.inner.record_activity(entry); }
+        }
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = MockCameraHost {
+            inner: HeadlessHost::new(McpPolicy::default(), AutomationRoots::default()),
+            camera: ViewportCameraState {
+                eye: [1.0, 1.0, 2.0],
+                target: [0.0, 0.78, 0.0],
+                distance: 2.35,
+                yaw_rad: 0.641,
+                pitch_rad: 0.340,
+                fov_deg: 42.0,
+            },
+        };
+
+        let (cam_resp, _) = call_tool_json(
+            &mut host,
+            "viewport_camera",
+            json!({
+                "target": [0.1, 0.4, -0.1],
+                "distance": 0.9,
+                "yaw_deg": 90.0,
+                "pitch_deg": 25.0
+            }),
+        );
+        assert_ne!(cam_resp["result"]["isError"], json!(true));
+
+        let (inspect_resp, v) = call_tool_json(&mut host, "viewport_inspect", json!({}));
+        assert_ne!(inspect_resp["result"]["isError"], json!(true));
+        let target = v["camera"]["target"].as_array().unwrap();
+        assert!((target[0].as_f64().unwrap() - 0.1).abs() < 1e-5);
+        assert!((target[1].as_f64().unwrap() - 0.4).abs() < 1e-5);
+        assert!((target[2].as_f64().unwrap() + 0.1).abs() < 1e-5);
+        assert!((v["camera"]["distance"].as_f64().unwrap() - 0.9).abs() < 1e-5);
+        assert!((v["camera"]["yaw_rad"].as_f64().unwrap() - std::f64::consts::FRAC_PI_2).abs() < 1e-5);
+        assert!((v["camera"]["pitch_rad"].as_f64().unwrap() - 25.0_f64.to_radians()).abs() < 1e-5);
+        assert_eq!(v["camera"]["fov_deg"], json!(42.0));
+    }
+
+    #[test]
+    fn diagnostics_snapshot_and_events_tail_return_expected_fields() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut host = HeadlessHost::new(McpPolicy::default(), AutomationRoots::default());
+        let (conn, _) = call_tool_json(&mut host, "robot_connect", json!({ "transport": "sim" }));
+        assert_ne!(conn["result"]["isError"], json!(true));
+
+        let (estop, _) = call_tool_json(&mut host, "safety_estop", json!({}));
+        assert_ne!(estop["result"]["isError"], json!(true));
+
+        let (diag_resp, diag) = call_tool_json(&mut host, "diagnostics_snapshot", json!({}));
+        assert_ne!(diag_resp["result"]["isError"], json!(true));
+        for key in [
+            "rx_crc_errors",
+            "rx_version_mismatches",
+            "faults",
+            "active_mode",
+            "est_com_pos_m",
+            "est_com_vel_m_s",
+            "est_dcm_xy_m",
+            "est_zmp_xy_m",
+            "foot_margin_m",
+            "left_grf_n",
+            "right_grf_n",
+            "contact_mask",
+            "ukemi_active",
+            "fall_orientation",
+            "joints",
+        ] {
+            assert!(!diag[key].is_null(), "diagnostics_snapshot missing key `{key}`");
+        }
+        let first_joint = &diag["joints"][0];
+        assert!(first_joint["current_ma"].is_u64());
+        assert!(first_joint["temp_c"].is_u64());
+        assert!(first_joint["limit_clamped"].is_boolean());
+
+        let (events_resp, ev) = call_tool_json(&mut host, "events_tail", json!({ "limit": 10 }));
+        assert_ne!(events_resp["result"]["isError"], json!(true));
+        let events = ev["events"].as_array().expect("events array");
+        assert!(!events.is_empty());
+        assert!(events.iter().any(|e| e["kind"] == json!("estop_triggered")));
+    }
+}
+
+fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }

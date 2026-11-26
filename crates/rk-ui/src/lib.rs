@@ -288,6 +288,8 @@ pub struct RockyStudioApp {
     /// Native-only consumer half of the HTTP→egui MCP bridge (desktop only).
     #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     mcp_bridge_rx: Option<rk_mcp::McpBridgeRx>,
+    /// Captured PNG screenshot staged by `pump_mcp_bridge` for `McpHost::capture_viewport_screenshot`.
+    pub(crate) pending_viewport_screenshot: Option<Result<(u32, u32, Vec<u8>), String>>,
     /// Visual alarm / latch state for the most recent fall event.
     pub fall_event_active: bool,
     /// Classification captured from telemetry when the fall latched.
@@ -376,6 +378,7 @@ impl RockyStudioApp {
             mcp: McpUiState::default(),
             #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
             mcp_bridge_rx: None,
+            pending_viewport_screenshot: None,
             fall_event_active: false,
             fall_orientation: FallOrientation::Unknown,
             auto_recovery_enabled: false,

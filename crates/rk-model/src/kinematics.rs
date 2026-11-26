@@ -495,6 +495,19 @@ impl KinematicRig {
                 continue;
             };
             let world = iso * vis.local_offset;
+            if matches!(vis.shape, VisualShape::Mesh { .. }) {
+                // Assembly-baked STLs often place `vis.local_offset` back at the origin while
+                // the link origin `iso` tracks the actual kinematic chain span. Include both.
+                let lp = iso.translation.vector;
+                for &pad in &[-0.04_f32, 0.04_f32] {
+                    min_v.x = min_v.x.min(lp.x + pad);
+                    min_v.y = min_v.y.min(lp.y + pad);
+                    min_v.z = min_v.z.min(lp.z + pad);
+                    max_v.x = max_v.x.max(lp.x + pad);
+                    max_v.y = max_v.y.max(lp.y + pad);
+                    max_v.z = max_v.z.max(lp.z + pad);
+                }
+            }
             let half = match vis.shape {
                 VisualShape::Box(s) => Vector3::new(s[0] * 0.5, s[1] * 0.5, s[2] * 0.5),
                 VisualShape::Cylinder { radius, length } => match self.up_axis {

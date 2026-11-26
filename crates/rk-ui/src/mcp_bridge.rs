@@ -3,7 +3,10 @@
 use std::collections::VecDeque;
 
 use rk_link::{FIXED_CONTROL_STEP_SEC, RobotTransport, TransportKind};
-use rk_mcp::{McpActivityEntry, McpHost, McpPolicy, dispatch_json_rpc};
+use rk_mcp::{
+    CameraOrbitRequest, McpActivityEntry, McpHost, McpPolicy, ViewportCameraState,
+    dispatch_json_rpc,
+};
 use rk_model::{AssetBundle, StudioModel};
 use rk_proto::{ModelRequest, ModelResponse};
 use rk_viewport::CameraPreset;
@@ -81,6 +84,10 @@ pub struct McpUiState {
     pub copied_notice_until: f64,
     pub(crate) config_dirty: bool,
     pub(crate) next_poll_allowed_at: f64,
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+    pub(crate) pending_native_screenshots: Vec<(rk_mcp::McpBridgeRequest, web_time::Instant)>,
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) pending_wasm_screenshots: Vec<(String, Value, web_time::Instant)>,
 }
 
 impl Default for McpUiState {
@@ -101,6 +108,10 @@ impl Default for McpUiState {
             copied_notice_until: -10.0,
             config_dirty: true,
             next_poll_allowed_at: 0.0,
+            #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+            pending_native_screenshots: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
+            pending_wasm_screenshots: Vec::new(),
         }
     }
 }
@@ -315,6 +326,17 @@ mod wasm_bridge {
     }
 }
 
+const SCREENSHOT_WAIT_TIMEOUT: web_time::Duration = web_time::Duration::from_secs(3);
+
+fn is_viewport_screenshot_call(msg: &Value) -> bool {
+    msg.get("method").and_then(Value::as_str) == Some("tools/call")
+        && msg
+            .get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(Value::as_str)
+            == Some("viewport_screenshot")
+}
+
 impl RockyStudioApp {
     /// Attaches the native bridge receiver. Must be called on the egui thread;
     /// the native platform wrapper drains it from `App::logic` so requests are
@@ -345,9 +367,45 @@ impl RockyStudioApp {
                 self.mcp.next_poll_allowed_at = self.sim_time_sec + 1.0;
             }
 
+            if !self.mcp.pending_wasm_screenshots.is_empty() {
+                let resolved = if let Some(res) = self.viewport.take_screenshot() {
+                    Some(res.map(|s| (s.width, s.height, s.png_bytes)))
+                } else if self
+                    .mcp
+                    .pending_wasm_screenshots
+                    .first()
+                    .is_some_and(|(_, _, t)| t.elapsed() >= SCREENSHOT_WAIT_TIMEOUT)
+                {
+                    let _ = self.viewport.take_screenshot();
+                    Some(Err(
+                        "Timed out waiting for 3D viewport to render a frame.".to_string(),
+                    ))
+                } else {
+                    None
+                };
+
+                if let Some(shot_res) = resolved {
+                    let pending = std::mem::take(&mut self.mcp.pending_wasm_screenshots);
+                    for (req_id, payload, _) in pending {
+                        self.pending_viewport_screenshot = Some(shot_res.clone());
+                        let reply = dispatch_json_rpc(self, payload);
+                        self.pending_viewport_screenshot = None;
+                        wasm_bridge::spawn_reply(req_id, reply);
+                    }
+                }
+            }
+
             for (req_id, payload) in incoming {
-                let reply = dispatch_json_rpc(self, payload);
-                wasm_bridge::spawn_reply(req_id, reply);
+                if self.mcp.policy.enabled && is_viewport_screenshot_call(&payload) {
+                    self.viewport.request_screenshot();
+                    ctx.request_repaint();
+                    self.mcp
+                        .pending_wasm_screenshots
+                        .push((req_id, payload, web_time::Instant::now()));
+                } else {
+                    let reply = dispatch_json_rpc(self, payload);
+                    wasm_bridge::spawn_reply(req_id, reply);
+                }
             }
 
             if self.sim_time_sec >= self.mcp.next_poll_allowed_at {
@@ -363,8 +421,36 @@ impl RockyStudioApp {
         }
         #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
         {
-            let _ = ctx;
             self.mcp.config_dirty = false;
+
+            if !self.mcp.pending_native_screenshots.is_empty() {
+                let resolved = if let Some(res) = self.viewport.take_screenshot() {
+                    Some(res.map(|s| (s.width, s.height, s.png_bytes)))
+                } else if self
+                    .mcp
+                    .pending_native_screenshots
+                    .first()
+                    .is_some_and(|(_, t)| t.elapsed() >= SCREENSHOT_WAIT_TIMEOUT)
+                {
+                    let _ = self.viewport.take_screenshot();
+                    Some(Err(
+                        "Timed out waiting for 3D viewport to render a frame (window may be minimized or hidden).".to_string(),
+                    ))
+                } else {
+                    None
+                };
+
+                if let Some(shot_res) = resolved {
+                    let pending = std::mem::take(&mut self.mcp.pending_native_screenshots);
+                    for (req, _) in pending {
+                        self.pending_viewport_screenshot = Some(shot_res.clone());
+                        let response = dispatch_json_rpc(self, req.message);
+                        self.pending_viewport_screenshot = None;
+                        let _ = req.reply.send(response);
+                    }
+                }
+            }
+
             // Collect requests first so the mutable borrow of `mcp_bridge_rx`
             // ends before `dispatch_json_rpc` borrows the whole app.
             let requests = self
@@ -373,8 +459,16 @@ impl RockyStudioApp {
                 .map(rk_mcp::McpBridgeRx::try_recv_all)
                 .unwrap_or_default();
             for req in requests {
-                let response = dispatch_json_rpc(self, req.message);
-                let _ = req.reply.send(response);
+                if self.mcp.policy.enabled && is_viewport_screenshot_call(&req.message) {
+                    self.viewport.request_screenshot();
+                    ctx.request_repaint();
+                    self.mcp
+                        .pending_native_screenshots
+                        .push((req, web_time::Instant::now()));
+                } else {
+                    let response = dispatch_json_rpc(self, req.message);
+                    let _ = req.reply.send(response);
+                }
             }
         }
     }
@@ -546,6 +640,34 @@ impl McpHost for RockyStudioApp {
         }
     }
 
+    fn set_camera_orbit(&mut self, req: &CameraOrbitRequest) -> Result<(), String> {
+        if let Some(preset) = req.preset.as_deref() {
+            self.set_camera_preset(preset)?;
+        }
+        if req.target.is_some()
+            || req.distance.is_some()
+            || req.yaw_deg.is_some()
+            || req.pitch_deg.is_some()
+        {
+            self.viewport
+                .orbit
+                .set_custom_orbit(req.target, req.distance, req.yaw_deg, req.pitch_deg);
+        }
+        Ok(())
+    }
+
+    fn viewport_camera_state(&self) -> Option<ViewportCameraState> {
+        let eye = self.viewport.orbit.eye_position();
+        Some(ViewportCameraState {
+            eye: [eye.x, eye.y, eye.z],
+            target: self.viewport.orbit.target,
+            distance: self.viewport.orbit.distance,
+            yaw_rad: self.viewport.orbit.yaw_rad,
+            pitch_rad: self.viewport.orbit.pitch_rad,
+            fov_deg: rk_viewport::CAMERA_FOV_DEG,
+        })
+    }
+
     fn apply_joint_angle(&mut self, joint_idx: usize, rad: f32) -> Result<(), String> {
         if joint_idx >= self.model.rig.joints.len() {
             return Err(format!("joint index {joint_idx} out of range"));
@@ -638,5 +760,11 @@ impl McpHost for RockyStudioApp {
         while self.mcp.activity.len() > MAX_ACTIVITY_ENTRIES {
             self.mcp.activity.pop_front();
         }
+    }
+
+    fn capture_viewport_screenshot(&mut self) -> Result<(u32, u32, Vec<u8>), String> {
+        self.pending_viewport_screenshot.take().unwrap_or_else(|| {
+            Err("No rendered 3D viewport frame available for screenshot.".to_string())
+        })
     }
 }

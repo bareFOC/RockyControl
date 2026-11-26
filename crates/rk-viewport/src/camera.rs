@@ -44,11 +44,16 @@ pub struct CameraTransition {
 pub struct OrbitState {
     /// Current horizontal turntable azimuth around world `+Y` (radians; 0 = Front `+Z`).
     pub yaw_rad: f32,
+    /// Current elevation angle above horizon (radians; defaults to `FIXED_ELEVATION_RAD`).
+    pub pitch_rad: f32,
     /// Rotation from camera-local basis (`+X` right, `+Y` up, `+Z` toward eye) to world space.
-    /// Always kept strictly synchronized with `turntable_orientation(self.yaw_rad)`.
+    /// Always kept strictly synchronized with `turntable_orientation_with_pitch(self.yaw_rad, self.pitch_rad)`.
     pub orientation: UnitQuaternion<f32>,
     pub distance: f32,
     pub target: [f32; 3],
+    /// When `true`, per-frame auto-framing (`fit_to_bounds`) is paused so custom agent/user
+    /// `target`/`distance` framing persists until `fit_to_rig` or a preset reset is called.
+    pub custom_framing: bool,
     pub transition: Option<CameraTransition>,
 }
 
@@ -56,9 +61,11 @@ impl Default for OrbitState {
     fn default() -> Self {
         Self {
             yaw_rad: HOME_YAW_RAD,
+            pitch_rad: FIXED_ELEVATION_RAD,
             orientation: home_iso_orientation(),
             distance: 2.35,
             target: [0.0, 0.78, 0.0],
+            custom_framing: false,
             transition: None,
         }
     }
@@ -73,13 +80,21 @@ fn wrap_angle(rad: f32) -> f32 {
     a
 }
 
+/// Computes the exact upright gravity-locked turntable camera orientation for azimuth `yaw_rad`
+/// and elevation `pitch_rad`. Camera horizon is strictly level (`right.y == 0`), roll is always `0`,
+/// and world `+Y` is always up.
+pub fn turntable_orientation_with_pitch(yaw_rad: f32, pitch_rad: f32) -> UnitQuaternion<f32> {
+    let clamped_pitch = pitch_rad.clamp(-1.45, 1.45);
+    let cos_e = clamped_pitch.cos();
+    let sin_e = clamped_pitch.sin();
+    let eye_dir = Vector3::new(yaw_rad.sin() * cos_e, sin_e, yaw_rad.cos() * cos_e);
+    orientation_from_dir_up(eye_dir, Vector3::y())
+}
+
 /// Computes the exact upright gravity-locked turntable camera orientation for azimuth `yaw_rad`.
 /// Camera horizon is strictly level (`right.y == 0`), roll is always `0`, and world `+Y` is always up.
 pub fn turntable_orientation(yaw_rad: f32) -> UnitQuaternion<f32> {
-    let cos_e = FIXED_ELEVATION_RAD.cos();
-    let sin_e = FIXED_ELEVATION_RAD.sin();
-    let eye_dir = Vector3::new(yaw_rad.sin() * cos_e, sin_e, yaw_rad.cos() * cos_e);
-    orientation_from_dir_up(eye_dir, Vector3::y())
+    turntable_orientation_with_pitch(yaw_rad, FIXED_ELEVATION_RAD)
 }
 
 /// Default Front-Right upright isometric workstation orientation.
@@ -129,7 +144,8 @@ pub fn preset_yaw(preset: CameraPreset) -> f32 {
 impl OrbitState {
     pub fn apply_preset(&mut self, preset: CameraPreset) {
         self.yaw_rad = wrap_angle(preset_yaw(preset));
-        self.orientation = turntable_orientation(self.yaw_rad);
+        self.pitch_rad = FIXED_ELEVATION_RAD;
+        self.orientation = turntable_orientation_with_pitch(self.yaw_rad, self.pitch_rad);
         self.transition = None;
     }
 
@@ -139,8 +155,46 @@ impl OrbitState {
         center: [f32; 3],
         radius: f32,
     ) {
+        self.custom_framing = false;
+        self.pitch_rad = FIXED_ELEVATION_RAD;
         self.animate_to_yaw(preset_yaw(preset));
         self.fit_to_bounds(center, radius, 1.33, CAMERA_FOV_DEG);
+    }
+
+    /// Sets custom orbit target, distance, yaw (degrees), and/or pitch (degrees).
+    /// Setting `target` or `distance` enables `custom_framing` so per-frame auto-fit
+    /// does not overwrite the requested close-up framing.
+    pub fn set_custom_orbit(
+        &mut self,
+        target: Option<[f32; 3]>,
+        distance: Option<f32>,
+        yaw_deg: Option<f32>,
+        pitch_deg: Option<f32>,
+    ) {
+        self.transition = None;
+        if let Some(t) = target {
+            if t.iter().all(|v| v.is_finite()) {
+                self.target = t;
+                self.custom_framing = true;
+            }
+        }
+        if let Some(d) = distance {
+            if d.is_finite() {
+                self.distance = d.clamp(0.15, 30.0);
+                self.custom_framing = true;
+            }
+        }
+        if let Some(yaw) = yaw_deg {
+            if yaw.is_finite() {
+                self.yaw_rad = wrap_angle(yaw.to_radians());
+            }
+        }
+        if let Some(pitch) = pitch_deg {
+            if pitch.is_finite() {
+                self.pitch_rad = pitch.to_radians().clamp(-1.45, 1.45);
+            }
+        }
+        self.orientation = turntable_orientation_with_pitch(self.yaw_rad, self.pitch_rad);
     }
 
     pub fn preset_orientation(&self, preset: CameraPreset) -> UnitQuaternion<f32> {
@@ -149,6 +203,7 @@ impl OrbitState {
 
     /// Smoothly rotates camera horizontally around world `+Y` to `target_yaw_rad` along shortest arc.
     pub fn animate_to_yaw(&mut self, target_yaw_rad: f32) {
+        self.pitch_rad = FIXED_ELEVATION_RAD;
         let from_yaw = self.yaw_rad;
         let delta = wrap_angle(target_yaw_rad - from_yaw);
         self.transition = Some(CameraTransition {
@@ -189,7 +244,7 @@ impl OrbitState {
 
     /// Camera roll is disabled in single-axis upright turntable mode so gravity/top always stays level.
     pub fn animate_roll(&mut self, _delta_rad: f32) {
-        self.orientation = turntable_orientation(self.yaw_rad);
+        self.orientation = turntable_orientation_with_pitch(self.yaw_rad, self.pitch_rad);
     }
 
     /// Advances any active smooth ViewCube horizontal transition; returns `true` while animating.
@@ -203,13 +258,13 @@ impl OrbitState {
         let eased = 1.0 - (1.0 - t).powi(3);
         let yaw = tr.from_yaw + (tr.to_yaw - tr.from_yaw) * eased;
         self.yaw_rad = wrap_angle(yaw);
-        self.orientation = turntable_orientation(self.yaw_rad);
+        self.orientation = turntable_orientation_with_pitch(self.yaw_rad, self.pitch_rad);
         if t < 1.0 {
             self.transition = Some(tr);
             true
         } else {
             self.yaw_rad = wrap_angle(tr.to_yaw);
-            self.orientation = turntable_orientation(self.yaw_rad);
+            self.orientation = turntable_orientation_with_pitch(self.yaw_rad, self.pitch_rad);
             false
         }
     }
@@ -220,7 +275,7 @@ impl OrbitState {
         self.transition = None;
         let yaw_delta = -dx * 0.0085;
         self.yaw_rad = wrap_angle(self.yaw_rad + yaw_delta);
-        self.orientation = turntable_orientation(self.yaw_rad);
+        self.orientation = turntable_orientation_with_pitch(self.yaw_rad, self.pitch_rad);
     }
 
     /// Computes exact perspective distance so a sphere of `radius` at `center` fits inside
@@ -322,5 +377,23 @@ mod tests {
         assert!(orbit.right_world().y.abs() < 1e-5);
         assert!(!orbit.advance(0.20));
         assert!(orbit.back_world().z < -0.9, "must finish facing Back");
+    }
+
+    #[test]
+    fn custom_orbit_sets_target_distance_yaw_pitch_and_pauses_auto_fit() {
+        let mut orbit = OrbitState::default();
+        assert!(!orbit.custom_framing);
+
+        orbit.set_custom_orbit(Some([0.1, 0.35, -0.2]), Some(0.85), Some(90.0), Some(30.0));
+        assert!(orbit.custom_framing);
+        assert_eq!(orbit.target, [0.1, 0.35, -0.2]);
+        assert!((orbit.distance - 0.85).abs() < 1e-6);
+        assert!((orbit.yaw_rad - FRAC_PI_2).abs() < 1e-5);
+        assert!((orbit.pitch_rad - 30.0_f32.to_radians()).abs() < 1e-5);
+        assert!(orbit.right_world().y.abs() < 1e-5);
+
+        orbit.apply_preset_for_bounds(CameraPreset::Iso, [0.0, 0.5, 0.0], 0.8);
+        assert!(!orbit.custom_framing);
+        assert!((orbit.pitch_rad - FIXED_ELEVATION_RAD).abs() < 1e-6);
     }
 }

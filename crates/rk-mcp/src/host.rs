@@ -15,6 +15,27 @@ pub struct ExperimentResult {
     pub quality: Option<WalkQuality>,
 }
 
+/// Live 3D viewport camera state returned by `viewport_inspect`.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct ViewportCameraState {
+    pub eye: [f32; 3],
+    pub target: [f32; 3],
+    pub distance: f32,
+    pub yaw_rad: f32,
+    pub pitch_rad: f32,
+    pub fov_deg: f32,
+}
+
+/// Orbit/zoom request for `viewport_camera` (preset and/or custom orbit parameters).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct CameraOrbitRequest {
+    pub preset: Option<String>,
+    pub target: Option<[f32; 3]>,
+    pub distance: Option<f32>,
+    pub yaw_deg: Option<f32>,
+    pub pitch_deg: Option<f32>,
+}
+
 /// Guarded autonomy policy controlling external MCP agent permissions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpPolicy {
@@ -87,6 +108,19 @@ pub trait McpHost {
     fn active_screen_name(&self) -> &'static str;
     fn navigate_screen(&mut self, screen: &str) -> Result<(), String>;
     fn set_camera_preset(&mut self, preset: &str) -> Result<(), String>;
+
+    /// Applies a camera preset and/or custom orbit/zoom parameters.
+    fn set_camera_orbit(&mut self, req: &CameraOrbitRequest) -> Result<(), String> {
+        if let Some(preset) = req.preset.as_deref() {
+            self.set_camera_preset(preset)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the live 3D viewport camera state, or `None` in headless CLI mode.
+    fn viewport_camera_state(&self) -> Option<ViewportCameraState> {
+        None
+    }
 
     fn apply_joint_angle(&mut self, joint_idx: usize, rad: f32) -> Result<(), String>;
     fn set_walk_override(&mut self, vx: f32, vy: f32, yaw_rate: f32, enabled: bool);
@@ -170,5 +204,11 @@ pub trait McpHost {
     /// Optional canonical file write confined to `--automation-write-root` (native CLI only).
     fn write_confined_file(&self, _path: &str, _bytes: &[u8]) -> Result<String, String> {
         Err("File-path writing is only available on the native rk-mcp CLI with --automation-write-root.".to_string())
+    }
+
+    /// Captures a PNG screenshot of the live 3D viewport, returning `(width, height, png_bytes)`.
+    /// Headless hosts without a GL viewport return a clear error.
+    fn capture_viewport_screenshot(&mut self) -> Result<(u32, u32, Vec<u8>), String> {
+        Err("Viewport screenshot requires a live 3D GUI window (unavailable in headless CLI mode).".to_string())
     }
 }

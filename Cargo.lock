@@ -3094,6 +3094,7 @@ dependencies = [
  "egui",
  "egui_glow",
  "glow",
+ "image",
  "rk-control",
  "rk-model",
  "rk-proto",

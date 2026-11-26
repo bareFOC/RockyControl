@@ -209,8 +209,12 @@ impl McpHost for HeadlessHost {
         Ok(())
     }
 
-    fn set_camera_preset(&mut self, _preset: &str) -> Result<(), String> {
-        Ok(())
+    fn set_camera_preset(&mut self, preset: &str) -> Result<(), String> {
+        match preset {
+            "iso" | "home" | "front" | "back" | "left" | "right" | "side" | "top" | "bottom"
+            | "fit" => Ok(()),
+            other => Err(format!("unknown camera preset `{other}`")),
+        }
     }
 
     fn apply_joint_angle(&mut self, joint_idx: usize, rad: f32) -> Result<(), String> {
